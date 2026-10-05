@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77", "wheel", "ninja", "torch>=2.12"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "delta-matching"
+version = "0.1.0"
+description = "fp8 attention for training with the Delta-Matching backward (Hopper, CUTLASS/CuTe): a flash-attention-style drop-in"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_NOTICES.md"]
+authors = [{ name = "Haozhan Tang" }]
+dependencies = ["torch>=2.12", "triton>=3.2", "numpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["delta_matching"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

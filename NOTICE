@@ -1,0 +1,10 @@
+delta-matching
+Copyright 2026 the delta-matching authors
+
+This product is licensed under the Apache License, Version 2.0 (LICENSE).
+
+It includes software adapted from FlashAttention-3 (https://github.com/Dao-AILab/flash-attention),
+Copyright (c) 2024, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao,
+licensed under the BSD 3-Clause License, and it is built with CUTLASS (https://github.com/NVIDIA/cutlass),
+Copyright (c) 2017 - 2025 NVIDIA CORPORATION & AFFILIATES, licensed under the BSD 3-Clause License.
+See THIRD_PARTY_NOTICES.md for their license texts.

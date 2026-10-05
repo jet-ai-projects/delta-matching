@@ -1,0 +1,5 @@
+include LICENSE NOTICE THIRD_PARTY_NOTICES.md README.md
+graft csrc
+graft delta_matching
+prune delta_matching/_jit
+global-exclude *.so *.pyc _build_info.py
