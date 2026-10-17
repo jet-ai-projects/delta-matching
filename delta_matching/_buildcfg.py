@@ -1,7 +1,10 @@
 """The build configuration shared by setup.py and the JIT build: sources, include dirs, defines, nvcc flags.
 The defines are the certified flag set of the shipped binary (Delta-Matching-128 v3 for head_dim 128, whose head_dim-256 paths
 are bitwise the Delta-Matching-256 binary): they are part of the kernel's numerical identity, not tuning knobs.  The csrc/
-sources were reduced to this flag set, and csrc/dm_flagset.h stops a build with any other value."""
+sources were reduced to this flag set, and csrc/dm_flagset.h stops a build with any other value.
+The host flags also keep the build machine out of the library: cxx_flags / cuda_flags remap every absolute build path
+that __FILE__ would record (_prefix_maps), -lineinfo is opt-in (DM_LINEINFO=1), and clean_ldshared drops the conda
+RPATH from the link command.  A library is checked with `strings _C*.so | grep -E "/home/|/project/"` (expected empty)."""
 import os
 
 PACKAGE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,6 +33,10 @@ def fa_src():
 
 DBG = os.environ.get("DM_DBG", "0") == "1"
 BF16_DP = os.environ.get("DM_BF16_DP", "0") == "1"
+# nvcc -lineinfo (source-line tables for ncu / nsight) is OPT-IN: it records the ABSOLUTE path of every source and
+# header in the device code of the library, and no compiler option remaps those.  The generated SASS is unchanged
+# either way (line tables are metadata), so the shipped numerics do not depend on it.
+LINEINFO = os.environ.get("DM_LINEINFO", "0") == "1"
 
 # the certified flag set (the build of the certified binaries)
 FLAGS = {
@@ -74,10 +81,69 @@ def include_dirs():
     return [CSRC, os.path.join(fa, "hopper"), os.path.join(fa, "csrc", "cutlass", "include")]
 
 
+def _prefix_maps():
+    """`-ffile-prefix-map=<dir>=<name>` for every directory the compiler would otherwise write into the library.
+    __FILE__ in the TORCH_CHECK / CHECK_CUDA messages of the host code names the header's full include path, and
+    torch's ninja writer makes every source path absolute, so a plain build stamps the checkout, the Python
+    environment and the CUDA toolkit paths of the build machine (user name, project directory, environment name)
+    into the binary.  Each prefix is rewritten to a neutral name; both the spelled and the symlink-resolved form of
+    a directory are mapped, and GCC tries the maps last-specified first, so the more specific directories come last."""
+    import sys
+    maps = [(sys.base_prefix, "python"), (sys.prefix, "python")]
+    try:
+        import torch
+        from torch.utils.cpp_extension import CUDA_HOME
+        maps.append((os.path.dirname(os.path.abspath(torch.__file__)), "torch"))
+        if CUDA_HOME:
+            maps.append((CUDA_HOME, "cuda"))
+    except ImportError:
+        pass
+    fa = fa_src()
+    if not fa.startswith(ROOT + os.sep):
+        maps.append((fa, "flash-attention"))
+    maps.append((ROOT, "delta-matching"))
+    out, seen = [], set()
+    for old, new in maps:
+        for d in (old, os.path.realpath(old)):
+            d = d.rstrip(os.sep)
+            if d and d != os.sep and d not in seen:
+                seen.add(d)
+                out.append(f"-ffile-prefix-map={d}={new}")
+    return out
+
+
+def cxx_flags():
+    """The host compiler flags (the api .cpp under setup.py, extra_cflags under the JIT build)."""
+    return ["-O3", "-std=c++17"] + _prefix_maps()
+
+
 def cuda_flags():
-    return ["-O3", "-std=c++17", "--use_fast_math", "-lineinfo", "-DNDEBUG", "--expt-relaxed-constexpr",
-            "--expt-extended-lambda", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED", "-DCUTLASS_ENABLE_GDC_FOR_SM90",
-            "-DCUTLASS_DEBUG_TRACE_LEVEL=0", "--threads", "4", "-gencode", "arch=compute_90a,code=sm_90a"]
+    f = ["-O3", "-std=c++17", "--use_fast_math", "-DNDEBUG", "--expt-relaxed-constexpr",
+         "--expt-extended-lambda", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED", "-DCUTLASS_ENABLE_GDC_FOR_SM90",
+         "-DCUTLASS_DEBUG_TRACE_LEVEL=0", "--threads", "4", "-gencode", "arch=compute_90a,code=sm_90a"]
+    if LINEINFO:
+        f.append("-lineinfo")
+    for m in _prefix_maps():   # the host-compiler half of every .cu: CHECK_CUDA's __FILE__ and the host debug info
+        f += ["-Xcompiler", m]
+    return f
+
+
+def clean_ldshared():
+    """Drop the `-Wl,-rpath,<env>/lib` that conda Pythons bake into the link commands (sysconfig's LDSHARED and
+    LDCXXSHARED; setuptools links a C++ extension with the latter): it would record the build machine's environment
+    path as the library's RPATH, which the library never needs (torch has loaded every dependency by the time
+    torch.ops.load_library runs).  A caller's own value of either variable is left alone; setuptools reads them when
+    it configures the linker."""
+    import shlex
+    import sysconfig
+    for var in ("LDSHARED", "LDCXXSHARED"):
+        if var in os.environ:
+            continue
+        ld = sysconfig.get_config_var(var)
+        if not ld:
+            continue
+        toks = [t for t in shlex.split(ld) if not (t.startswith("-Wl,-rpath,") or t.startswith("-Wl,-rpath="))]
+        os.environ[var] = " ".join(shlex.quote(t) for t in toks)
 
 
 def csrc_sha():
@@ -92,7 +158,8 @@ def csrc_sha():
 
 def write_build_info():
     """Stamp this build into the package (read by delta_matching.kernel_version()); rewritten by every build."""
-    info = {"code_sha": csrc_sha(), "dbg": DBG, "bf16_dp": BF16_DP, "flags": FLAGS, "extra_defines": EXTRA_DEFINES}
+    info = {"code_sha": csrc_sha(), "dbg": DBG, "bf16_dp": BF16_DP, "lineinfo": LINEINFO, "flags": FLAGS,
+            "extra_defines": EXTRA_DEFINES}
     with open(os.path.join(PACKAGE_DIR, "_build_info.py"), "w") as f:
         f.write("# written by the build (setup.py / delta_matching.jit); not hand-edited\n")
         f.write(f"BUILD_INFO = {info!r}\n")

@@ -1,10 +1,22 @@
 # delta-matching
 
+This repository contains the official implementation of Delta-Matching, along with an implementation of naive FP8 attention, as described in the following paper.
+
+**Delta-Matching: Closing the Final Gap of Native 8-bit Training for LLMs**
+Haozhan Tang, Hao Kang, Han Cai, Song Han, Chenyan Xiong<br>
+Paper: https://arxiv.org/abs/2609.37852
+
+![Delta-Matching: where the fp8 attention backward's row correction comes from](asset/delta-matching-method.png)
+
 fp8 attention for training on Hopper with the **Delta-Matching** backward: the attention core runs in fp8 in both
 directions, and the backward's softmax-gradient centering term (delta) is built from the kernel's own fp8 P / dP
 pair instead of the conventional `rowsum(dO * O)`. That keeps the row-sum identity `rowsum(dS) = 0` at fp32 round-off
 inside the fp8 arithmetic, which is what lets an all-fp8 attention backward train without the slow divergence a stale
 delta causes. The same binary also runs the conventional ("stale") delta, so the two can be compared on the same code.
+
+
+
+
 
 It is a drop-in for flash-attention call sites: same tensor layout, same signature, one import to change.
 
@@ -128,3 +140,18 @@ flash-attention commit, and the path and variant flag (`bf16_dp`) of the library
 Apache License 2.0 (see `LICENSE` and `NOTICE`). Parts of `csrc/` are adapted from FlashAttention-3 and keep its
 copyright notice: those portions stay under flash-attention's BSD 3-Clause license, and the kernels build against
 flash-attention and CUTLASS, both BSD 3-Clause (license texts in `THIRD_PARTY_NOTICES.md`).
+
+
+## Citation
+If you use this codebase, or otherwise found our work valuable, please cite:
+```
+@misc{tang2026deltamatching,
+  title         = {{Delta-Matching}: Closing the Final Gap of Native 8-bit Training for {LLMs}},
+  author        = {Haozhan Tang and Hao Kang and Han Cai and Song Han and Chenyan Xiong},
+  year          = {2026},
+  eprint        = {2609.37852},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.LG},
+  url           = {https://arxiv.org/abs/2609.37852}
+}
+```
