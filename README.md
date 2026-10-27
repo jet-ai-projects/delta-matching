@@ -9,7 +9,8 @@
 
 This repository contains the official kernel implementation of Delta-Matching, along with an implementation of naive FP8 attention.
 
-![Delta-Matching: where the fp8 attention backward's row correction comes from](asset/delta-matching-method.png)
+https://github.com/user-attachments/assets/6236d646-dd3a-4277-a602-39339c69d712
+
 
 fp8 attention for training on Hopper with the **Delta-Matching** backward: the attention core runs in fp8 in both
 directions, and the backward's softmax-gradient centering term (delta) is built from the kernel's own fp8 P / dP
