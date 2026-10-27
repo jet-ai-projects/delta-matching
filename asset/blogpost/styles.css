@@ -305,6 +305,32 @@ h1 {
   white-space: nowrap;
 }
 
+.hero-video {
+  max-width: 1100px;
+  margin: 32px 0 0;
+}
+
+.hero-video video {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+.hero-video figcaption {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px 20px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
 .hero-deck {
   max-width: 760px;
   margin: 28px 0 0;
