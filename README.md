@@ -9,7 +9,7 @@
 
 This repository contains the official kernel implementation of Delta-Matching, along with an implementation of naive FP8 attention.
 
-https://github.com/user-attachments/assets/6236d646-dd3a-4277-a602-39339c69d712
+https://github.com/user-attachments/assets/60775448-b069-4c0b-8a5c-fd1fefe94b07
 
 
 fp8 attention for training on Hopper with the **Delta-Matching** backward: the attention core runs in fp8 in both
