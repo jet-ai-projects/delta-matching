@@ -4,7 +4,13 @@ This repository contains the official implementation of Delta-Matching, along wi
 
 **Delta-Matching: Closing the Final Gap of Native 8-bit Training for LLMs**
 Haozhan Tang, Hao Kang, Han Cai, Song Han, Chenyan Xiong<br>
-Paper: https://arxiv.org/abs/2609.37852
+
+<div align="center">
+  <a href="https://arxiv.org/abs/2609.37852"><img src="https://img.shields.io/static/v1?label=arXiv&amp;message=Delta-Matching&amp;color=red&amp;logo=arxiv" alt="Delta-Matching on arXiv"></a> &ensp;
+  <a href="https://huggingface.co/collections/cx-cmu/delta-matching"><img src="https://img.shields.io/static/v1?label=Hugging%20Face&amp;message=Model%20Checkpoints&amp;color=yellow&amp;logo=huggingface" alt="Model checkpoints on Hugging Face"></a> &ensp;
+  <a href="https://jet-ai-projects.github.io/delta-matching/"><img src="https://img.shields.io/static/v1?label=&amp;message=Blog%20post&amp;color=00A86B" alt="Blog post"></a> &ensp;
+  <a href="https://github.com/cxcscmu/delta-matching-train"><img src="https://img.shields.io/static/v1?label=GitHub&amp;message=Training%20Pipeline&amp;color=blue&amp;logo=github" alt="Training pipeline on GitHub"></a>
+</div>
 
 ![Delta-Matching: where the fp8 attention backward's row correction comes from](asset/delta-matching-method.png)
 
