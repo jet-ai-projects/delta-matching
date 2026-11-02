@@ -7,3 +7,4 @@ dist/
 delta_matching/_jit/
 delta_matching/_build_info.py
 .pytest_cache/
+/workspace/
