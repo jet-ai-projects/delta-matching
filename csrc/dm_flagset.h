@@ -32,8 +32,8 @@
 #if !defined(FA3FP11_HD128_P1R) || (FA3FP11_HD128_P1R) != 1
 #error "delta_matching: FA3FP11_HD128_P1R must be 1 (the release flag set)"
 #endif
-#if !defined(FA3FP11_HD128_P2ST) || (FA3FP11_HD128_P2ST) != 2
-#error "delta_matching: FA3FP11_HD128_P2ST must be 2 (the release flag set)"
+#if !defined(FA3FP11_HD128_P2ST) || (FA3FP11_HD128_P2ST) != 3
+#error "delta_matching: FA3FP11_HD128_P2ST must be 3 (the release flag set)"
 #endif
 #if !defined(FA3FP11_HD128_PVFIRST) || (FA3FP11_HD128_PVFIRST) != 1
 #error "delta_matching: FA3FP11_HD128_PVFIRST must be 1 (the release flag set)"

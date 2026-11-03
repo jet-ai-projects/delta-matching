@@ -255,11 +255,14 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     // to M2's on any psi field.
     float psi_w = 0.0f;
     float psi_max = 0.0f;
+    // psi of tile nb is loaded one iteration early, so its load latency overlaps the barrier wait.
+    float psi_pf = nb_end > 0 ? psi_row[0] : 0.0f;
     #pragma unroll 1
     for (int nb = 0; nb < nb_end; ++nb) {
         int const s = nb % kStages;
+        float const psi_cur = psi_pf;
+        if (nb + 1 < nb_end) { psi_pf = psi_row[nb + 1]; }
         shared.full_bar[s].wait((nb / kStages) & 1);
-        float const psi_cur = psi_row[nb];
         // ## FP11-F2: psi == 0.0f is pass 1's zero-tile sentinel (fully
         // underflowed or fully masked tile; its dS' codes are exact zeros).
         // ## FP11-F2b (dominance skip, M2): also skip any tile whose psi sits
