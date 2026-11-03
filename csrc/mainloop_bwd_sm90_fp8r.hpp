@@ -716,8 +716,10 @@ struct CollectiveMainloopBwdSm90Fp8R {
             }
             cute::tma_store_arrive();
         };
-        auto bwd_step = [&](int m_block, auto mask_fn, auto stage_c) {
+        auto bwd_step = [&](int m_block, auto mask_fn, auto stage_c, auto expbx_c) {
             constexpr int kSt = decltype(stage_c)::value;   // compile-time Q / Qt stage under UNROLL2 (-1 = runtime)
+            // The unmasked loop (m_block >= fq8_mask_m_end) never holds a tile pass 0 masks.
+            [[maybe_unused]] constexpr bool kExpbx = decltype(expbx_c)::value;
             Tensor fq8_tmpK = make_fragment_like(tdKrdK);
             float fq8_g_fold = 0.0f;
             // (kBlockN, kBlockM) = the swapAB fragment: rows = keys, columns = query rows.
@@ -766,16 +768,28 @@ struct CollectiveMainloopBwdSm90Fp8R {
             fq8_f_prev = fq8_f_cur;
             warpgroup_wait<1>();   // S retired
             auto const stage_q = [&] { if constexpr (kSt >= 0) { return Int<kSt>{}; } else { return smem_pipe_read.index(); } }();
+            // Whether pass 0 masks this tile.
+            [[maybe_unused]] bool const fq8_x64_orig = [&] {
+                int const nb64 = 2 * n_block + warp_group_idx;
+                return (Is_causal && (nb64 + 1) * 64 > m_block * 64 + (seqlen_k - seqlen_q)) || ((nb64 + 1) * 64 > seqlen_k);
+            }();
             // rowcol view: (16 query rows, 2 keys) per thread.
             Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(tSrS.layout()));
             mask_fn(tSrS, m_block);
             #pragma unroll
             for (int mi = 0; mi < size<0>(scores); ++mi) {
-                float const lse_scaled = __fmul_rn(tLSEsLSE(mi, stage_q), float(M_LOG2E));   // LSEK: the host prep's exact multiply
+                // Pass 0's exp line: exp2(fma(s, dsc, -b)), b = fma(lse, log2e, -8), on the tiles pass 0 does not mask;
+                // exp2(min(fma(s, dsc, -fl(lse log2e)) + 8, 12)) on the ones it masks (the clamp maps NaN to 12).
+                float const lse_scaled = (kExpbx || !fq8_x64_orig) ? __fmaf_rn(tLSEsLSE(mi, stage_q), float(M_LOG2E), -kFq8MoE)
+                                                                   : __fmul_rn(tLSEsLSE(mi, stage_q), float(M_LOG2E));
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(scores); ++ni) {
-                    // P-hat = 2^8 * exp(S - lse) with the F1 cliff clamp (P1-A's line, verbatim).
-                    scores(mi, ni) = exp2f(fminf(scores(mi, ni) * fq8_s_descale_log2 - lse_scaled + kFq8MoE, kFq8MoE + 4.0f));
+                    if constexpr (kExpbx) {
+                        scores(mi, ni) = exp2f(__fmaf_rn(scores(mi, ni), fq8_s_descale_log2, -lse_scaled));
+                    } else {   // masked loop (rare): per-WG runtime choice
+                        float const y = __fmaf_rn(scores(mi, ni), fq8_s_descale_log2, -lse_scaled);
+                        scores(mi, ni) = exp2f(fq8_x64_orig ? fminf(__fadd_rn(y, kFq8MoE), 12.0f) : y);
+                    }
                 }
             }
             // The stage's LSE rows were read by the loop above and the S gemm has retired: raw Q's readers are done.
@@ -976,9 +990,9 @@ struct CollectiveMainloopBwdSm90Fp8R {
         int const fq8_mask_m_end = ((n_block + 1) * kbn_ > seqlen_k) ? INT32_MAX
                                    : ((n_block + 1) * kbn_ - (seqlen_k - seqlen_q) + kbm_ - 1) / kbm_;
         CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < m_block_max && m_block < fq8_mask_m_end; ++m_block) { bwd_step(m_block, mask_fn, Int<-1>{}); }
+        for (; m_block < m_block_max && m_block < fq8_mask_m_end; ++m_block) { bwd_step(m_block, mask_fn, Int<-1>{}, cute::false_type{}); }
         CUTLASS_PRAGMA_NO_UNROLL
-        for (; m_block < m_block_max; ++m_block) { bwd_step(m_block, no_mask_fn, Int<-1>{}); }
+        for (; m_block < m_block_max; ++m_block) { bwd_step(m_block, no_mask_fn, Int<-1>{}, cute::true_type{}); }
 
         // The last tile's deferred dS' store, after every thread has fenced its stmatrix.
         cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG3) /*id 4*/);
