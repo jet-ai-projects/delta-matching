@@ -8,8 +8,8 @@
 #if !defined(FA3FP11_HD128_BM128) || (FA3FP11_HD128_BM128) != 0
 #error "delta_matching: FA3FP11_HD128_BM128 must be 0 (the release flag set)"
 #endif
-#if !defined(FA3FP11_HD128_BN256) || (FA3FP11_HD128_BN256) != 1
-#error "delta_matching: FA3FP11_HD128_BN256 must be 1 (the release flag set)"
+#if !defined(FA3FP11_HD128_BN256) || (FA3FP11_HD128_BN256) != 0
+#error "delta_matching: FA3FP11_HD128_BN256 must be 0 (the release flag set; the BM192 forward uses 128-key tiles)"
 #endif
 #if !defined(FA3FP11_HD128_DOST) || (FA3FP11_HD128_DOST) != 1
 #error "delta_matching: FA3FP11_HD128_DOST must be 1 (the release flag set)"
@@ -34,6 +34,18 @@
 #endif
 #if !defined(FA3FP11_HD128_P2ST) || (FA3FP11_HD128_P2ST) != 3
 #error "delta_matching: FA3FP11_HD128_P2ST must be 3 (the release flag set)"
+#endif
+#if !defined(FA3FP11_HD128_BM192) || (FA3FP11_HD128_BM192) != 1
+#error "delta_matching: FA3FP11_HD128_BM192 must be 1 (the release flag set)"
+#endif
+#if !defined(FA3FP11_HD128_FWDST) || (FA3FP11_HD128_FWDST) != 3
+#error "delta_matching: FA3FP11_HD128_FWDST must be 3 (the release flag set)"
+#endif
+#if !defined(FA3FP11_HD128_FWDLAZY) || (FA3FP11_HD128_FWDLAZY) != 1
+#error "delta_matching: FA3FP11_HD128_FWDLAZY must be 1 (the release flag set)"
+#endif
+#if !defined(FA3FP11_HD128_FWDDFOLD) || (FA3FP11_HD128_FWDDFOLD) != 1
+#error "delta_matching: FA3FP11_HD128_FWDDFOLD must be 1 (the release flag set)"
 #endif
 #if !defined(FA3FP11_HD128_PVFIRST) || (FA3FP11_HD128_PVFIRST) != 1
 #error "delta_matching: FA3FP11_HD128_PVFIRST must be 1 (the release flag set)"

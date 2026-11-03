@@ -34,13 +34,15 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
     using ArchTag = cutlass::arch::Sm90;
     static constexpr int kHeadDim = kHeadDim_;
     static constexpr int kHeadDimV = kHeadDim_;
-    static constexpr int kBlockM = 128;
+    // hd128 with BM192: 192 x 128 tiles, three consumer warpgroups (registers 160 / 32): the per-warpgroup chain is
+    // latency-bound, so a third one raises tensor-pipe use.  Each 64-row warpgroup lies in one 128-row Q scale block.
+    static constexpr int kBlockM = (kHeadDim_ < 256 && FA3FP11_HD128_BM192) ? 192 : 128;
     // ## Delta-Matching-128 F3 (FA3FP11_HD128_BN256=1, hd128 only): 256-key tiles (four 64-key groups per tile, half the tile
     // boundaries); the d256 configuration stays 128 x 128.
     static constexpr int kBlockN = (kHeadDim_ < 256 && FA3FP11_HD128_BN256) ? 256 : 128;
     static constexpr bool MmaPV_is_RS = true;
     static constexpr bool IntraWGOverlap = true;
-    static constexpr int kStages = 2;
+    static constexpr int kStages = kHeadDim_ < 256 ? FA3FP11_HD128_FWDST : 2;   // hd128 forward K/V stages
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using TileShape_MNK_PV = cute::Shape<Int<kBlockM>, Int<kHeadDimV>, Int<kBlockN>>;

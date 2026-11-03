@@ -218,6 +218,33 @@ except RuntimeError as ex:
     assert "RUNTIME-ERROR True" in p.stdout, p.stdout + p.stderr[-2000:]
 
 
+def test_hd128_raw_forward_refuses_seqlens_that_are_not_256_multiples(tmp_path):
+    """At head_dim 128, fwd_fp8 raises a RuntimeError when the sequence length is not a multiple of 256."""
+    code = r"""
+import torch
+from delta_matching.core import _ops, blocks
+from delta_matching.producers import quant_qkv_m17
+ops = _ops()
+B, H, N, D = 1, 4, 384, 128
+x = torch.randn(B, H, N, D, device="cuda").to(torch.bfloat16)
+Q8, Q8s, K8, K8s, V8, V8s, _, _ = quant_qkv_m17(x, x, x, want_qt=True, blocks=blocks(D))
+b = lambda t: t.view(B, H, N, D).permute(0, 2, 1, 3)
+try:
+    ops.fwd_fp8(b(Q8), b(K8), b(V8), Q8s.view(B, H, -1), K8s.view(B, H, -1), V8s.view(B, H, -1), D ** -0.5, True)
+    torch.cuda.synchronize()
+    print("NO-ERROR")
+except RuntimeError as ex:
+    print("RUNTIME-ERROR", "256-multiple" in str(ex))
+"""
+    import delta_matching
+    env = dict(os.environ)
+    pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(delta_matching.__file__)))
+    env["PYTHONPATH"] = pkg_parent + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=600, cwd=str(tmp_path))
+    assert p.returncode == 0, f"the process ended with {p.returncode}: {p.stderr[-2000:]}"
+    assert "RUNTIME-ERROR True" in p.stdout, p.stdout + p.stderr[-2000:]
+
+
 def test_hd128_delta_128_row_fallback_matches_the_256_row_cta():
     """Causal pass 0 at head_dim 128 gives the same delta with 128-row and 256-row CTAs."""
     from delta_matching.producers import quant_q_m17
@@ -240,6 +267,21 @@ def test_hd128_delta_128_row_fallback_matches_the_256_row_cta():
                          v8s[..., :n // 64].contiguous(), do8s[..., :n // 128].contiguous(), True).view(B, H, n)
     assert torch.isfinite(full).all()
     assert torch.equal(part, full[..., :n])
+
+
+@pytest.mark.parametrize("mode", ["matched", "stale"])
+def test_all_zero_inputs_give_finite_outputs(mode):
+    """All-zero Q, K and V give finite outputs and gradients at head_dim 128."""
+    import delta_matching as dm
+    B, N, H, Hk, D = 1, 512, 4, 2, 128
+    q = torch.zeros(B, N, H, D, device="cuda", dtype=BF, requires_grad=True)
+    k = torch.zeros(B, N, Hk, D, device="cuda", dtype=BF, requires_grad=True)
+    v = torch.zeros(B, N, Hk, D, device="cuda", dtype=BF, requires_grad=True)
+    o = dm.dm_attn_func(q, k, v, causal=True, mode=mode)
+    o.backward(torch.randn_like(o))
+    for name, t in (("o", o), ("dq", q.grad), ("dk", k.grad), ("dv", v.grad)):
+        assert torch.isfinite(t.float()).all(), f"{name} has non-finite values"
+    assert torch.equal(o, torch.zeros_like(o))
 
 
 def test_kernel_version_reports_the_loaded_library():
