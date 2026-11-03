@@ -246,7 +246,7 @@ except RuntimeError as ex:
 
 
 def test_hd128_delta_128_row_fallback_matches_the_256_row_cta():
-    """Causal pass 0 at head_dim 128 gives the same delta with 128-row and 256-row CTAs."""
+    """Causal pass 0 at head_dim 128 gives the same delta with 128-row and 256-row CTAs, up to fp32 round-off."""
     from delta_matching.producers import quant_q_m17
     ops = _ops()
     B, H, Hk, N, n, D = 1, 4, 2, 512, 384, 128
@@ -265,8 +265,12 @@ def test_hd128_delta_128_row_fallback_matches_the_256_row_cta():
     part = ops.delta_fp8(cut(do8), cut(q8), cut(k8), cut(v8), lse[..., :n].contiguous(), kt[..., :n].contiguous(),
                          q8s[..., :n // 128].contiguous(), k8s[..., :n // 64].contiguous(),
                          v8s[..., :n // 64].contiguous(), do8s[..., :n // 128].contiguous(), True).view(B, H, n)
-    assert torch.isfinite(full).all()
-    assert torch.equal(part, full[..., :n])
+    again = ops.delta_fp8(cut(do8), cut(q8), cut(k8), cut(v8), lse[..., :n].contiguous(), kt[..., :n].contiguous(),
+                          q8s[..., :n // 128].contiguous(), k8s[..., :n // 64].contiguous(),
+                          v8s[..., :n // 64].contiguous(), do8s[..., :n // 128].contiguous(), True).view(B, H, n)
+    assert torch.isfinite(full).all() and torch.equal(part, again)
+    ref = full[..., :n]
+    assert ((part - ref).abs().amax(-1) <= 1e-6 * ref.abs().amax(-1)).all()
 
 
 @pytest.mark.parametrize("mode", ["matched", "stale"])

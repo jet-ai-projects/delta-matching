@@ -381,10 +381,12 @@ struct DeltaV6 {
             auto exp_step = [&](auto& tSrS, int n_block, float dsc_g0, float dsc_g1) {
                 exp_step_t(cute::true_type{}, tSrS, n_block, dsc_g0, dsc_g1);
             };
-            // The quad reduction as a transposed reduce: lane l keeps row (l >> 1) & 1 and adds lane l^2's partial, then
-            // lane l^1's sum.  Same pairing as Allreduce<4>, so bitwise the same, with half the shuffles.
-            double acc_r = 0.0;
-            bool const quad_hi = (wtid & 2) != 0;   // this lane keeps row1 (else row0)
+            // Row sums: per tile each lane adds its two fixed-order fp32 half partials (dP descale once per half),
+            // scales by 2^-8 and accumulates into fp64 per row; the quad is reduced once, in fp64, after the loop.
+            // Fixed order and one writer per row: deterministic.
+            double acc_q0 = 0.0, acc_q1 = 0.0;   // this lane's partial of row0 / row1
+            double acc_r = 0.0;                  // the quad-reduced row value this lane stores (quad_hi: row1)
+            bool const quad_hi = (wtid & 2) != 0;
             auto rowsum_step = [&](auto& tSrS, auto& tdPrdP, float dp_g0, float dp_g1) {
                 Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
                 Tensor dPv = make_tensor(tdPrdP.data(), scores.layout());
@@ -393,21 +395,13 @@ struct DeltaV6 {
                 for (int mi = 0; mi < 2; ++mi) {
                     float a0 = 0.f, a1 = 0.f;
                     #pragma unroll
-                    for (int ni = 0; ni < 8; ++ni) { a0 = fmaf(scores(mi, ni), dPv(mi, ni) * dp_g0, a0); }
+                    for (int ni = 0; ni < 8; ++ni) { a0 = fmaf(scores(mi, ni), dPv(mi, ni), a0); }
                     #pragma unroll
-                    for (int ni = 8; ni < 16; ++ni) { a1 = fmaf(scores(mi, ni), dPv(mi, ni) * dp_g1, a1); }
-                    a[mi][0] = a0; a[mi][1] = a1;
+                    for (int ni = 8; ni < 16; ++ni) { a1 = fmaf(scores(mi, ni), dPv(mi, ni), a1); }
+                    a[mi][0] = a0 * dp_g0; a[mi][1] = a1 * dp_g1;   // the dP descale, once per 8-key half
                 }
-                float k0 = quad_hi ? a[1][0] : a[0][0], k1 = quad_hi ? a[1][1] : a[0][1];
-                float const s0 = quad_hi ? a[0][0] : a[1][0], s1 = quad_hi ? a[0][1] : a[1][1];
-                k0 = k0 + __shfl_xor_sync(uint32_t(-1), s0, 2);
-                k1 = k1 + __shfl_xor_sync(uint32_t(-1), s1, 2);
-                k0 = k0 + __shfl_xor_sync(uint32_t(-1), k0, 1);
-                k1 = k1 + __shfl_xor_sync(uint32_t(-1), k1, 1);
-                // the pass-0.5 fold: part(j, half 0) then part(j, half 1), each a fp32 value added into fp64
-                float const p0 = k0 * kFq8MoInv;
-                float const p1 = k1 * kFq8MoInv;
-                acc_r += double(p0); acc_r += double(p1);
+                acc_q0 += double((a[0][0] + a[0][1]) * kFq8MoInv);
+                acc_q1 += double((a[1][0] + a[1][1]) * kFq8MoInv);
             };
 
             if constexpr (kNWG == 4) {
@@ -558,6 +552,13 @@ struct DeltaV6 {
             for (int s = 0; s < nstages - 1; ++s) { step(s, cute::true_type{}, cute::Int<-1>{}); }
             step(nstages - 1, cute::false_type{}, cute::Int<-1>{});
             }
+            {
+                double r0 = acc_q0 + __shfl_xor_sync(uint32_t(-1), acc_q0, 1);
+                double r1 = acc_q1 + __shfl_xor_sync(uint32_t(-1), acc_q1, 1);
+                r0 = r0 + __shfl_xor_sync(uint32_t(-1), r0, 2);
+                r1 = r1 + __shfl_xor_sync(uint32_t(-1), r1, 2);
+                acc_r = quad_hi ? r1 : r0;
+            }
             // One writer per row: quad lane 0 stores row0's fp64 fold rounded once to fp32, quad lane 2 row1's.
             if ((wtid & 1) == 0) {
                 int const r = m_block * kBlockM + (quad_hi ? row1 : row0);
@@ -629,6 +630,7 @@ void run_flash_delta_v6_fp11_hd128_w(Flash_bwd_fp8_params &params, cudaStream_t 
 }
 
 // Runs pass 0 with 256-row CTAs when seqlen_q % 256 == 0, else with 128-row CTAs.
+// The two agree only to fp32 round-off.
 template <bool Is_causal>
 void run_flash_delta_v6_fp11_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
     if (params.seqlen_q % 256 == 0) { run_flash_delta_v6_fp11_hd128_w<Is_causal, 4>(params, stream); }

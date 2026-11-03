@@ -663,7 +663,7 @@ struct CollectiveMainloopBwdSm90Fp8R {
         float* fq8_psired = shared_storage.tensors.mainloop.smem_psired.data();
         static constexpr float kFq8MoE = 8.0f;
         static constexpr float kFq8MoInv = 1.0f / 256.0f;
-        constexpr int kFq8PromoteTiles = 8;   // the 512-row dV promote window (pinned, as P1-A)
+        constexpr int kFq8PromoteTiles = 32;   // the 2048-row dV promote window
         auto fq8_clamp_ratio = [](float r) { return fminf(fmaxf(r, 1e-8f), 1e8f); };
 
         // The dS' natural transpose bookkeeping (per lane, per CTA): lane holds key pair ip = lane / 4 of its warp's 16
