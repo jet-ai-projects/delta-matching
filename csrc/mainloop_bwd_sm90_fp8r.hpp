@@ -736,7 +736,10 @@ struct CollectiveMainloopBwdSm90Fp8R {
                 fq8_q8sc_next = fq8_q8s_base[fq8_qblk(m_block + 1)];
                 fq8_do8sc_next = fq8_do8s_base[fq8_qblk(m_block + 1)];
             }
-            float const fq8_s_descale_log2 = fq8_q8sc * fq8_k8s_wg * float(M_LOG2E);
+            // Floored at FLT_MIN on the masked tiles, as in the forward: a zero Q block times a zero K block underflows
+            // to 0, and -inf * 0 = NaN would become P = 2^12 on the masked entries below.
+            float const fq8_s_descale_log2 = kExpbx ? fq8_q8sc * fq8_k8s_wg * float(M_LOG2E)
+                                                    : fmaxf(fq8_q8sc * fq8_k8s_wg * float(M_LOG2E), 1.17549435e-38f);
             // dP accumulator -> TRUE dP units.  With e4m3 operands that is the product of their code scales;
             // under bf16-dP the operands are the raw bf16 tensors, so the accumulator is already true dP and the
             // only surviving factor is pass 1's k8s fold (dS' = 2^8 * P * (dP_true - delta) * k8s_wg).
@@ -779,7 +782,7 @@ struct CollectiveMainloopBwdSm90Fp8R {
             #pragma unroll
             for (int mi = 0; mi < size<0>(scores); ++mi) {
                 // Pass 0's exp line: exp2(fma(s, dsc, -b)), b = fma(lse, log2e, -8), on the tiles pass 0 does not mask;
-                // exp2(min(fma(s, dsc, -fl(lse log2e)) + 8, 12)) on the ones it masks (the clamp maps NaN to 12).
+                // exp2(min(fma(s, dsc, -fl(lse log2e)) + 8, 12)) on the ones it masks.
                 float const lse_scaled = (kExpbx || !fq8_x64_orig) ? __fmaf_rn(tLSEsLSE(mi, stage_q), float(M_LOG2E), -kFq8MoE)
                                                                    : __fmul_rn(tLSEsLSE(mi, stage_q), float(M_LOG2E));
                 #pragma unroll

@@ -379,7 +379,15 @@ struct DeltaV4 {
                 Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
                 static_assert(decltype(size<0>(scores))::value == 2 && decltype(size<1>(scores))::value == 16,
                               "DeltaV4: expected 2 rows x 16 columns per thread for a 64x64 tile");
-                mask.template apply<true /*Seqlenk_mask*/, Is_causal, false /*Is_local*/>(tSrS, m_block, n_block);
+                // The mask is applied only on the tiles where it can set a score: the diagonal tiles and the seqlen_k tail
+                // (elsewhere it is a no-op, so skipping it is bitwise).  There the descale is floored at FLT_MIN: a zero Q
+                // block times a zero K block underflows to 0, and -inf * 0 = NaN would become P = 2^12 through the clamp.
+                bool const need_mask = (Is_causal && (n_block + 1) * kBlockN > m_block * kBlockM + (seqlen_k - seqlen_q))
+                                       || ((n_block + 1) * kBlockN > seqlen_k);
+                if (need_mask) {
+                    mask.template apply<true /*Seqlenk_mask*/, Is_causal, false /*Is_local*/>(tSrS, m_block, n_block);
+                    dsc_g0 = fmaxf(dsc_g0, 1.17549435e-38f); dsc_g1 = fmaxf(dsc_g1, 1.17549435e-38f);
+                }
                 #pragma unroll
                 for (int mi = 0; mi < 2; ++mi) {
                     float const lse_scaled = mi == 0 ? lse0 : lse1;

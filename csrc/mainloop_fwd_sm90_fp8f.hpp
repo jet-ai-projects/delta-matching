@@ -1378,15 +1378,17 @@ struct CollectiveMainloopFwdSm90Fp8F {
                 }
             }
         };
-        auto fq8_descale = [&](auto& tSrS_, int n_blk) {
+        // Descales S; may_mask_c marks a tile that may hold masked scores.
+        auto fq8_descale = [&](auto& tSrS_, int n_blk, auto may_mask_c) {
             auto sc_ = make_tensor(tSrS_.data(), flash::convert_layout_acc_rowcol(tSrS_.layout()));
             static_assert(decltype(size<1>(sc_))::value == kRowcol, "delta_matching fwd: rowcol width must match kBlockN / 4");
             if constexpr (kGroups == 4 && kColsPerGroup == 8) {
-            float const g_[4] = {
-                fq8_q8sc * params.ptr_k8s[fq8_bh_k + 4 * n_blk + 0],
-                fq8_q8sc * params.ptr_k8s[fq8_bh_k + 4 * n_blk + 1],
-                fq8_q8sc * params.ptr_k8s[fq8_bh_k + 4 * n_blk + 2],
-                fq8_q8sc * params.ptr_k8s[fq8_bh_k + 4 * n_blk + 3]};
+            // d256: the descale is floored at FLT_MIN on the steps that may mask.
+            auto gk = [&](int g) {
+                float const x = fq8_q8sc * params.ptr_k8s[fq8_bh_k + 4 * n_blk + g];
+                if constexpr (decltype(may_mask_c)::value) { return fmaxf(x, 1.17549435e-38f); } else { return x; }
+            };
+            float const g_[4] = {gk(0), gk(1), gk(2), gk(3)};
             #pragma unroll
             for (int mi = 0; mi < size<0>(sc_); ++mi) {
                 #pragma unroll
@@ -1472,7 +1474,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
             scoremod_premask_fn(tSrS);
             mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
             // The first (masked) tile keeps the exact descale.
-            fq8_descale(tSrS, n_block);   // ## FQ8: codes -> true S (mask's -inf survives)
+            fq8_descale(tSrS, n_block, cute::true_type{});   // ## FQ8: codes -> true S (mask's -inf survives)
 
             Tensor scores_scale = [&] {
                 return softmax.template max_get_scale_grouped</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
@@ -1823,7 +1825,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
                     scoremod_premask_fn(tSrS);
                     mask_fn(tSrS, n_block);
                     float fq8_g_[kGroups];
-                    if constexpr (kFwdDfold && !Check_inf) { fq8_gsc(n_block, fq8_g_); } else { fq8_descale(tSrS, n_block); }   // ## FQ8
+                    if constexpr (kFwdDfold && !Check_inf) { fq8_gsc(n_block, fq8_g_); } else { fq8_descale(tSrS, n_block, cute::bool_constant<Check_inf>{}); }   // ## FQ8
                     if constexpr (kFwdDfold && !Check_inf) { cute::copy(softmax.template max_get_scale_grouped_raw</*Is_first=*/false, Check_inf>(tSrS, fq8_g_), scores_scale); }
                     else { cute::copy(softmax.template max_get_scale_grouped</*Is_first=*/false, Check_inf>(tSrS), scores_scale); }
                     if constexpr (LargeHeadDimV) { store_scales(scores_scale, smem_pipe_read_v.index()); }
@@ -1865,7 +1867,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
                     }
                     scoremod_premask_fn(tSrS);
                     mask_fn(tSrS, n_block);
-                    fq8_descale(tSrS, n_block);   // ## FQ8
+                    fq8_descale(tSrS, n_block, cute::bool_constant<Check_inf>{});   // ## FQ8
                     warpgroup_wait<0>();
                     fq8_promote_last(tOrD);
                     if constexpr (!HasQv) { pipeline_v.consumer_release(smem_pipe_read_v); }  // release V

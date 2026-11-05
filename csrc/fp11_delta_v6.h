@@ -352,6 +352,9 @@ struct DeltaV6 {
                 if (MayMask && need_mask) {
                     mask.template apply<true /*Seqlenk_mask*/, Is_causal, false /*Is_local*/>(tSrS, m_block, n_block);
                 }
+                // Floored at FLT_MIN where a tile may be masked: a zero Q block times a zero K block underflows to 0,
+                // and -inf * 0 = NaN would become P = 2^12 on the masked entries.
+                if constexpr (MayMask) { dsc_g0 = fmaxf(dsc_g0, 1.17549435e-38f); dsc_g1 = fmaxf(dsc_g1, 1.17549435e-38f); }
                 // y = fma(s, dsc, -B): B = b off the masked tiles; on them B = fl(lse log2e), then + 8
                 {
                     bool const orig = MayMask && need_mask;   // the mask-free loop never holds a masked tile

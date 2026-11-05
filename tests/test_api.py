@@ -273,19 +273,25 @@ def test_hd128_delta_128_row_fallback_matches_the_256_row_cta():
     assert ((part - ref).abs().amax(-1) <= 1e-6 * ref.abs().amax(-1)).all()
 
 
+@pytest.mark.parametrize("D", [128, 256])
 @pytest.mark.parametrize("mode", ["matched", "stale"])
-def test_all_zero_inputs_give_finite_outputs(mode):
-    """All-zero Q, K and V give finite outputs and gradients at head_dim 128."""
+def test_all_zero_inputs_match_reference(mode, D):
+    """All-zero Q, K and V give zero O, dQ and dK and the reference dV."""
     import delta_matching as dm
-    B, N, H, Hk, D = 1, 512, 4, 2, 128
+    B, N, H, Hk = 1, 512, 4, 2
     q = torch.zeros(B, N, H, D, device="cuda", dtype=BF, requires_grad=True)
     k = torch.zeros(B, N, Hk, D, device="cuda", dtype=BF, requires_grad=True)
     v = torch.zeros(B, N, Hk, D, device="cuda", dtype=BF, requires_grad=True)
+    do = torch.randn(B, N, H, D, generator=torch.Generator(device="cpu").manual_seed(0)).to("cuda", BF)
     o = dm.dm_attn_func(q, k, v, causal=True, mode=mode)
-    o.backward(torch.randn_like(o))
-    for name, t in (("o", o), ("dq", q.grad), ("dk", k.grad), ("dv", v.grad)):
-        assert torch.isfinite(t.float()).all(), f"{name} has non-finite values"
+    o.backward(do)
+    p = torch.ones(N, N, device="cuda", dtype=torch.float64).tril()
+    p /= p.sum(-1, keepdim=True)
+    dv = torch.einsum("ij,bihd->bjhd", p, do.double()).view(B, N, Hk, H // Hk, D).sum(3)
     assert torch.equal(o, torch.zeros_like(o))
+    assert torch.equal(q.grad, torch.zeros_like(q)) and torch.equal(k.grad, torch.zeros_like(k))
+    err = float((v.grad.double() - dv).norm() / dv.norm())
+    assert err < 0.06, f"dV relative error {err:.4f}"
 
 
 def test_kernel_version_reports_the_loaded_library():
