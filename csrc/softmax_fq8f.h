@@ -289,6 +289,107 @@ struct SoftmaxFq8F {
         for (int mi = 0; mi < kNRows; ++mi) { row_sum(mi) = Is_first ? acc(mi) : row_sum(mi) + acc(mi); }
     };
 
+    // The grouped softmax on raw QK codes, with the S descale folded into the exp argument.
+    template <bool Is_first, bool Check_inf = false, typename Tensor0>
+    __forceinline__ __device__ TensorT max_get_scale_grouped_raw(Tensor0& acc_s, float const (&gsc)[kGroups]) {
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
+        MaxOp<float> max_op;
+        if constexpr (kGroups == 4) {
+            flash::thread_reduce_group_<0, /*zero_init=*/true, kColsPerGroup>(scores, ms_[0], max_op);
+            flash::thread_reduce_group_<1, /*zero_init=*/true, kColsPerGroup>(scores, ms_[1], max_op);
+            flash::thread_reduce_group_<2, /*zero_init=*/true, kColsPerGroup>(scores, ms_[2], max_op);
+            flash::thread_reduce_group_<3, /*zero_init=*/true, kColsPerGroup>(scores, ms_[3], max_op);
+        } else {
+            flash::thread_reduce_group_<0, /*zero_init=*/true, kColsPerGroup>(scores, ms_[0], max_op);
+            flash::thread_reduce_group_<1, /*zero_init=*/true, kColsPerGroup>(scores, ms_[1], max_op);
+        }
+        #pragma unroll
+        for (int g = 0; g < kGroups; ++g) {
+            flash::quad_allreduce_(ms_[g], ms_[g], max_op);
+            #pragma unroll
+            for (int mi = 0; mi < kNRows; ++mi) { ms_[g](mi) *= gsc[g]; }
+        }
+        TensorT scores_scale;
+        #pragma unroll
+        for (int mi = 0; mi < kNRows; ++mi) {
+            float const tile_max = [&] {
+                if constexpr (kGroups == 4) { return fmaxf(fmaxf(ms_[0](mi), ms_[1](mi)), fmaxf(ms_[2](mi), ms_[3](mi))); }
+                else { return fmaxf(ms_[0](mi), ms_[1](mi)); }
+            }();
+            if constexpr (Is_first) {
+                row_max(mi) = tile_max;
+                scores_scale(mi) = 1.f;
+            } else {
+                float const scores_max_prev = row_max(mi);
+                row_max(mi) = fmaxf(scores_max_prev, tile_max);
+                float const scores_max_cur = !Check_inf
+                    ? row_max(mi)
+                    : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
+                scores_scale(mi) = exp2f((scores_max_prev - scores_max_cur) * softmax_scale_log2);
+                row_sum(mi) *= scores_scale(mi);
+            }
+            float const floor_l2 = max_l2<Check_inf>(mi) - kFloorB;
+            #pragma unroll
+            for (int g = 0; g < kGroups; ++g) {
+                ms_[g](mi) = fmaxf(ms_[g](mi) * softmax_scale_log2, floor_l2) - kLog2_448;
+            }
+        }
+        return scores_scale;
+    };
+
+    template <bool Is_first, bool Check_inf = false, typename Tensor0>
+    __forceinline__ __device__ void online_softmax_grouped_raw(Tensor0& acc_s, float const (&gsc)[kGroups]) {
+        Tensor scores = make_tensor(acc_s.data(), flash::convert_layout_acc_rowcol(acc_s.layout()));
+        static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
+        static_assert(decltype(size<1>(scores))::value == kRowcol, "FQ8F: the rowcol fragment width must match kRowcol");
+        float gl2[kGroups];
+        #pragma unroll
+        for (int g = 0; g < kGroups; ++g) { gl2[g] = gsc[g] * softmax_scale_log2; }
+        #pragma unroll
+        for (int mi = 0; mi < size<0>(scores); ++mi) {
+            #pragma unroll
+            for (int ni = 0; ni < size<1>(scores); ++ni) {
+                scores(mi, ni) = exp2f(fmaf(scores(mi, ni), gl2[ni / kColsPerGroup], -ms_[ni / kColsPerGroup](mi)));
+            }
+        }
+        SumOp<float> sum_op;
+        TensorT part, acc;
+        cute::fill(acc, 0.f);
+        auto fold = [&](auto g_c, TensorT const& part_) {
+            constexpr int g = decltype(g_c)::value;
+            #pragma unroll
+            for (int mi = 0; mi < kNRows; ++mi) {
+                acc(mi) += exp2f(ms_[g](mi) - max_l2<Check_inf>(mi)) * part_(mi);
+            }
+        };
+        if constexpr (kGroups == 4) {
+            flash::thread_reduce_group_<0, true, kColsPerGroup>(scores, part, sum_op); fold(cute::Int<0>{}, part);
+            flash::thread_reduce_group_<1, true, kColsPerGroup>(scores, part, sum_op); fold(cute::Int<1>{}, part);
+            flash::thread_reduce_group_<2, true, kColsPerGroup>(scores, part, sum_op); fold(cute::Int<2>{}, part);
+            flash::thread_reduce_group_<3, true, kColsPerGroup>(scores, part, sum_op); fold(cute::Int<3>{}, part);
+        } else {
+            flash::thread_reduce_group_<0, true, kColsPerGroup>(scores, part, sum_op); fold(cute::Int<0>{}, part);
+            flash::thread_reduce_group_<1, true, kColsPerGroup>(scores, part, sum_op); fold(cute::Int<1>{}, part);
+        }
+        #pragma unroll
+        for (int mi = 0; mi < kNRows; ++mi) { row_sum(mi) = Is_first ? acc(mi) : row_sum(mi) + acc(mi); }
+    };
+
+    // Lazy O rescale: O is kept against a lagging per-row reference max and rebased only when it drifts past 2^8.
+    TensorT mref_;
+    __forceinline__ __device__ void init_ref() {
+        #pragma unroll
+        for (int mi = 0; mi < kNRows; ++mi) { mref_(mi) = max_l2</*Check_inf=*/true>(mi); }
+    }
+    template <int G>
+    __forceinline__ __device__ TensorT basis_ref(float v8sc_g) const {
+        TensorT c;
+        #pragma unroll
+        for (int mi = 0; mi < kNRows; ++mi) { c(mi) = v8sc_g * exp2f(ms_[G](mi) - mref_(mi)); }
+        return c;
+    }
+
     // ## FQ8F: c_last = v8sc_3 * 2^(ms_3 - m*log2e), the basis of the tile's
     // group-3 product.  ## V3-TILEPROMOTE: this is the promote weight w_3, read
     // once per 128-key tile while ms_[3] and row_max still belong to the tile

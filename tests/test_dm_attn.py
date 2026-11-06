@@ -146,3 +146,72 @@ def test_flash_attn_alias_and_argument_checks():
 def test_kernel_version_stamp():
     s = dm.kernel_version()
     assert s["fa_src_commit"] == dm.FA_SRC_COMMIT and len(s["code_sha"]) == 12 and s["numerics"]["128"]
+
+
+def _reference64(q, k, v, do):
+    """fp64 causal attention on the kernel's own dequantized codes, returning O, dQ, dK and dV."""
+    from delta_matching.core import blocks
+    from delta_matching.producers import doq_m17, quant_qkv_m17
+    B, N, H, D = q.shape
+    Hk = k.shape[2]
+    bq, bk = blocks(D)
+    Q8, Q8s, K8, K8s, V8, V8s, _, _ = quant_qkv_m17(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2),
+                                                    want_qt=True, blocks=blocks(D))
+    dO8, dO8s, _, _ = doq_m17(do, None, H, bq, want_delta=False, want_twin=False)
+
+    def deq(x8, s, blk, h):
+        return (x8.view(B * h, N // blk, blk, D).double() * s.view(B * h, N // blk, 1, 1).double()).view(B, h, N, D)
+    qd, kd, vd, dod = deq(Q8, Q8s, bq, H), deq(K8, K8s, bk, Hk), deq(V8, V8s, bk, Hk), deq(dO8, dO8s, bq, H)
+    kd, vd = kd.repeat_interleave(H // Hk, 1), vd.repeat_interleave(H // Hk, 1)
+    above = torch.ones(N, N, dtype=torch.bool, device=q.device).triu(1)
+    s = (qd @ kd.transpose(-1, -2)).masked_fill(above, float("-inf"))
+    p = torch.softmax(s, -1)
+    dp = dod @ vd.transpose(-1, -2)
+    ds = p * (dp - (p * dp).sum(-1, keepdim=True))
+    dq = D ** -0.5 * ds @ kd
+    dk = (ds.transpose(-1, -2) @ qd).view(B, Hk, H // Hk, N, D).sum(2)
+    dv = (p.transpose(-1, -2) @ dod).view(B, Hk, H // Hk, N, D).sum(2)
+    return tuple(x.transpose(1, 2) for x in (p @ vd, dq, dk, dv))
+
+
+def _rel64(x, r):
+    return float((x.double() - r).norm() / r.norm().clamp_min(1e-300))
+
+
+def _worst_row(x, r):
+    """Largest relative error over the rows."""
+    xr, rr = x.double().reshape(-1, x.shape[-1]), r.reshape(-1, r.shape[-1])
+    rn = rr.norm(dim=-1)
+    return float(((xr - rr).norm(dim=-1) / rn.clamp_min(1e-3 * float(rn.square().mean().sqrt()))).max())
+
+
+# N: one 256-row pass-0 CTA, partial last 192-row forward tiles (512, 1280, 1792), exact 192-multiples (768, 2304);
+# MHA, GQA, MQA; batch > 1
+@pytest.mark.parametrize("B,N,H,Hk", [(1, 256, 2, 1), (1, 512, 4, 2), (1, 768, 4, 2), (2, 1280, 4, 4), (1, 1792, 4, 1),
+                                      (1, 2304, 6, 3), (3, 1024, 6, 6), (2, 2048, 8, 2)])
+def test_hd128_matches_fp64_reference_rowwise(B, N, H, Hk):
+    """Head-dim 128 outputs match the fp64 reference both globally and row by row."""
+    q, k, v, do = _inputs(B, H, Hk, N, 128, N + 7 * H)
+    got = _run(q, k, v, do, "matched")
+    ref = _reference64(q, k, v, do)
+    bounds = ((0.04, 0.12), (0.06, 0.15), (0.06, 0.15), (0.06, 0.15))   # (global, worst row): ~2x / 3x the fp8 floor
+    for name, x, r, (glob, row) in zip(("O", "dQ", "dK", "dV"), got, ref, bounds):
+        assert _rel64(x, r) < glob, f"{name}: relative error {_rel64(x, r):.4f}"
+        assert _worst_row(x, r) < row, f"{name}: worst-row relative error {_worst_row(x, r):.4f}"
+
+
+def test_hd128_forward_lazy_rescale_rows_masked_in_first_tile():
+    """The lazy O rescale is correct on a row that sees no key in its first forward tile."""
+    N, D = 512, 128
+    sm = D ** -0.5
+    q, k, v = (torch.zeros(1, N, 1, D, device="cuda") for _ in range(3))
+    k[0, :256, 0, 0] = 1.0; k[0, 256:, 0, 0] = -1.0; k[0, :128, 0, 1] = 1.0
+    q[0, 192, 0, 0] = -3.0 / sm
+    q[0, 193, 0, 1] = 10.0 / (0.75 * sm)
+    v[0, 128:256, 0, 2] = 1.0
+    q, k, v = q.to(torch.bfloat16), k.to(torch.bfloat16), v.to(torch.bfloat16)
+    o = dm.dm_attn_func(q, k, v, causal=True, mode="matched")
+    ro = _reference64(q, k, v, torch.zeros_like(q))[0]
+    got, want = float(o[0, 192, 0, 2]), float(ro[0, 192, 0, 2])      # 0.337; the clamped rebase gave 0.015
+    assert abs(got - want) < 0.02 * want, (got, want)
+    assert _worst_row(o, ro) < 0.12

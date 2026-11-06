@@ -71,28 +71,30 @@
 #define FA3FP11_P0V7_LAZY 0
 #endif
 
+// Pass 0 at head_dim 128, with four consumer warpgroups per CTA when seqlen_q % 256 == 0, else two.
 namespace flash {
 
 using namespace cute;
 
-template <bool Is_causal>
+template <bool Is_causal, int kNWG_>
 struct DeltaV6 {
     using Element = cutlass::float_e4m3_t;
     using ElementAccum = float;
     static constexpr int kBlockM = 64;       // per warpgroup
-    static constexpr int kRowsCTA = 128;     // two warpgroups = one Q/dO scale block
+    static constexpr int kNWG = kNWG_;
+    static constexpr int kRowsCTA = 64 * kNWG;   // one (kNWG 2) or two (kNWG 4) Q/dO scale blocks
     static constexpr int kBlockN = 64;       // per n-block (one K/V scale group)
     static constexpr int kNbPerStage = 2;    // 128 keys per stage
     static constexpr int kHeadDim = 128;
     static constexpr int kStages = FA3FP11_HD128_P0V5_ST;
     static constexpr int kAtomN = 64;
-    static constexpr int NumMmaWarpGroups = 2;
+    static constexpr int NumMmaWarpGroups = kNWG;
     static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
     static constexpr int NumProducerThreads = cutlass::NumThreadsPerWarpGroup;
     static constexpr int MaxThreadsPerBlock = NumMmaThreads + NumProducerThreads;
     static constexpr int MinBlocksPerMultiprocessor = 1;
-    static constexpr uint32_t LoadRegisterRequirement = 40;
-    static constexpr uint32_t MmaRegisterRequirement = 232;
+    static constexpr uint32_t LoadRegisterRequirement = kNWG == 2 ? 40 : 24;
+    static constexpr uint32_t MmaRegisterRequirement = kNWG == 2 ? 232 : 104;
 
     using TileShape_MNK = Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = Shape<_1, _1, _1>;
@@ -204,9 +206,9 @@ struct DeltaV6 {
         MainloopPipeline pipeline_kv(shared_storage.pipelines.pipeline_kv, pipeline_params, ClusterShape{});
         __syncthreads();
 
-        // CTA = (m-pair p, bh); longest first for the causal tail (as pass 2).
-        int const p = params.npairs - 1 - int(blockIdx.x);
-        int const bh = int(blockIdx.y);
+        // CTA = (m-pair p, bh); grid (bh, p) with x fastest, so the longest row blocks of all heads go first.
+        int const p = params.npairs - 1 - int(blockIdx.y);
+        int const bh = int(blockIdx.x);
         int const bidb = bh / params.num_heads;
         int const bidh = bh - bidb * params.num_heads;
         int const bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
@@ -294,7 +296,7 @@ struct DeltaV6 {
             }
         } else {  // ---------------- consumer warpgroups ----------------
             cutlass::arch::warpgroup_reg_alloc<MmaRegisterRequirement>();
-            int const thread_idx = threadIdx.x - NumProducerThreads;   // 0..255
+            int const thread_idx = threadIdx.x - NumProducerThreads;   // 0 .. NumMmaThreads - 1
             int const wg = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarpGroup, 0);   // ## M21: warp-uniform for ptxas (uniform descriptors)
             int const wtid = thread_idx % cutlass::NumThreadsPerWarpGroup;
             int const m_block = kRowsCTA / kBlockM * p + wg;
@@ -321,8 +323,9 @@ struct DeltaV6 {
             int const fq8_bh_kv = bidb * get<2>(params.shape_K) + bidh_kv;
             float const* fq8_k8s_base = params.ptr_k8s + fq8_bh_kv * params.nblk_k;
             float const* fq8_v8s_base = params.ptr_v8s + fq8_bh_kv * params.nblk_k;
-            float const fq8_q8sc = params.ptr_q8s[bh * params.nblk_q + p];      // one Q/dO scale block per CTA (128 rows)
-            float const fq8_do8sc = params.ptr_do8s[bh * params.nblk_q + p];
+            int const qblk = (kRowsCTA / 128) * p + wg / 2;   // the warpgroup's 128-row Q/dO scale block
+            float const fq8_q8sc = params.ptr_q8s[bh * params.nblk_q + qblk];
+            float const fq8_do8sc = params.ptr_do8s[bh * params.nblk_q + qblk];
             static constexpr float kFq8MoE = 8.0f;
             static constexpr float kFq8MoInv = 1.0f / 256.0f;
 
@@ -330,51 +333,144 @@ struct DeltaV6 {
             if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_QdO.wait(0); }
             float const lse0 = __fmul_rn(sLSE(row0, wg), float(M_LOG2E));   // the host prep's exact multiply
             float const lse1 = __fmul_rn(sLSE(row1, wg), float(M_LOG2E));
+            // P-hat = exp2(fma(s, dsc, -b)), b = fma(lse, log2e, -8), unclamped on unmasked tiles; masked tiles keep
+            // the clamped line.  Pass 1 must use the same line and tile predicate (P is shared bit for bit).
+            float const bx0 = __fmaf_rn(sLSE(row0, wg), float(M_LOG2E), -kFq8MoE);
+            float const bx1 = __fmaf_rn(sLSE(row1, wg), float(M_LOG2E), -kFq8MoE);
             // The v4b per-tile arithmetic, VERBATIM: (1) S~ -> P~ (mask, descale, LSE, F1 clamp, exp2), (2) the fixed-order
             // half row sums; (3) the M5 reduce's fp64 fold (n-block ascending, half 0 then half 1) in registers.
             // ## M21 diet: the mask is a no-op on every n-block whose keys all lie at or below the row block's diagonal and
             // inside seqlen_k; skipping it there is bitwise (no element would have been set to -inf).  Warpgroup-uniform.
             int const fq8_diag_off = seqlen_k - seqlen_q;
-            auto exp_step = [&](auto& tSrS, int n_block, float dsc_g0, float dsc_g1) {
+            auto exp_step_t = [&](auto may_mask_c, auto& tSrS, int n_block, float dsc_g0, float dsc_g1) {
+                constexpr bool MayMask = decltype(may_mask_c)::value;
                 Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
                 static_assert(decltype(size<0>(scores))::value == 2 && decltype(size<1>(scores))::value == 16,
                               "DeltaV6: expected 2 rows x 16 columns per thread for a 64x64 tile");
                 bool const need_mask = (Is_causal && (n_block + 1) * kBlockN > m_block * kBlockM + fq8_diag_off)
                                        || ((n_block + 1) * kBlockN > seqlen_k);
-                if (need_mask) {
+                if (MayMask && need_mask) {
                     mask.template apply<true /*Seqlenk_mask*/, Is_causal, false /*Is_local*/>(tSrS, m_block, n_block);
                 }
-                #pragma unroll
-                for (int mi = 0; mi < 2; ++mi) {
-                    float const lse_scaled = mi == 0 ? lse0 : lse1;
+                // Floored at FLT_MIN where a tile may be masked: a zero Q block times a zero K block underflows to 0,
+                // and -inf * 0 = NaN would become P = 2^12 on the masked entries.
+                if constexpr (MayMask) { dsc_g0 = fmaxf(dsc_g0, 1.17549435e-38f); dsc_g1 = fmaxf(dsc_g1, 1.17549435e-38f); }
+                // y = fma(s, dsc, -B): B = b off the masked tiles; on them B = fl(lse log2e), then + 8
+                {
+                    bool const orig = MayMask && need_mask;   // the mask-free loop never holds a masked tile
+                    float const B0 = orig ? lse0 : bx0, B1 = orig ? lse1 : bx1;
                     #pragma unroll
-                    for (int ni = 0; ni < 16; ++ni) {
-                        float const dsc = (ni >> 3) == 0 ? dsc_g0 : dsc_g1;
-                        scores(mi, ni) = exp2f(fminf(scores(mi, ni) * dsc - lse_scaled + kFq8MoE, kFq8MoE + 4.0f));
+                    for (int mi = 0; mi < 2; ++mi) {
+                        #pragma unroll
+                        for (int ni = 0; ni < 16; ++ni) {
+                            float const dsc = (ni >> 3) == 0 ? dsc_g0 : dsc_g1;
+                            scores(mi, ni) = __fmaf_rn(scores(mi, ni), dsc, -(mi == 0 ? B0 : B1));
+                        }
+                    }
+                    if (orig) {
+                        #pragma unroll
+                        for (int i = 0; i < size(scores); ++i) { scores(i) = __fadd_rn(scores(i), kFq8MoE); }
+                    }
+                    if (orig) {
+                        #pragma unroll
+                        for (int i = 0; i < size(scores); ++i) { scores(i) = exp2f(fminf(scores(i), 12.0f)); }
+                    } else {
+                        #pragma unroll
+                        for (int i = 0; i < size(scores); ++i) { scores(i) = exp2f(scores(i)); }
                     }
                 }
             };
-            flash::SumOp<float> fq8_sum_op;
-            double acc0 = 0.0, acc1 = 0.0;
+
+            auto exp_step = [&](auto& tSrS, int n_block, float dsc_g0, float dsc_g1) {
+                exp_step_t(cute::true_type{}, tSrS, n_block, dsc_g0, dsc_g1);
+            };
+            // Row sums: per tile each lane adds its two fixed-order fp32 half partials (dP descale once per half),
+            // scales by 2^-8 and accumulates into fp64 per row; the quad is reduced once, in fp64, after the loop.
+            // Fixed order and one writer per row: deterministic.
+            double acc_q0 = 0.0, acc_q1 = 0.0;   // this lane's partial of row0 / row1
+            double acc_r = 0.0;                  // the quad-reduced row value this lane stores (quad_hi: row1)
+            bool const quad_hi = (wtid & 2) != 0;
             auto rowsum_step = [&](auto& tSrS, auto& tdPrdP, float dp_g0, float dp_g1) {
                 Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
                 Tensor dPv = make_tensor(tdPrdP.data(), scores.layout());
+                float a[2][2];
                 #pragma unroll
                 for (int mi = 0; mi < 2; ++mi) {
                     float a0 = 0.f, a1 = 0.f;
                     #pragma unroll
-                    for (int ni = 0; ni < 8; ++ni) { a0 = fmaf(scores(mi, ni), dPv(mi, ni) * dp_g0, a0); }
+                    for (int ni = 0; ni < 8; ++ni) { a0 = fmaf(scores(mi, ni), dPv(mi, ni), a0); }
                     #pragma unroll
-                    for (int ni = 8; ni < 16; ++ni) { a1 = fmaf(scores(mi, ni), dPv(mi, ni) * dp_g1, a1); }
-                    a0 = flash::Allreduce<4>::run(a0, fq8_sum_op);
-                    a1 = flash::Allreduce<4>::run(a1, fq8_sum_op);
-                    // the pass-0.5 fold: part(j, half 0) then part(j, half 1), each a fp32 value added into fp64
-                    float const p0 = a0 * kFq8MoInv;
-                    float const p1 = a1 * kFq8MoInv;
-                    if (mi == 0) { acc0 += double(p0); acc0 += double(p1); } else { acc1 += double(p0); acc1 += double(p1); }
+                    for (int ni = 8; ni < 16; ++ni) { a1 = fmaf(scores(mi, ni), dPv(mi, ni), a1); }
+                    a[mi][0] = a0 * dp_g0; a[mi][1] = a1 * dp_g1;   // the dP descale, once per 8-key half
                 }
+                acc_q0 += double((a[0][0] + a[0][1]) * kFq8MoInv);
+                acc_q1 += double((a[1][0] + a[1][1]) * kFq8MoInv);
             };
 
+            if constexpr (kNWG == 4) {
+                PipelineState smem_pipe_read;
+                Tensor tSrS = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
+                Tensor tdPrdP = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
+                float2 const* fq8_k8s_2 = reinterpret_cast<float2 const*>(fq8_k8s_base);
+                float2 const* fq8_v8s_2 = reinterpret_cast<float2 const*>(fq8_v8s_base);
+                int const nb_last = Is_causal ? (m_block * kBlockM + kBlockM - 1 + fq8_diag_off) / kBlockN : (1 << 30);   // later n-blocks: fully masked
+                int s0_tail = 0;
+                // Leading stages that need no mask (need_mask is monotone in the n-block) run without the mask test.
+                {
+                    int const xdiag = m_block * kBlockM + fq8_diag_off;
+                    int const nbm0c = Is_causal ? (xdiag <= 0 ? 0 : xdiag / kBlockN) : (1 << 30);
+                    int const nbm0 = min(nbm0c, params.nbn);            // first n-block that needs the mask
+                    s0_tail = min(max(nbm0 / kNbPerStage, 0), nstages);
+                }
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (int s = 0; s < s0_tail; ++s) {
+                    float2 const k2 = fq8_k8s_2[s], v2 = fq8_v8s_2[s];
+                    auto tok = pipeline_kv.consumer_try_wait(smem_pipe_read);
+                    pipeline_kv.consumer_wait(smem_pipe_read, tok);
+                    int const slot0 = kNbPerStage * smem_pipe_read.index();
+                    #pragma unroll
+                    for (int j = 0; j < kNbPerStage; ++j) {
+                        int const nb = kNbPerStage * s + j;
+                        flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma, tSrQ(_, _, _, wg), tSrK(_, _, _, slot0 + j), tSrS);
+                        flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma, tdPrdO(_, _, _, wg), tdPrV(_, _, _, slot0 + j), tdPrdP);
+                        float const dsc = fq8_q8sc * (j == 0 ? k2.x : k2.y) * float(M_LOG2E);
+                        float const dp = fq8_do8sc * (j == 0 ? v2.x : v2.y);
+                        warpgroup_wait<1>();
+                        warpgroup_fence_operand(tSrS);
+                        exp_step_t(cute::false_type{}, tSrS, nb, dsc, dsc);
+                        warpgroup_wait<0>();
+                        warpgroup_fence_operand(tdPrdP);
+                        rowsum_step(tSrS, tdPrdP, dp, dp);
+                    }
+                    pipeline_kv.consumer_release(smem_pipe_read);
+                    ++smem_pipe_read;
+                }
+                CUTLASS_PRAGMA_NO_UNROLL
+                for (int s = s0_tail; s < nstages; ++s) {
+                    float2 const k2 = fq8_k8s_2[s], v2 = fq8_v8s_2[s];
+                    auto tok = pipeline_kv.consumer_try_wait(smem_pipe_read);
+                    pipeline_kv.consumer_wait(smem_pipe_read, tok);
+                    int const slot0 = kNbPerStage * smem_pipe_read.index();
+                    #pragma unroll
+                    for (int j = 0; j < kNbPerStage; ++j) {
+                        int const nb = kNbPerStage * s + j;
+                        if (nb <= nb_last && nb < n_block_max) {
+                            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma, tSrQ(_, _, _, wg), tSrK(_, _, _, slot0 + j), tSrS);
+                            flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma, tdPrdO(_, _, _, wg), tdPrV(_, _, _, slot0 + j), tdPrdP);
+                            float const dsc = fq8_q8sc * (j == 0 ? k2.x : k2.y) * float(M_LOG2E);
+                            float const dp = fq8_do8sc * (j == 0 ? v2.x : v2.y);
+                            warpgroup_wait<1>();
+                            warpgroup_fence_operand(tSrS);
+                            exp_step(tSrS, nb, dsc, dsc);
+                            warpgroup_wait<0>();
+                            warpgroup_fence_operand(tdPrdP);
+                            rowsum_step(tSrS, tdPrdP, dp, dp);
+                        }
+                    }
+                    pipeline_kv.consumer_release(smem_pipe_read);
+                    ++smem_pipe_read;
+                }
+            } else {
             // Warp-scheduler ping-pong: WG0 takes the first turn (WG1 pre-arrives on WG0's barrier).
             auto sched_sync = [&]() {
             };
@@ -386,8 +482,13 @@ struct DeltaV6 {
             Tensor tSrS1 = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
             Tensor tdPrdP1 = partition_fragment_C(tiled_mma, select<0, 1>(TileShape_MNK{}));
             // Per-n-block scales: this stage's two groups (prefetched one stage ahead).
-            float k8s_n0 = fq8_k8s_base[0], k8s_n1 = fq8_k8s_base[1 < params.nbn ? 1 : 0];
-            float v8s_n0 = fq8_v8s_base[0], v8s_n1 = fq8_v8s_base[1 < params.nbn ? 1 : 0];
+            // One 8-byte load per stage and tensor: nblk_k is even, so the per-head base is 8-byte aligned; no clamp is
+            // needed, since a next stage exists whenever HasNext.
+            float2 const* fq8_k8s_2 = reinterpret_cast<float2 const*>(fq8_k8s_base);
+            float2 const* fq8_v8s_2 = reinterpret_cast<float2 const*>(fq8_v8s_base);
+            float2 k8s_2 = fq8_k8s_2[0], v8s_2 = fq8_v8s_2[0];
+            float k8s_n0 = k8s_2.x, k8s_n1 = k8s_2.y;
+            float v8s_n0 = v8s_2.x, v8s_n1 = v8s_2.y;
             // Prologue: the first stage's (S0, dP0) in flight before the loop (v4b).
             {
                 auto tok = pipeline_kv.consumer_try_wait(smem_pipe_read);
@@ -413,9 +514,8 @@ struct DeltaV6 {
                 float const dp0 = fq8_do8sc * v8s_n0;
                 float const dp1 = fq8_do8sc * v8s_n1;
                 if constexpr (HasNext) {
-                    int const nn0 = nb0 + kNbPerStage, nn1 = nn0 + 1;
-                    k8s_n0 = fq8_k8s_base[nn0 < params.nbn ? nn0 : 0]; k8s_n1 = fq8_k8s_base[nn1 < params.nbn ? nn1 : 0];
-                    v8s_n0 = fq8_v8s_base[nn0 < params.nbn ? nn0 : 0]; v8s_n1 = fq8_v8s_base[nn1 < params.nbn ? nn1 : 0];
+                    float2 const kn = fq8_k8s_2[s + 1], vn = fq8_v8s_2[s + 1];
+                    k8s_n0 = kn.x; k8s_n1 = kn.y; v8s_n0 = vn.x; v8s_n1 = vn.y;
                 }
                 sched_sync();
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma, tSrQ(_, _, _, wg), tSrK(_, _, _, slot1), tSrS1);
@@ -454,11 +554,18 @@ struct DeltaV6 {
             CUTLASS_PRAGMA_NO_UNROLL
             for (int s = 0; s < nstages - 1; ++s) { step(s, cute::true_type{}, cute::Int<-1>{}); }
             step(nstages - 1, cute::false_type{}, cute::Int<-1>{});
-            // One writer per row: the quad leader stores the fp64 fold rounded once to fp32.
-            if ((wtid & 3) == 0) {
-                int const r0 = m_block * kBlockM + row0, r1 = m_block * kBlockM + row1;
-                if (r0 < seqlen_q) { params.ptr_dlt[int64_t(bh) * seqlen_q + r0] = float(acc0); }
-                if (r1 < seqlen_q) { params.ptr_dlt[int64_t(bh) * seqlen_q + r1] = float(acc1); }
+            }
+            {
+                double r0 = acc_q0 + __shfl_xor_sync(uint32_t(-1), acc_q0, 1);
+                double r1 = acc_q1 + __shfl_xor_sync(uint32_t(-1), acc_q1, 1);
+                r0 = r0 + __shfl_xor_sync(uint32_t(-1), r0, 2);
+                r1 = r1 + __shfl_xor_sync(uint32_t(-1), r1, 2);
+                acc_r = quad_hi ? r1 : r0;
+            }
+            // One writer per row: quad lane 0 stores row0's fp64 fold rounded once to fp32, quad lane 2 row1's.
+            if ((wtid & 1) == 0) {
+                int const r = m_block * kBlockM + (quad_hi ? row1 : row0);
+                if (r < seqlen_q) { params.ptr_dlt[int64_t(bh) * seqlen_q + r] = float(acc_r); }
             }
         }
     }
@@ -466,15 +573,15 @@ struct DeltaV6 {
 
 }  // namespace flash
 
-template <bool Is_causal>
-void run_flash_delta_v6_fp11_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
-    using Kernel = flash::DeltaV6<Is_causal>;
+template <bool Is_causal, int kNWG>
+void run_flash_delta_v6_fp11_hd128_w(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    using Kernel = flash::DeltaV6<Is_causal, kNWG>;
     using Element = typename Kernel::Element;
     using namespace cute;
     int const seqlen_q = params.seqlen_q;
     int const seqlen_k = params.seqlen_k;
     if (seqlen_q % Kernel::kRowsCTA != 0 || seqlen_k % (Kernel::kNbPerStage * Kernel::kBlockN) != 0) {
-        fprintf(stderr, "[delta_matching pass 0] seqlen_q and seqlen_k must be 128-multiples (got %d, %d)\n", seqlen_q, seqlen_k); exit(1);
+        fprintf(stderr, "[delta_matching pass 0] seqlen_q must be a %d-multiple and seqlen_k a 128-multiple (got %d, %d)\n", Kernel::kRowsCTA, seqlen_q, seqlen_k); exit(1);
     }
     int const nbm = seqlen_q / Kernel::kBlockM;
     int const nbn = seqlen_k / Kernel::kBlockN;
@@ -509,7 +616,7 @@ void run_flash_delta_v6_fp11_hd128(Flash_bwd_fp8_params &params, cudaStream_t st
         params.dlt_ptr,
         nbm, nbn, npairs, params.b, params.h
     };
-    dim3 grid_dims(npairs, params.b * params.h, 1);
+    dim3 grid_dims(params.b * params.h, npairs, 1);
     dim3 block_dims(Kernel::MaxThreadsPerBlock, 1, 1);
     int smem_size = Kernel::SharedStorageSize;
     auto kernel = cutlass::device_kernel<Kernel>;
@@ -523,4 +630,12 @@ void run_flash_delta_v6_fp11_hd128(Flash_bwd_fp8_params &params, cudaStream_t st
     kernel<<<grid_dims, block_dims, smem_size, stream>>>(kp);
     { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { fprintf(stderr, "[delta_matching pass 0] launch: %s\n", cudaGetErrorString(e_)); exit(1); } }
     // No pass 0.5: the fold ran in registers.
+}
+
+// Runs pass 0 with 256-row CTAs when seqlen_q % 256 == 0, else with 128-row CTAs.
+// The two agree only to fp32 round-off.
+template <bool Is_causal>
+void run_flash_delta_v6_fp11_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+    if (params.seqlen_q % 256 == 0) { run_flash_delta_v6_fp11_hd128_w<Is_causal, 4>(params, stream); }
+    else { run_flash_delta_v6_fp11_hd128_w<Is_causal, 2>(params, stream); }
 }
