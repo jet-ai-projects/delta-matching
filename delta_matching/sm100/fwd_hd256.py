@@ -25,9 +25,9 @@ def _cache():
         # cache key: the same fingerprint as every other DM kernel = FA4 source fingerprint +
         # ALL delta_matching/sm100/*.py bytes + fwd.compile_env() (DSL lineinfo/opt/debug, SM count, fence settings, ...).
         # (Was: only 4 files and no compile settings -> a change in dm_common*.py / quant*.py or the DSL settings kept the key.)
-        from .fwd import _fingerprint
+        from .compile_cache_sm100 import fingerprint
         if cache_utils.CUTE_DSL_CACHE_ENABLED:
-            _CACHE = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / _fingerprint() / "fwd_hd256")
+            _CACHE = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / fingerprint() / "fwd_hd256")
         else:
             _CACHE = cache_utils.JITCache()
     return _CACHE

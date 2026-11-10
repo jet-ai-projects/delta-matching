@@ -18,7 +18,7 @@ DETERMINISTIC = True
 def _cfg():
     """(scratch cap GiB, Dqg stages, KV2 store mode).  Cap: DM_BWD_WS_LIMIT_GB,
     DM_H256_DQW_GB = the older name, honoured if DM_BWD_WS_LIMIT_GB is unset."""
-    from .fastpath import env as _env
+    from .launch_cache_sm100 import env as _env
     cap = _env("DM_BWD_WS_LIMIT_GB", None)
     cap = _env("DM_H256_DQW_GB", "8") if cap is None else cap
     return float(cap), int(_env("DM_H256_DQG_STAGES", "3")), _env("DM_H256_DQW_MODE", "dqt")
@@ -27,7 +27,7 @@ def _cfg():
 def _groups_mode():
     """DM_BWD_HEAD_GROUPS (as sm90 split.py): "auto" (default) = whole call, else batch chunks, else KV-head-group chunks, whichever
     is the first to fit the cap; "off" = never split heads (batch chunks only); <n> = force n KV-head groups per call."""
-    from .fastpath import env as _env
+    from .launch_cache_sm100 import env as _env
     v = str(_env("DM_BWD_HEAD_GROUPS", "auto")).strip().lower()
     assert v in ("auto", "off") or v.isdigit(), v
     return v
@@ -133,7 +133,7 @@ def plan(B, H, Hk, N, causal):
     the 2 GiB cap no carry plan beat the kv2 path by >= 2% (32k 8/2 q-head carry x1.079 / 0.970 / 1.004 in three sweeps, fwd+bwd +0.6%;
     band plans 0.94-0.98); "heads" = carry only over q-head ranges with ALL KV groups per chunk (no bands; e.g.
     64k 8/2 at 8 GiB x1.05); "1" = every carry class (bands, group subsets).  All three are bitwise (gate classes / dqc / wlock).  Every reduction keeps its unchunked order -> bitwise."""
-    from .fastpath import env as _env
+    from .launch_cache_sm100 import env as _env
     cap = _cfg()[0] * (1 << 30)
     r, nt = H // Hk, N // 128
     full = lambda b0, b1, g0, g1: dict(b0=b0, b1=b1, g0=g0, g1=g1, h0=0, h1=r, q0=0, q1=nt)  # noqa: E731

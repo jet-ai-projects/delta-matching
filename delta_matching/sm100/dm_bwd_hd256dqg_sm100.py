@@ -3,7 +3,7 @@
 dQ = dS . K from the dS codes that KV2 (DmHd256Kv2 opt dqw) stored to the workspace W / Wsb -- NO S / dP / exp recompute here.
 Bitwise the dq kernel (DmHd256Mx2 impl 13) by construction:
   * the same codes (KV2's dS codes == the dq kernel's, lockstep dbg-8 slot 2) and the same raw block exponents ds_sb;
-  * the same MMA: kind::mxf8f6f4 cta_group::1 M=128 N=256 K=32 (dm_utils.gemm_ptx_bs), 4 k-steps ascending per 128-key tile, key tiles
+  * the same MMA: kind::mxf8f6f4 cta_group::1 M=128 N=256 K=32 (gemm_ptx_bs), 4 k-steps ascending per 128-key tile, key tiles
     ascending (causal: 0..q tile), zero-init on the first tile; SFA = add_sb_clamp(ds_sb, sb_of(ks)) per 32-key block (one word,
     byte k = k-step k), SFB = 0x7F; A = W tile via TMA (MN-major A: queries contiguous), B = K tile via the T view (MN-major B, as yr);
   * the same epilogue: x * 2^-4, bf16x2 RN, one writer per element.
@@ -27,8 +27,11 @@ from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from delta_matching.sm100 import dm_utils
-from delta_matching.sm100.dm_common_hd256 import tmem_ld32, bf16x2, st_global_v4, mul_f32, _gaddr, _asm
+from delta_matching.sm100.cute_ptx_sm100 import tmem_ld32, bf16x2, st_global_v4, mul_f32, global_address, inline_asm
+from delta_matching.sm100.cute_ptx_sm100 import mbar_init, tc_commit, tmem_st_x1, tmem_st_x4
+from delta_matching.sm100.fp8_e8m0_scale_sm100 import add_sb_clamp
+from delta_matching.sm100.mma_sm100 import gemm_ptx_bs
+from delta_matching.sm100.tcgen05_fence_sm100 import mbar_wait_parity
 from delta_matching.sm100.dm_bwd_hd256mx_sm100 import spin, sb_of, pack4, tc_fence_before, tc_fence_after
 
 F8 = cutlass.Float8E4M3FN
@@ -37,18 +40,18 @@ SM = 0.0625
 
 @dsl_user_op
 def ld_global_u32(addr: Int64, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.global.u32 $0, [$1];", "=r,l", True, loc, ip))
+    return Int32(inline_asm(T.i32(), [Int64(addr).ir_value(loc=loc, ip=ip)], "ld.global.u32 $0, [$1];", "=r,l", True, loc, ip))
 
 
 @dsl_user_op
 def byte_of(w: Int32, k: int, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [Int32(w).ir_value(loc=loc, ip=ip)], f"bfe.u32 $0, $1, {8 * k}, 8;", "=r,r", False, loc, ip))
+    return Int32(inline_asm(T.i32(), [Int32(w).ir_value(loc=loc, ip=ip)], f"bfe.u32 $0, $1, {8 * k}, 8;", "=r,r", False, loc, ip))
 
 
 @dsl_user_op
 def bulk_g2s(saddr: Int32, gaddr: Int64, nbytes: int, mbar: Int32, *, loc=None, ip=None):
     """1-D bulk copy gmem -> smem completing nbytes of tx on mbar (wsw: the W tile is already the swizzled smem image)."""
-    _asm(None, [Int32(saddr).ir_value(loc=loc, ip=ip), Int64(gaddr).ir_value(loc=loc, ip=ip), Int32(mbar).ir_value(loc=loc, ip=ip)],
+    inline_asm(None, [Int32(saddr).ir_value(loc=loc, ip=ip), Int64(gaddr).ir_value(loc=loc, ip=ip), Int32(mbar).ir_value(loc=loc, ip=ip)],
          f"cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [$0], [$1], {int(nbytes)}, [$2];",
          "r,l,r", True, loc, ip)
 
@@ -56,7 +59,7 @@ def bulk_g2s(saddr: Int32, gaddr: Int64, nbytes: int, mbar: Int32, *, loc=None, 
 @dsl_user_op
 def warp_arrive(mbar: Int32, *, loc=None, ip=None):
     """bar.warp.sync, then lane 0 mbarrier.arrive.release.cta (every lane did its own wait::st + fence::before first)."""
-    _asm(None, [Int32(mbar).ir_value(loc=loc, ip=ip)],
+    inline_asm(None, [Int32(mbar).ir_value(loc=loc, ip=ip)],
          "{\n\t.reg .pred p;\n\t.reg .b32 l;\n\tbar.warp.sync 0xffffffff;\n\tmov.u32 l, %laneid;\n\t"
          "setp.eq.u32 p, l, 0;\n\t@p mbarrier.arrive.release.cta.shared::cta.b64 _, [$0];\n\t}", "r", True, loc, ip)
 
@@ -173,8 +176,8 @@ class DmHd256Dqg:
         if warp == self.MMA_WARP:
             with cute.arch.elect_one():
                 for s_ in cutlass.range_constexpr(S):
-                    dm_utils.mbar_init(SFF + 8 * s_, 4)
-                dm_utils.mbar_init(FIN, 1)
+                    mbar_init(SFF + 8 * s_, 4)
+                mbar_init(FIN, 1)
         cute.arch.mbarrier_init_fence()
 
         tmem = utils.TmemAllocator(st.tmem_hold.ptr,
@@ -193,7 +196,7 @@ class DmHd256Dqg:
             thr_o = mma_o.get_slice(0)
             sA_addr = Int32(st.sA.data_ptr().toint())
             a_stage = cute.cosize(a_l) // S
-            wbase = _gaddr(mW)
+            wbase = global_address(mW)
             tAs, tAg = cpasync.tma_partition(tma_A, 0, cute.make_layout(1), cute.group_modes(sA, 0, 3),
                                              cute.group_modes(thr_o.partition_A(mA), 0, 3))
             gT = cute.local_tile(mKt[None, None, hk, b], (D, self.TN), (0, None))
@@ -217,7 +220,7 @@ class DmHd256Dqg:
             for kt in cutlass.range(total, unroll=1):
                 s = kt % S
                 f = ab_c.wait_and_advance()
-                dm_utils.mbar_wait_parity(SFF + 8 * s, (kt // S) & 1)
+                mbar_wait_parity(SFF + 8 * s, (kt // S) & 1)
                 tc_fence_after()
                 if const_expr(self.kn == "ab"):
                     if const_expr(self.unsafe):
@@ -229,7 +232,7 @@ class DmHd256Dqg:
                 if const_expr(self.kn == "fin"):
                     if kt == total - 1:
                         spin(self.DLY)
-                dm_utils.gemm_ptx_bs(
+                gemm_ptx_bs(
                     mma_op, tmem_base + self.COL_ACC, tCrA[(None, None, None, f.index)], tCrT[(None, None, None, f.index)],
                     sA[(None, None, None, f.index)], sT[(None, None, None, f.index)],
                     tmem_base + self.COL_SF + 4 * s, tmem_base + self.COL_SFB,
@@ -238,16 +241,16 @@ class DmHd256Dqg:
                 if const_expr(not (self.kn == "ab" and self.unsafe)):
                     f.release()      # tcgen05.commit -> ab-empty[s]: covers this stage's 4 MMAs
             with cute.arch.elect_one():
-                dm_utils.tc_commit(FIN)
+                tc_commit(FIN)
 
         # ------------------------------------------------------------------ SF writers + epilogue (warps 0-3)
         if warp < 4:
             tb = tmem_base + Int32((warp * 32) << 16)
             # SFB = 1.0 (0x7F), once; published by the first sff arrive below (same threads, program order + fences)
             onew = Int32(0x7F7F7F7F)
-            dm_utils.tmem_st_x4(tb + self.COL_SFB, onew, onew, onew, onew)       # N = 256: 8 SFB columns (as Mx2)
-            dm_utils.tmem_st_x4(tb + self.COL_SFB + 4, onew, onew, onew, onew)
-            wsb_base = _gaddr(mWsb)
+            tmem_st_x4(tb + self.COL_SFB, onew, onew, onew, onew)       # N = 256: 8 SFB columns (as Mx2)
+            tmem_st_x4(tb + self.COL_SFB + 4, onew, onew, onew, onew)
+            wsb_base = global_address(mWsb)
             wnext = ld_global_u32(wsb_base + tbase * 4)
             for kt in cutlass.range(total, unroll=1):
                 s = kt % S
@@ -257,33 +260,33 @@ class DmHd256Dqg:
                     kv[k] = Float32(mKs[b, hk, kt * 4 + k])
                 if kt + 1 < total:
                     wnext = ld_global_u32(wsb_base + (tbase + kt + 1) * 4)
-                sfa = pack4(dm_utils.add_sb_clamp(byte_of(w, 0), sb_of(kv[0])),
-                            dm_utils.add_sb_clamp(byte_of(w, 1), sb_of(kv[1])),
-                            dm_utils.add_sb_clamp(byte_of(w, 2), sb_of(kv[2])),
-                            dm_utils.add_sb_clamp(byte_of(w, 3), sb_of(kv[3])))
+                sfa = pack4(add_sb_clamp(byte_of(w, 0), sb_of(kv[0])),
+                            add_sb_clamp(byte_of(w, 1), sb_of(kv[1])),
+                            add_sb_clamp(byte_of(w, 2), sb_of(kv[2])),
+                            add_sb_clamp(byte_of(w, 3), sb_of(kv[3])))
                 if kt >= S:
                     if const_expr(self.kn == "sw" and self.unsafe):
                         if kt > S:     # UNSAFE: the first reuse (kt == S) skips the WAR wait (bounded lead: no phase aliasing)
-                            dm_utils.mbar_wait_parity(abe_addr + 8 * s, ((kt // S) - 1) & 1)
+                            mbar_wait_parity(abe_addr + 8 * s, ((kt // S) - 1) & 1)
                             tc_fence_after()
                     else:
-                        dm_utils.mbar_wait_parity(abe_addr + 8 * s, ((kt // S) - 1) & 1)   # MMA(kt - S) complete
+                        mbar_wait_parity(abe_addr + 8 * s, ((kt // S) - 1) & 1)   # MMA(kt - S) complete
                         tc_fence_after()
                 if const_expr(self.kn == "sf"):
                     if const_expr(self.unsafe):
                         warp_arrive(SFF + 8 * s)       # UNSAFE: published before the SFA word is written
                     spin(self.DLY)
-                dm_utils.tmem_st_x1(tb + self.COL_SF + 4 * s + warp, sfa)       # SFA of rows 32 w.. at column + w (as Mx2)
+                tmem_st_x1(tb + self.COL_SF + 4 * s + warp, sfa)       # SFA of rows 32 w.. at column + w (as Mx2)
                 cute.arch.fence_view_async_tmem_store()
                 tc_fence_before()
                 if const_expr(not (self.kn == "sf" and self.unsafe)):
                     warp_arrive(SFF + 8 * s)
             # ---- epilogue: row 32 w + lane, 256 fp32 -> x 2^-4 -> bf16 ----
             if const_expr(not (self.kn == "fin" and self.unsafe)):
-                dm_utils.mbar_wait_parity(FIN, Int32(0))
+                mbar_wait_parity(FIN, Int32(0))
             tc_fence_after()
             q = ct * 128 + warp * 32 + lane
-            ob = _gaddr(mdQ) + ((Int64(b) * nrow + q) * H + h) * (D * 2)
+            ob = global_address(mdQ) + ((Int64(b) * nrow + q) * H + h) * (D * 2)
             for cb in cutlass.range_constexpr(8):
                 ov = tmem_ld32(tb + self.COL_ACC + 32 * cb)
                 cute.arch.fence_view_async_tmem_load()
@@ -293,7 +296,7 @@ class DmHd256Dqg:
                         wv[qq] = bf16x2(mul_f32(ov[i + 2 * qq], Float32(SM)), mul_f32(ov[i + 2 * qq + 1], Float32(SM)))
                     st_global_v4(ob + (32 * cb + i) * 2, wv[0], wv[1], wv[2], wv[3])
             if const_expr(self.kn == "fin" and self.unsafe):
-                dm_utils.mbar_wait_parity(FIN, Int32(0))   # UNSAFE: acc read before the final commit
+                mbar_wait_parity(FIN, Int32(0))   # UNSAFE: acc read before the final commit
             tc_fence_before()
         # teardown: every TMEM reader / MMA issuer fences before the barrier, the deallocator after
         if warp == self.MMA_WARP:

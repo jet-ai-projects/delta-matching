@@ -35,8 +35,11 @@ import flash_attn.cute.pipeline as pipeline_custom
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from flash_attn.cute import utils
 
-from delta_matching.sm100 import dm_utils
-from delta_matching.sm100.dm_utils import tmem_st_x4
+from delta_matching.sm100.cute_ptx_sm100 import tmem_st_x4
+from delta_matching.sm100.cute_ptx_sm100 import ceil_f32, clock64, floor_f32, globaltimer, mbar_init, nanosleep_1us, smid, tc_commit
+from delta_matching.sm100.fp8_e8m0_scale_sm100 import byte_pow2_f32, byte_shl23_f32, exp2i_f32, pack_bytes4, ue8m0_byte
+from delta_matching.sm100.mma_sm100 import gemm_ptx_bs
+from delta_matching.sm100.tcgen05_fence_sm100 import mbar_arrive, mbar_wait_parity, tcgen05_fence_after, tcgen05_fence_before
 
 LOG2E = float(np.float32(math.log2(math.e)))           # float(M_LOG2E) in fp32
 LN2 = float(np.float32(math.log(2.0)))                 # __logf: lg2.approx * 0x3F317218
@@ -498,20 +501,20 @@ class DMFwdHd256MxSm100:
             consumer_group=mma_warp, tx_count=self.tma_bytes_kv, cta_layout_vmnk=cluster_layout_vmnk, defer_sync=True)
         mbar = Int32(storage.mbar_dm.data_ptr().toint())
         if cute.arch.thread_idx()[0] == 0:
-            dm_utils.mbar_init(mbar + 0, 1)
-            dm_utils.mbar_init(mbar + 8, 1)
-            dm_utils.mbar_init(mbar + 16, 256 if self.c8 else 128)     # P_full[0] (C8: both WGs)
-            dm_utils.mbar_init(mbar + 24, 256 if self.c8 else 128)     # P_full[1]
-            dm_utils.mbar_init(mbar + 32, 1)
-            dm_utils.mbar_init(mbar + 40, 128)
-            dm_utils.mbar_init(mbar + 48, 128)
-            dm_utils.mbar_init(mbar + 56, 128)
-            dm_utils.mbar_init(mbar + 64, 128)
-            dm_utils.mbar_init(mbar + 72, 128)
-            dm_utils.mbar_init(mbar + 80, 128)     # state_full[0] (two_wg)
-            dm_utils.mbar_init(mbar + 88, 128)     # state_full[1]
-            dm_utils.mbar_init(mbar + 96, 128)     # S_empty[0] (C7b)
-            dm_utils.mbar_init(mbar + 104, 128)    # S_empty[1]
+            mbar_init(mbar + 0, 1)
+            mbar_init(mbar + 8, 1)
+            mbar_init(mbar + 16, 256 if self.c8 else 128)     # P_full[0] (C8: both WGs)
+            mbar_init(mbar + 24, 256 if self.c8 else 128)     # P_full[1]
+            mbar_init(mbar + 32, 1)
+            mbar_init(mbar + 40, 128)
+            mbar_init(mbar + 48, 128)
+            mbar_init(mbar + 56, 128)
+            mbar_init(mbar + 64, 128)
+            mbar_init(mbar + 72, 128)
+            mbar_init(mbar + 80, 128)     # state_full[0] (two_wg)
+            mbar_init(mbar + 88, 128)     # state_full[1]
+            mbar_init(mbar + 96, 128)     # S_empty[0] (C7b)
+            mbar_init(mbar + 104, 128)    # S_empty[1]
             cute.arch.mbarrier_init_fence()
         pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
@@ -587,9 +590,9 @@ class DMFwdHd256MxSm100:
             if const_expr(self.epi == 10):
                 # DEBUG POSITIVE CONTROL ONLY: an unordered ring writer ("ring released early"): wait final_full, let the last PV
                 # finish, poison the staging rows while the correction WG (epi 10) holds its staged rows -> O must be corrupted.
-                dm_utils.mbar_wait_parity(mbar + 64, Int32(0))
+                mbar_wait_parity(mbar + 64, Int32(0))
                 for _ in cutlass.range(8, unroll=1):
-                    dm_utils.nanosleep_1us()
+                    nanosleep_1us()
                 skb = Int32(sK.iterator.toint())
                 ln = cute.arch.lane_idx()
                 pz = Int32(-1)
@@ -604,18 +607,18 @@ class DMFwdHd256MxSm100:
             if const_expr(self.trace):
                 self.tr(-1, 0, Int64(m_block))
                 self.tr(-1, 1, Int64(cnt))
-                self.tr(-1, 2, Int64(dm_utils.smid()))
-                self.tr(-1, 3, dm_utils.globaltimer())
+                self.tr(-1, 2, Int64(smid()))
+                self.tr(-1, 3, globaltimer())
                 self.tr(-1, 4)
                 self.tr(-1, 7, Int64(head_idx))
                 self.tr(-1, 8, Int64(batch_idx))
             self.mma(tiled_mma_qk, tiled_mma_pv, sQ, sK, sV, sP, acc_qk, acc_pv, pipeline_q, pipeline_kv, mbar, cnt)
             tmem.relinquish_alloc_permit()
             if const_expr(self.ord_td):
-                dm_utils.tc_fence_before()
+                tcgen05_fence_before()
             tmem_alloc_barrier.arrive_and_wait_unaligned()
             if const_expr(self.ord_td):
-                dm_utils.tc_fence_after()
+                tcgen05_fence_after()
             tmem.free(tmem_ptr)
 
         if warp_idx <= self.softmax_warp_ids[-1]:
@@ -632,7 +635,7 @@ class DMFwdHd256MxSm100:
                 self.softmax(acc_qk, mbar, stats, sp_base, mLSE, mQS, mKVW, m_block, head_idx, kv_head_idx,
                              batch_idx, n_block_max, cnt)
             if const_expr(self.ord_td):
-                dm_utils.tc_fence_before()
+                tcgen05_fence_before()
             tmem_alloc_barrier.arrive_unaligned()
 
         if warp_idx >= self.correction_warp_ids[0] and warp_idx <= self.correction_warp_ids[-1]:
@@ -644,9 +647,9 @@ class DMFwdHd256MxSm100:
             self.correction(mbar, stats, mO, m_block, head_idx, batch_idx, cnt, Int32(sK.iterator.toint()))
             if const_expr(self.trace):
                 self.tr(-1, 5, None, warp_idx == 8)
-                self.tr(-1, 6, dm_utils.globaltimer(), warp_idx == 8)
+                self.tr(-1, 6, globaltimer(), warp_idx == 8)
             if const_expr(self.ord_td):
-                dm_utils.tc_fence_before()
+                tcgen05_fence_before()
             tmem_alloc_barrier.arrive_unaligned()
         return
 
@@ -661,7 +664,7 @@ class DMFwdHd256MxSm100:
         completion (warp 13) | 29 O_full(PV(j)) completion (warp 15).  Header row 0: 0 m_block 1 cnt 2 smid 3 globaltimer
         start 4 clock start (MMA warp) 5 clock end 6 globaltimer end (correction warp 8) 7 head 8 batch."""
         if const_expr(self.trace):
-            v = dm_utils.clock64() if val is None else val
+            v = clock64() if val is None else val
             tr_st(self._tb + Int64(Int32(j) + 1) * Int64(TR_E * 8) + Int64(ev * 8), v, Int32(en))
 
     @cute.jit
@@ -689,7 +692,7 @@ class DMFwdHd256MxSm100:
         self.tr(0, 2)
         self.qk128(atom_qk, acc_qk, tSrQ, tSrK, sQ, sK, kv_state.index, Int32(0))
         with cute.arch.elect_one():
-            dm_utils.tc_commit(mbar + 0)
+            tc_commit(mbar + 0)
         self.tr(0, 3)
         pipeline_kv.consumer_release(kv_state)
         kv_state.advance()
@@ -702,15 +705,15 @@ class DMFwdHd256MxSm100:
             if const_expr(self.sf_bank):
                 # single S buffer: the softmax has loaded S(j-1) (S_empty(j-1), parity (j-1)&1)
                 if const_expr(self.pc_inj != 3):
-                    dm_utils.mbar_wait_parity(mbar + 72, (j - 1) & 1)
-                    dm_utils.tc_fence_after()
+                    mbar_wait_parity(mbar + 72, (j - 1) & 1)
+                    tcgen05_fence_after()
                 slot = Int32(0)
             elif const_expr(self.sf_wait) and i >= 1:
                 if const_expr(self.g1 & 4):
                     pipeline_kv.consumer_wait(kv_state)                 # G1c: K(j) first (no dependency on PV(j-2))
                 self.tr(j, 0)
-                dm_utils.mbar_wait_parity(mbar + 32, (j - 2) & 1)
-                dm_utils.tc_fence_after()
+                mbar_wait_parity(mbar + 32, (j - 2) & 1)
+                tcgen05_fence_after()
                 self.tr(j, 1)
             if const_expr((self.g1 & 4) and self.sf_wait and not self.sf_bank):
                 if i < 1:
@@ -720,7 +723,7 @@ class DMFwdHd256MxSm100:
             self.tr(j, 2)
             self.qk128(atom_qk, acc_qk, tSrQ, tSrK, sQ, sK, kv_state.index, slot)
             with cute.arch.elect_one():
-                dm_utils.tc_commit(mbar + 8 * slot)      # S_full (sf_bank: always mbar+0, slot 0)
+                tc_commit(mbar + 8 * slot)      # S_full (sf_bank: always mbar+0, slot 0)
             self.tr(j, 3)
             pipeline_kv.consumer_release(kv_state)
             kv_state.advance()
@@ -782,15 +785,15 @@ class DMFwdHd256MxSm100:
                 self.qk_part(0, tSrQ, tSrK, sQ, sK, acc_qk, ks0 % S, Int32(j0))
                 self.qk_part(1, tSrQ, tSrK, sQ, sK, acc_qk, ks0 % S, Int32(j0))
                 with cute.arch.elect_one():
-                    dm_utils.tc_commit(mbar + 8 * j0)                                     # S_full[j0]
+                    tc_commit(mbar + 8 * j0)                                     # S_full[j0]
                 pipeline_kv.consumer_release_w_index(ks0 % S)
         for i in cutlass.range(cnt, unroll=1):
             slot = i & 1
             if i + 2 < cnt:
                 self.tr(i + 2, 0)
                 if const_expr(self.pc_inj != 6):
-                    dm_utils.mbar_wait_parity(mbar + 96 + 8 * slot, (i >> 1) & 1)        # S_empty(i): S(i) in registers
-                    dm_utils.tc_fence_after()
+                    mbar_wait_parity(mbar + 96 + 8 * slot, (i >> 1) & 1)        # S_empty(i): S(i) in registers
+                    tcgen05_fence_after()
                 self.tr(i + 2, 1)
                 ks = self.kseq(i + 2)
                 self.kv_wait(pipeline_kv, ks)
@@ -801,12 +804,12 @@ class DMFwdHd256MxSm100:
             self.mma_pv(pv_op, acc_pv, tOrP, tOrV, sP, sV, pipeline_kv, None, mbar, i, vs % S, (vs // S) & 1)
             if i + 2 < cnt:
                 if const_expr(self.pc_inj != 8):
-                    dm_utils.mbar_wait_parity(mbar + 32, i & 1)                          # O_full(PV(i)): SF(i) read
-                    dm_utils.tc_fence_after()
+                    mbar_wait_parity(mbar + 32, i & 1)                          # O_full(PV(i)): SF(i) read
+                    tcgen05_fence_after()
                 ks2 = self.kseq(i + 2)
                 self.qk_part(1, tSrQ, tSrK, sQ, sK, acc_qk, ks2 % S, slot)               # QK_b(i+2): cols 112..127
                 with cute.arch.elect_one():
-                    dm_utils.tc_commit(mbar + 8 * slot)                                   # S_full[slot] (tile i+2)
+                    tc_commit(mbar + 8 * slot)                                   # S_full[slot] (tile i+2)
                 self.tr(i + 2, 3)
                 pipeline_kv.consumer_release_w_index(ks2 % S)
         pipeline_q.consumer_release(q_state)
@@ -824,7 +827,7 @@ class DMFwdHd256MxSm100:
     @cute.jit
     def kv_wait(self, pipeline_kv, seq):
         pipeline_kv.consumer_wait_w_index_phase(seq % self.kv_stage, (seq // self.kv_stage) & 1)
-        dm_utils.tc_fence_after()
+        tcgen05_fence_after()
 
     @cute.jit
     def qk128(self, atom_qk, acc_qk, tSrQ, tSrK, sQ, sK, stage, slot):
@@ -853,24 +856,24 @@ class DMFwdHd256MxSm100:
         else:
             pipeline_kv.consumer_wait_w_index_phase(kv_idx, kv_ph)
         self.tr(i, 5)
-        dm_utils.mbar_wait_parity(mbar + 16 + 8 * slot, (i >> 1) & 1)     # P_full[slot]: P(i) codes + SF(i) written
+        mbar_wait_parity(mbar + 16 + 8 * slot, (i >> 1) & 1)     # P_full[slot]: P(i) codes + SF(i) written
         self.tr(i, 6)
         if i >= 1:
-            dm_utils.mbar_wait_parity(mbar + 40, (i - 1) & 1)            # O_ready(i): O rescaled (or not) after PV(i-1)
+            mbar_wait_parity(mbar + 40, (i - 1) & 1)            # O_ready(i): O rescaled (or not) after PV(i-1)
         self.tr(i, 7)
-        dm_utils.tc_fence_after()
+        tcgen05_fence_after()
         sf = (128 + 32 * slot) if const_expr(self.sf_bank) else slot * 128
-        dm_utils.gemm_ptx_bs(
+        gemm_ptx_bs(
             pv_op, self.tmem_o, tOrP[None, None, None, slot], tOrV[None, None, None, stage],
             sP[None, None, None, slot], sV[None, None, None, stage], sf + self.sfa_off, sf + self.sfb_off,
             tuple((0, k) for k in range(4)), tuple((0, k) for k in range(4)), zero_init=(i == 0))
         with cute.arch.elect_one():
-            dm_utils.tc_commit(mbar + 32)                                   # O_full(i)
+            tc_commit(mbar + 32)                                   # O_full(i)
         self.tr(i, 8)
         if const_expr(self.pc_inj in (1, 2)):
             if const_expr(self.pc_inj == 2):
-                dm_utils.mbar_wait_parity(mbar + 32, i & 1)
-                dm_utils.tc_fence_after()
+                mbar_wait_parity(mbar + 32, i & 1)
+                tcgen05_fence_after()
             lane0 = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) * 32
             for r in cutlass.range_constexpr(4):
                 tmem_st1((lane0 << 16) + sf + self.sfa_off + r, Int32(-2139062144))     # 0x80808080
@@ -908,7 +911,7 @@ class DMFwdHd256MxSm100:
             if not zero_or_nan else -Float32.inf
         mLSE[batch_idx, head_idx, row] = lse
         st_shared_f32(stats + 4 * (2 * 128 + tidx), scale)
-        dm_utils.mbar_arrive(mbar + 64)
+        mbar_arrive(mbar + 64)
 
     @cute.jit
     def softmax_step(self, j, n_block, is_first: cutlass.Constexpr, thr_ld, tStS, tScS, mbar, stats, sp_base, tidx,
@@ -916,21 +919,21 @@ class DMFwdHd256MxSm100:
         slot = j & 1
         dm_kw = Int32(mKVW[batch_idx, kv_head_idx, 2 * n_block])
         dm_vw = Int32(mKVW[batch_idx, kv_head_idx, 2 * n_block + 1])
-        dm_ks = [dm_utils.byte_pow2_f32(dm_kw, b) for b in range(4)]
+        dm_ks = [byte_pow2_f32(dm_kw, b) for b in range(4)]
         if const_expr(self.sf_bank):
-            dm_utils.mbar_wait_parity(mbar + 0, j & 1)                 # S_full (single buffer, one completion per tile)
-            dm_utils.tc_fence_after()
+            mbar_wait_parity(mbar + 0, j & 1)                 # S_full (single buffer, one completion per tile)
+            tcgen05_fence_after()
             tStS_cur = tStS
         else:
-            dm_utils.mbar_wait_parity(mbar + 8 * slot, (j >> 1) & 1)
-            dm_utils.tc_fence_after()
+            mbar_wait_parity(mbar + 8 * slot, (j >> 1) & 1)
+            tcgen05_fence_after()
             tStS_cur = cute.make_tensor(tStS.iterator + slot * 128, tStS.layout)
         s = cute.make_rmem_tensor(tScS.shape, Float32)
         cute.copy(thr_ld, tStS_cur, s)
         cute.arch.fence_view_async_tmem_load()
         if const_expr(self.sf_bank):
-            dm_utils.tc_fence_before()
-            dm_utils.mbar_arrive(mbar + 72)                            # S_empty(j): QK(j+1) may overwrite S
+            tcgen05_fence_before()
+            mbar_arrive(mbar + 72)                            # S_empty(j): QK(j+1) may overwrite S
         if const_expr(self.is_causal and is_first):
             for c in cutlass.range_constexpr(128):
                 if Int32(c) > tidx:
@@ -947,7 +950,7 @@ class DMFwdHd256MxSm100:
             v = utils.fmax(utils.fmax(lm[0], lm[1], lm[2]), lm[3])
             dm_bmax[b] = v * dm_c[b]
         dm_xmax = utils.fmax(utils.fmax(dm_bmax[0], dm_bmax[1], dm_bmax[2]), dm_bmax[3])
-        dm_mcand = dm_utils.ceil_f32(dm_xmax)
+        dm_mcand = ceil_f32(dm_xmax)
         acc_scale = Float32(1.0)
         row_max = dm_mcand
         if const_expr(is_first):
@@ -956,18 +959,18 @@ class DMFwdHd256MxSm100:
             row_max = m_old
             if dm_mcand > m_old + Float32(self.rescale_T):
                 row_max = dm_mcand
-                acc_scale = dm_utils.exp2i_f32(m_old - dm_mcand)
+                acc_scale = exp2i_f32(m_old - dm_mcand)
         m_safe = row_max if row_max != -Float32.inf else Float32(0.0)
         dm_bias = [None] * 4
         dm_w = [None] * 4
         dm_sfa = [None] * 4
         for b in cutlass.range_constexpr(4):
-            kb = cute.arch.fmax(dm_utils.floor_f32(dm_bmax[b]), Float32(-1e30))
+            kb = cute.arch.fmax(floor_f32(dm_bmax[b]), Float32(-1e30))
             e = kb - Float32(7.0) - m_safe
             dm_bias[b] = Float32(7.0) - kb
-            dm_sfa[b] = dm_utils.ue8m0_byte(e)
-            dm_w[b] = dm_utils.byte_shl23_f32(dm_sfa[b])
-        sfa_word = dm_utils.pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3])
+            dm_sfa[b] = ue8m0_byte(e)
+            dm_w[b] = byte_shl23_f32(dm_sfa[b])
+        sfa_word = pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3])
         sfbase = (lane << 16) + ((128 + 32 * slot) if const_expr(self.sf_bank) else slot * 128)
         for r in cutlass.range_constexpr(4):
             tmem_st1(sfbase + self.sfa_off + r, sfa_word)
@@ -986,13 +989,13 @@ class DMFwdHd256MxSm100:
                 k = 32 * b + 16 * q
                 w = [e4m3x4(s[k + 4 * t], s[k + 4 * t + 1], s[k + 4 * t + 2], s[k + 4 * t + 3]) for t in range(4)]
                 chunk = Int32(2 * b + q)
-                dm_utils.st_shared_v4_b32(prow + ((chunk ^ (tidx & 7)) << 4), w[0], w[1], w[2], w[3])
+                st_shared_v4_b32(prow + ((chunk ^ (tidx & 7)) << 4), w[0], w[1], w[2], w[3])
         cute.arch.fence_view_async_shared()
         tmem_wait_st()
-        dm_utils.tc_fence_before()
-        dm_utils.mbar_arrive(mbar + 16 + 8 * slot)          # P_full[slot]
+        tcgen05_fence_before()
+        mbar_arrive(mbar + 16 + 8 * slot)          # P_full[slot]
         st_shared_f32(stats + 4 * (slot * 128 + tidx), acc_scale)
-        dm_utils.mbar_arrive(mbar + 48 + 8 * slot)          # stats_full[slot]
+        mbar_arrive(mbar + 48 + 8 * slot)          # stats_full[slot]
         dm_bs = [None] * 4
         for b in cutlass.range_constexpr(4):
             ps = (s[32 * b], s[32 * b + 1])
@@ -1044,7 +1047,7 @@ class DMFwdHd256MxSm100:
                 if not zero_or_nan else -Float32.inf
             mLSE[batch_idx, head_idx, row] = lse
             st_shared_f32(stats + 4 * (2 * 128 + tidx), scale)
-            dm_utils.mbar_arrive(mbar + 64)
+            mbar_arrive(mbar + 64)
 
     @cute.jit
     def softmax_step2(self, j, n_block, is_first: cutlass.Constexpr, thr_ld, tStS, tScS, mbar, stats, sp_base, tidx,
@@ -1052,25 +1055,25 @@ class DMFwdHd256MxSm100:
         slot = j & 1
         dm_kw = Int32(mKVW[batch_idx, kv_head_idx, 2 * n_block])
         dm_vw = Int32(mKVW[batch_idx, kv_head_idx, 2 * n_block + 1])
-        dm_ks = [dm_utils.byte_pow2_f32(dm_kw, b) for b in range(4)]
+        dm_ks = [byte_pow2_f32(dm_kw, b) for b in range(4)]
         tr_w = (tidx // 32) if const_expr(self.trace) else None
         self.tr(j, 10, None, tr_w == 0)
-        dm_utils.mbar_wait_parity(mbar + 8 * slot, (j >> 1) & 1)          # S_full[slot]
-        dm_utils.tc_fence_after()
+        mbar_wait_parity(mbar + 8 * slot, (j >> 1) & 1)          # S_full[slot]
+        tcgen05_fence_after()
         self.tr(j, 11, None, tr_w == 0)
         tStS_cur = cute.make_tensor(tStS.iterator + slot * 128, tStS.layout)
         s = cute.make_rmem_tensor(tScS.shape, Float32)
         if const_expr(self.split == 2 and self.pc_inj == 7):
-            dm_utils.tc_fence_before()
-            dm_utils.mbar_arrive(mbar + 96 + 8 * slot)          # DEBUG PC 7: S_empty BEFORE the load (must corrupt)
+            tcgen05_fence_before()
+            mbar_arrive(mbar + 96 + 8 * slot)          # DEBUG PC 7: S_empty BEFORE the load (must corrupt)
         cute.copy(thr_ld, tStS_cur, s)
         cute.arch.fence_view_async_tmem_load()
         if const_expr(self.trace):
             for q in cutlass.range_constexpr(4):
                 self.tr(j, 16 + q, None, tr_w == q)
         if const_expr(self.split == 2 and self.pc_inj != 7):
-            dm_utils.tc_fence_before()
-            dm_utils.mbar_arrive(mbar + 96 + 8 * slot)          # S_empty[slot](j): S(j) is in registers (wait::ld above)
+            tcgen05_fence_before()
+            mbar_arrive(mbar + 96 + 8 * slot)          # S_empty[slot](j): S(j) is in registers (wait::ld above)
         if const_expr(self.is_causal and is_first):
             for c in cutlass.range_constexpr(128):
                 if Int32(c) > tidx:
@@ -1087,11 +1090,11 @@ class DMFwdHd256MxSm100:
             v = utils.fmax(utils.fmax(lm[0], lm[1], lm[2]), lm[3])
             dm_bmax[b] = v * dm_c[b]
         dm_xmax = utils.fmax(utils.fmax(dm_bmax[0], dm_bmax[1], dm_bmax[2]), dm_bmax[3])
-        dm_mcand = dm_utils.ceil_f32(dm_xmax)
+        dm_mcand = ceil_f32(dm_xmax)
         dm_kb = [None] * 4
         dm_bias = [None] * 4
         for b in cutlass.range_constexpr(4):
-            dm_kb[b] = cute.arch.fmax(dm_utils.floor_f32(dm_bmax[b]), Float32(-1e30))
+            dm_kb[b] = cute.arch.fmax(floor_f32(dm_bmax[b]), Float32(-1e30))
             dm_bias[b] = Float32(7.0) - dm_kb[b]
         for b in cutlass.range_constexpr(4):
             for i in cutlass.range_constexpr(0, 32, 2):
@@ -1105,7 +1108,7 @@ class DMFwdHd256MxSm100:
                 k = 32 * b + 16 * q
                 w = [e4m3x4(s[k + 4 * t], s[k + 4 * t + 1], s[k + 4 * t + 2], s[k + 4 * t + 3]) for t in range(4)]
                 chunk = Int32(2 * b + q)
-                dm_utils.st_shared_v4_b32(prow + ((chunk ^ (tidx & 7)) << 4), w[0], w[1], w[2], w[3])
+                st_shared_v4_b32(prow + ((chunk ^ (tidx & 7)) << 4), w[0], w[1], w[2], w[3])
         dm_bs = [None] * 4
         for b in cutlass.range_constexpr(4):
             ps = (s[32 * b], s[32 * b + 1])
@@ -1125,7 +1128,7 @@ class DMFwdHd256MxSm100:
         if const_expr(not is_first):
             pj = j - 1
             if const_expr(self.pc_inj != 4):
-                dm_utils.mbar_wait_parity(mbar + 80 + 8 * (pj & 1), (pj >> 1) & 1)
+                mbar_wait_parity(mbar + 80 + 8 * (pj & 1), (pj >> 1) & 1)
         self.tr(j, 13, None, tr_w == 0)
         if const_expr(not is_first):
             m_old = ld_shared_f32(stats + 4 * (512 + (pj & 1) * 128 + tidx))
@@ -1138,27 +1141,27 @@ class DMFwdHd256MxSm100:
             row_max = m_old
             if dm_mcand > m_old + Float32(self.rescale_T):
                 row_max = dm_mcand
-                acc_scale = dm_utils.exp2i_f32(m_old - dm_mcand)
+                acc_scale = exp2i_f32(m_old - dm_mcand)
         if const_expr(self.g1 & 1):
             # G1a: acc_scale(j) -> correction now (stats[slot] reuse: correction(j-2) read it before O_ready(j-2) -> PV(j-2) ->
             # (C0) QK(j) -> S_full(j), which this thread waited)
             if const_expr(self.pc_inj == 9):
                 # DEBUG PC 9 (G1a): stats_full arrives BEFORE its payload, payload ~20 us later -> must corrupt (rescaling inputs)
-                dm_utils.mbar_arrive(mbar + 48 + 8 * slot)
+                mbar_arrive(mbar + 48 + 8 * slot)
                 for _d in cutlass.range_constexpr(20):
-                    dm_utils.nanosleep_1us()
+                    nanosleep_1us()
                 st_shared_f32(stats + 4 * (slot * 128 + tidx), acc_scale)
             else:
                 st_shared_f32(stats + 4 * (slot * 128 + tidx), acc_scale)
-                dm_utils.mbar_arrive(mbar + 48 + 8 * slot)          # stats_full[slot]
+                mbar_arrive(mbar + 48 + 8 * slot)          # stats_full[slot]
         m_safe = row_max if row_max != -Float32.inf else Float32(0.0)
         dm_w = [None] * 4
         dm_sfa = [None] * 4
         for b in cutlass.range_constexpr(4):
             e = dm_kb[b] - Float32(7.0) - m_safe
-            dm_sfa[b] = dm_utils.ue8m0_byte(e)
-            dm_w[b] = dm_utils.byte_shl23_f32(dm_sfa[b])
-        sfa_word = dm_utils.pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3])
+            dm_sfa[b] = ue8m0_byte(e)
+            dm_w[b] = byte_shl23_f32(dm_sfa[b])
+        sfa_word = pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3])
         sfbase = (lane << 16) + slot * 128
         if const_expr(self.g1 & 8):
             tmem_st_x4(sfbase + self.sfa_off, sfa_word, sfa_word, sfa_word, sfa_word)
@@ -1169,28 +1172,28 @@ class DMFwdHd256MxSm100:
                 tmem_st1(sfbase + self.sfb_off + r, dm_vw)
         cute.arch.fence_view_async_shared()
         tmem_wait_st()
-        dm_utils.tc_fence_before()
-        dm_utils.mbar_arrive(mbar + 16 + 8 * slot)          # P_full[slot]
+        tcgen05_fence_before()
+        mbar_arrive(mbar + 16 + 8 * slot)          # P_full[slot]
         if const_expr(self.trace):
             self.tr(j, 14, None, tr_w == 0)
             for q in cutlass.range_constexpr(4):
                 self.tr(j, 20 + q, None, tr_w == q)
         if const_expr(not (self.g1 & 1)):
             st_shared_f32(stats + 4 * (slot * 128 + tidx), acc_scale)
-            dm_utils.mbar_arrive(mbar + 48 + 8 * slot)          # stats_full[slot]
+            mbar_arrive(mbar + 48 + 8 * slot)          # stats_full[slot]
         dm_l = Float32(0.0) if const_expr(is_first) else row_sum * acc_scale
         for b in cutlass.range_constexpr(4):
             dm_l = dm_l + dm_bs[b] * dm_w[b]
         # publish (m, l) of tile j for tile j + 1 (owned by the other WG)
         if j + 1 < cnt:
             if const_expr(self.pc_inj == 5):
-                dm_utils.mbar_arrive(mbar + 80 + 8 * slot)
+                mbar_arrive(mbar + 80 + 8 * slot)
                 for _d in cutlass.range_constexpr(20):          # widen the window: payload lands ~20 us after the arrive
-                    dm_utils.nanosleep_1us()
+                    nanosleep_1us()
             st_shared_f32(stats + 4 * (512 + slot * 128 + tidx), row_max)
             st_shared_f32(stats + 4 * (768 + slot * 128 + tidx), dm_l)
             if const_expr(self.pc_inj != 5):
-                dm_utils.mbar_arrive(mbar + 80 + 8 * slot)      # state_full[slot] (release: orders the stores above)
+                mbar_arrive(mbar + 80 + 8 * slot)      # state_full[slot] (release: orders the stores above)
         self.tr(j, 15, None, tr_w == 0)
         return row_max, dm_l
 
@@ -1219,7 +1222,7 @@ class DMFwdHd256MxSm100:
                 if not zero_or_nan else -Float32.inf
             mLSE[batch_idx, head_idx, row] = lse
             st_shared_f32(stats + 4 * (2 * 128 + tidx), scale)
-            dm_utils.mbar_arrive(mbar + 64)
+            mbar_arrive(mbar + 64)
         else:
             self.softmax_step3(Int32(0), n_block_max - 1, True, 1, mbar, stats, sp_base, tidx, lane, qsc, mKVW, kv_head_idx,
                                batch_idx, m_last, l_last)
@@ -1235,11 +1238,11 @@ class DMFwdHd256MxSm100:
         part = stats + 4 * (1024 + slot * 512)                      # part[slot][k][128]: bmax2, bmax3, bs2, bs3
         dm_kw = Int32(mKVW[batch_idx, kv_head_idx, 2 * n_block])
         dm_vw = Int32(mKVW[batch_idx, kv_head_idx, 2 * n_block + 1])
-        dm_ks = [dm_utils.byte_pow2_f32(dm_kw, b) for b in range(4)]
+        dm_ks = [byte_pow2_f32(dm_kw, b) for b in range(4)]
         tr_w = (tidx // 32) if const_expr(self.trace) else None
         self.tr(j, 10 + 8 * h, None, tr_w == 0)
-        dm_utils.mbar_wait_parity(mbar + 8 * slot, (j >> 1) & 1)          # S_full[slot]
-        dm_utils.tc_fence_after()
+        mbar_wait_parity(mbar + 8 * slot, (j >> 1) & 1)          # S_full[slot]
+        tcgen05_fence_after()
         self.tr(j, 11 + 8 * h, None, tr_w == 0)
         sfbase = (lane << 16) + slot * 128
         if const_expr(h == 0 and self.c8 == 1 and self.pc_inj == 12):
@@ -1247,7 +1250,7 @@ class DMFwdHd256MxSm100:
                 tmem_st1(sfbase + self.sfb_off + r, dm_vw)
         if const_expr(h == 1 and self.c8 == 1 and self.pc_inj == 12):
             for _d in cutlass.range_constexpr(20):
-                dm_utils.nanosleep_1us()
+                nanosleep_1us()
         c0 = 64 * h
         if const_expr(h == 1 and self.c8 == 2 and self.pc_inj == 12):
             for r in cutlass.range_constexpr(8):                             # DEBUG PC 12 (C8b): SFB before our S load
@@ -1277,7 +1280,7 @@ class DMFwdHd256MxSm100:
         dm_kb = [None] * 2
         dm_bias = [None] * 2
         for bb in cutlass.range_constexpr(2):
-            dm_kb[bb] = cute.arch.fmax(dm_utils.floor_f32(dm_bmax[bb]), Float32(-1e30))
+            dm_kb[bb] = cute.arch.fmax(floor_f32(dm_bmax[bb]), Float32(-1e30))
             dm_bias[bb] = Float32(7.0) - dm_kb[bb]
         for bb in cutlass.range_constexpr(2):
             for i in cutlass.range_constexpr(0, 32, 2):
@@ -1295,7 +1298,7 @@ class DMFwdHd256MxSm100:
                 chunk = Int32(2 * (2 * h + bb) + q)
                 pst.append((prow + ((chunk ^ (tidx & 7)) << 4), w))
                 if const_expr(not (h == 1 and self.pc_inj == 11)):
-                    dm_utils.st_shared_v4_b32(pst[-1][0], w[0], w[1], w[2], w[3])
+                    st_shared_v4_b32(pst[-1][0], w[0], w[1], w[2], w[3])
         dm_bs = [None] * 2
         for bb in cutlass.range_constexpr(2):
             ps = (s[32 * bb], s[32 * bb + 1])
@@ -1309,38 +1312,38 @@ class DMFwdHd256MxSm100:
             # ---- publish the high half: part(j) reuse at j+2 is ordered by WG0's read(j) -> P_full(j) -> PV(j) -> (C0)
             # QK(j+2) -> S_full(j+2), which this WG waits before writing part(j+2) ----
             if const_expr(self.pc_inj == 5):
-                dm_utils.tc_fence_before()
-                dm_utils.mbar_arrive(mbar + 80 + 8 * slot)
+                tcgen05_fence_before()
+                mbar_arrive(mbar + 80 + 8 * slot)
                 for _d in cutlass.range_constexpr(20):
-                    dm_utils.nanosleep_1us()
+                    nanosleep_1us()
             st_shared_f32(part + 4 * (0 * 128 + tidx), dm_bmax[0])
             st_shared_f32(part + 4 * (1 * 128 + tidx), dm_bmax[1])
             st_shared_f32(part + 4 * (2 * 128 + tidx), dm_bs[0])
             st_shared_f32(part + 4 * (3 * 128 + tidx), dm_bs[1])
             if const_expr(self.pc_inj != 5):
-                dm_utils.tc_fence_before()                                   # our S loads (wait::ld) before WG0's SFB stores
-                dm_utils.mbar_arrive(mbar + 80 + 8 * slot)                   # partial_full[slot]
+                tcgen05_fence_before()                                   # our S loads (wait::ld) before WG0's SFB stores
+                mbar_arrive(mbar + 80 + 8 * slot)                   # partial_full[slot]
             if const_expr(self.pc_inj != 11):
                 cute.arch.fence_view_async_shared()
                 if const_expr(self.c8 == 2):
                     tmem_wait_st()                                           # C8b: our SFB stores complete before P_full
-                dm_utils.tc_fence_before()
-                dm_utils.mbar_arrive(mbar + 16 + 8 * slot)                   # P_full[slot] (our P codes)
+                tcgen05_fence_before()
+                mbar_arrive(mbar + 16 + 8 * slot)                   # P_full[slot] (our P codes)
             else:
                 # DEBUG PC 11: P_full arrives BEFORE WG1's P stores (stores ~20 us later, then the proxy fence) -> must corrupt
-                dm_utils.tc_fence_before()
-                dm_utils.mbar_arrive(mbar + 16 + 8 * slot)
+                tcgen05_fence_before()
+                mbar_arrive(mbar + 16 + 8 * slot)
                 for _d in cutlass.range_constexpr(20):
-                    dm_utils.nanosleep_1us()
+                    nanosleep_1us()
                 for (a, w) in pst:
-                    dm_utils.st_shared_v4_b32(a, w[0], w[1], w[2], w[3])
+                    st_shared_v4_b32(a, w[0], w[1], w[2], w[3])
                 cute.arch.fence_view_async_shared()
             self.tr(j, 22, None, tr_w == 0)
         else:
             # ---- ordered tail (WG0): exactly the C6 tail over the 4 blocks ----
             if const_expr(self.pc_inj != 4):
-                dm_utils.mbar_wait_parity(mbar + 80 + 8 * slot, (j >> 1) & 1)   # partial_full[slot]
-            dm_utils.tc_fence_after()
+                mbar_wait_parity(mbar + 80 + 8 * slot, (j >> 1) & 1)   # partial_full[slot]
+            tcgen05_fence_after()
             self.tr(j, 13, None, tr_w == 0)
             bmax2 = ld_shared_f32(part + 4 * (0 * 128 + tidx))
             bmax3 = ld_shared_f32(part + 4 * (1 * 128 + tidx))
@@ -1348,10 +1351,10 @@ class DMFwdHd256MxSm100:
             bs3 = ld_shared_f32(part + 4 * (3 * 128 + tidx))
             bmax = [dm_bmax[0], dm_bmax[1], bmax2, bmax3]
             bsum = [dm_bs[0], dm_bs[1], bs2, bs3]
-            kb = [dm_kb[0], dm_kb[1], cute.arch.fmax(dm_utils.floor_f32(bmax2), Float32(-1e30)),
-                  cute.arch.fmax(dm_utils.floor_f32(bmax3), Float32(-1e30))]
+            kb = [dm_kb[0], dm_kb[1], cute.arch.fmax(floor_f32(bmax2), Float32(-1e30)),
+                  cute.arch.fmax(floor_f32(bmax3), Float32(-1e30))]
             dm_xmax = utils.fmax(utils.fmax(bmax[0], bmax[1], bmax[2]), bmax[3])
-            dm_mcand = dm_utils.ceil_f32(dm_xmax)
+            dm_mcand = ceil_f32(dm_xmax)
             acc_scale = Float32(1.0)
             row_max = dm_mcand
             if const_expr(is_first):
@@ -1360,23 +1363,23 @@ class DMFwdHd256MxSm100:
                 row_max = m_old
                 if dm_mcand > m_old + Float32(self.rescale_T):
                     row_max = dm_mcand
-                    acc_scale = dm_utils.exp2i_f32(m_old - dm_mcand)
+                    acc_scale = exp2i_f32(m_old - dm_mcand)
             if const_expr(self.pc_inj == 9):
-                dm_utils.mbar_arrive(mbar + 48 + 8 * slot)
+                mbar_arrive(mbar + 48 + 8 * slot)
                 for _d in cutlass.range_constexpr(20):
-                    dm_utils.nanosleep_1us()
+                    nanosleep_1us()
                 st_shared_f32(stats + 4 * (slot * 128 + tidx), acc_scale)
             else:
                 st_shared_f32(stats + 4 * (slot * 128 + tidx), acc_scale)
-                dm_utils.mbar_arrive(mbar + 48 + 8 * slot)                   # stats_full[slot] (G1a)
+                mbar_arrive(mbar + 48 + 8 * slot)                   # stats_full[slot] (G1a)
             m_safe = row_max if row_max != -Float32.inf else Float32(0.0)
             dm_w = [None] * 4
             dm_sfa = [None] * 4
             for b in cutlass.range_constexpr(4):
                 e = kb[b] - Float32(7.0) - m_safe
-                dm_sfa[b] = dm_utils.ue8m0_byte(e)
-                dm_w[b] = dm_utils.byte_shl23_f32(dm_sfa[b])
-            sfa_word = dm_utils.pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3])
+                dm_sfa[b] = ue8m0_byte(e)
+                dm_w[b] = byte_shl23_f32(dm_sfa[b])
+            sfa_word = pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3])
             for r in cutlass.range_constexpr(4):
                 tmem_st1(sfbase + self.sfa_off + r, sfa_word)
             if const_expr(self.c8 == 1 and self.pc_inj != 12):
@@ -1384,8 +1387,8 @@ class DMFwdHd256MxSm100:
                     tmem_st1(sfbase + self.sfb_off + r, dm_vw)
             cute.arch.fence_view_async_shared()
             tmem_wait_st()
-            dm_utils.tc_fence_before()
-            dm_utils.mbar_arrive(mbar + 16 + 8 * slot)                       # P_full[slot]
+            tcgen05_fence_before()
+            mbar_arrive(mbar + 16 + 8 * slot)                       # P_full[slot]
             self.tr(j, 14, None, tr_w == 0)
             dm_l = Float32(0.0) if const_expr(is_first) else row_sum * acc_scale
             for b in cutlass.range_constexpr(4):
@@ -1401,18 +1404,18 @@ class DMFwdHd256MxSm100:
         for i in cutlass.range(cnt - 1, unroll=1):
             j = i + 1
             slot = j & 1
-            dm_utils.mbar_wait_parity(mbar + 48 + 8 * slot, (j >> 1) & 1)          # stats(j)
+            mbar_wait_parity(mbar + 48 + 8 * slot, (j >> 1) & 1)          # stats(j)
             self.tr(j, 24, None, tidx == 0)
             acc_scale = ld_shared_f32(stats + 4 * (slot * 128 + tidx))
-            dm_utils.mbar_wait_parity(mbar + 32, (j - 1) & 1)                       # O_full(PV(j-1))
-            dm_utils.tc_fence_after()
+            mbar_wait_parity(mbar + 32, (j - 1) & 1)                       # O_full(PV(j-1))
+            tcgen05_fence_after()
             self.tr(j, 25, None, tidx == 0)
             if const_expr(self.pc_inj == 10):
                 # DEBUG PC 10: O_ready(j) arrives BEFORE the O rescale -> PV(j) may accumulate into unscaled O -> must corrupt
-                dm_utils.tc_fence_before()
-                dm_utils.mbar_arrive(mbar + 40)
+                tcgen05_fence_before()
+                mbar_arrive(mbar + 40)
                 for _d in cutlass.range_constexpr(20):          # widen the window: the rescale lands ~20 us after O_ready
-                    dm_utils.nanosleep_1us()
+                    nanosleep_1us()
             if cute.arch.vote_ballot_sync(acc_scale < Float32(1.0)) != 0:      # hd128 predicate
                 for c in cutlass.range_constexpr(8):
                     o = list(tmem_ld32(obase + 32 * c))
@@ -1422,13 +1425,13 @@ class DMFwdHd256MxSm100:
                     tmem_st32(obase + 32 * c, o)
                 tmem_wait_st()
             if const_expr(self.pc_inj != 10):
-                dm_utils.tc_fence_before()
-                dm_utils.mbar_arrive(mbar + 40)                                      # O_ready(j)
+                tcgen05_fence_before()
+                mbar_arrive(mbar + 40)                                      # O_ready(j)
             self.tr(j, 26, None, tidx == 0)
-        dm_utils.mbar_wait_parity(mbar + 64, Int32(0))
+        mbar_wait_parity(mbar + 64, Int32(0))
         scale = ld_shared_f32(stats + 4 * (2 * 128 + tidx))
-        dm_utils.mbar_wait_parity(mbar + 32, (cnt - 1) & 1)                         # O_full(PV(last))
-        dm_utils.tc_fence_after()
+        mbar_wait_parity(mbar + 32, (cnt - 1) & 1)                         # O_full(PV(last))
+        tcgen05_fence_after()
         N = mO.shape[1]
         H = mO.shape[2]
         row = m_block * self.m_block_size + tidx
@@ -1479,7 +1482,7 @@ class DMFwdHd256MxSm100:
             bar_warp_sync()                                              # warp-local hand-off: a warp copies only its own rows
             if const_expr(self.epi == 10):                               # DEBUG PC: hold the staged rows (see load warp)
                 for _ in cutlass.range(30, unroll=1):
-                    dm_utils.nanosleep_1us()
+                    nanosleep_1us()
             if const_expr(self.epi == 9):
                 w0 = (w0 + 32) % 128                                     # DEBUG PC (racy): another warp's rows, no CTA barrier
             if const_expr(self.epi != 8):

@@ -30,9 +30,9 @@ def _cache():
     """Persistent compile cache under the package fingerprint (FA4 + delta_matching/sm100/*.py sources + compile_env)."""
     if not _CACHE:
         from flash_attn.cute import cache_utils
-        from .fwd import _fingerprint
+        from .compile_cache_sm100 import fingerprint
         if cache_utils.CUTE_DSL_CACHE_ENABLED:
-            _CACHE.append(cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / _fingerprint("quant") / "quant"))
+            _CACHE.append(cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / fingerprint("quant") / "quant"))
         else:
             _CACHE.append(cache_utils.JITCache())
     return _CACHE[0]
@@ -62,8 +62,8 @@ def _compile(key, obj, sig):
     # explicit stream argument (current raw stream, passed by the host like Triton's launcher) and Int64 pointers only:
     # no TVM-FFI tensor marshalling / env-stream lookup
     args.append(cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False))
-    from . import fastpath
-    fastpath.EPOCH[0] += 1
+    from . import launch_cache_sm100
+    launch_cache_sm100.EPOCH[0] += 1
     return cute.compile(obj, *args, options="--enable-tvm-ffi")
 
 

@@ -13,7 +13,7 @@ from .quant import quant_qkv2, quant_do_delta
 from .fwd import dm_fwd
 from .bwd import dm_bwd_main, dm_bwd_prestage
 from .pass0 import dm_delta
-from .fastpath import env as _env
+from .launch_cache_sm100 import env as _env
 
 D = 128
 

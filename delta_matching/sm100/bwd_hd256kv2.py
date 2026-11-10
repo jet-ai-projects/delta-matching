@@ -100,7 +100,7 @@ def _side(dev):
 
 
 def _s1_mode():
-    from .fastpath import env as _env
+    from .launch_cache_sm100 import env as _env
     v = _env("DM_H256_S1", "kv2first")
     assert v in ("0", "kv2first", "dqfirst"), v
     return v

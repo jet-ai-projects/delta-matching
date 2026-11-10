@@ -28,12 +28,12 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass import Float32, Float64, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from delta_matching.sm100 import dm_common_hd256 as dmh
-from delta_matching.sm100 import dm_utils
-from delta_matching.sm100.dm_common_hd256 import (tmem_ld32, e4m3x4, bf16x2, st_global_v4, st_global_f32,
-                                                 ld_shared_f32, st_shared_f32, abs_f32, max_f32, add_f32, mul_f32,
-                                                 _gaddr)
-from delta_matching.sm100.dm_common_hd256 import ld_shared_v4 as ld_shared_v4i
+from delta_matching.sm100.cute_ptx_sm100 import tmem_ld32, e4m3x4, bf16x2, st_global_v4, st_global_f32, ld_shared_f32, st_shared_f32, abs_f32, max_f32, add_f32, mul_f32, global_address
+from delta_matching.sm100.cute_ptx_sm100 import ld_shared_v4 as ld_shared_v4i
+from delta_matching.sm100.attention_math_sm100 import dm_mx256_c, dm_mx256_dp_scale, dm_mx256_l2, dm_mx256_p_pair, dm_mx256_p_pair2
+from delta_matching.sm100.cute_ptx_sm100 import redux_max_abs_f32, tmem_st_x1, tmem_st_x4
+from delta_matching.sm100.fp8_e8m0_scale_sm100 import add_sb_clamp, inv_pow2_from_sb, pow2_sb
+from delta_matching.sm100.mma_sm100 import gemm_ptx_bs
 from delta_matching.sm100.dm_bwd_hd256mx_sm100 import (st_shared_v4, ld_shared_v4f, spin, sb_of, pack4, tc_fence_before,
                                                        tc_fence_after, st_global_u8, st_global_f64x2, f2i, hmix, hidx,
                                                        zext64, red_add_u64, red_add_f64, lk_cols_u32, lk_cols_f64,
@@ -361,7 +361,7 @@ class DmHd256Mx2:
                             tf = t_c.wait_and_advance()
                             cf = cd_c.wait_and_advance()
                             tc_fence_after()
-                            dm_utils.gemm_ptx_bs(
+                            gemm_ptx_bs(
                                 mma_op, tmem_base + self.COL_OUT, tCrC[(None, None, None, 0)], tCrT[(None, None, None, 0)],
                                 sC[(None, None, None, s)], sT[(None, None, None, 0)],
                                 tmem_base + self.COL_SF + self.SF_STRIDE * s, tmem_base + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF,
@@ -380,7 +380,7 @@ class DmHd256Mx2:
                                 mma_s.set(tcgen05.Field.ACCUMULATE, True)
                             de.commit()
                             yg.release()
-                            dm_utils.gemm_ptx_bs(
+                            gemm_ptx_bs(
                                 mma_op, tmem_base + self.COL_OUT, tCrC[(None, None, None, 0)], tCrT[(None, None, None, 0)],
                                 sC[(None, None, None, s)], sT[(None, None, None, 0)],
                                 tmem_base + self.COL_SF + self.SF_STRIDE * s, tmem_base + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF,
@@ -400,7 +400,7 @@ class DmHd256Mx2:
                             tf = t_c.wait_and_advance()
                             cf = cd_c.wait_and_advance()
                             tc_fence_after()
-                            dm_utils.gemm_ptx_bs(
+                            gemm_ptx_bs(
                                 mma_op, tmem_base + self.COL_OUT, tCrC[(None, None, None, 0)], tCrT[(None, None, None, 0)],
                                 sC[(None, None, None, s)], sT[(None, None, None, 0)],
                                 tmem_base + self.COL_SF + self.SF_STRIDE * s, tmem_base + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF,
@@ -435,7 +435,7 @@ class DmHd256Mx2:
                             yo = ya_o.current_handle()
                             cf = cd_c.wait_and_advance()
                             tc_fence_after()
-                            dm_utils.gemm_ptx_bs(
+                            gemm_ptx_bs(
                                 mma_op, tmem_base + self.COL_OUT, tCrC[(None, None, None, 0)], tCrT[(None, None, None, 0)],
                                 sC[(None, None, None, s)], sT[(None, None, None, yo.index)],
                                 tmem_base + self.COL_SF + self.SF_STRIDE * s, tmem_base + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF,
@@ -458,7 +458,7 @@ class DmHd256Mx2:
                             tf = t_c.wait_and_advance()
                             cf = cd_c.wait_and_advance()
                             tc_fence_after()
-                            dm_utils.gemm_ptx_bs(
+                            gemm_ptx_bs(
                                 mma_op, tmem_base + self.COL_OUT, tCrC[(None, None, None, 0)], tCrT[(None, None, None, 0)],
                                 sC[(None, None, None, s)], sT[(None, None, None, 0)],
                                 tmem_base + self.COL_SF + self.SF_STRIDE * s, tmem_base + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF,
@@ -493,7 +493,7 @@ class DmHd256Mx2:
                         tf = t_c.wait_and_advance()
                         cf = cd_c.wait_and_advance()
                         tc_fence_after()
-                        dm_utils.gemm_ptx_bs(
+                        gemm_ptx_bs(
                             mma_op, tmem_base + self.COL_OUT, tCrC[(None, None, None, 0)], tCrT[(None, None, None, 0)],
                             sC[(None, None, None, s)], sT[(None, None, None, 0)],
                             tmem_base + self.COL_SF + self.SF_STRIDE * s, tmem_base + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF,
@@ -529,7 +529,7 @@ class DmHd256Mx2:
             else:
                 row_s = Float32(mQs[b, hx, rtok // 32])
                 row_a = Float32(mdOs[b, hx, rtok // 32])
-                l2r = dmh.dm_mx256_l2(Float32(mLse[b, hx, rtok]))
+                l2r = dm_mx256_l2(Float32(mLse[b, hx, rtok]))
                 dlr = Float32(mDelta[b, hx, rtok])
             idn = Float64(0.0)
             idd = Float64(0.0)
@@ -549,17 +549,17 @@ class DmHd256Mx2:
                         # control sfb<s>: POISON 0x80 (2.0) first, completed; the real 0x7F follows here (safe) or only after
                         # set s's first publication (unsafe, below)
                         pz = Int32(0x80808080 - (1 << 32))
-                        dm_utils.tmem_st_x4(tb + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF, pz, pz, pz, pz)
-                        dm_utils.tmem_st_x4(tb + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF + 4, pz, pz, pz, pz)
+                        tmem_st_x4(tb + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF, pz, pz, pz, pz)
+                        tmem_st_x4(tb + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF + 4, pz, pz, pz, pz)
                         cute.arch.fence_view_async_tmem_store()
                     if const_expr(not (self.kn == "sfb%d" % s and self.unsafe)):
-                        dm_utils.tmem_st_x4(tb + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF, one, one, one, one)
-                        dm_utils.tmem_st_x4(tb + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF + 4, one, one, one, one)
+                        tmem_st_x4(tb + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF, one, one, one, one)
+                        tmem_st_x4(tb + self.COL_SF + self.SF_STRIDE * s + self.SFB_OFF + 4, one, one, one, one)
             # keys-on-rows: stage l2 / delta of tile 0 (threads 0-127 l2, 128-255 delta)
             if const_expr(self.rows_are_keys):
                 h0 = hx * rep
                 if ctid < 128:
-                    st_shared_f32(sLD_addr + ctid * 4, dmh.dm_mx256_l2(Float32(mLse[b, h0, c_lo * 128 + ctid])))
+                    st_shared_f32(sLD_addr + ctid * 4, dm_mx256_l2(Float32(mLse[b, h0, c_lo * 128 + ctid])))
                 else:
                     st_shared_f32(sLD_addr + ctid * 4, Float32(mDelta[b, h0, c_lo * 128 + ctid - 128]))
                 cute.arch.barrier(barrier_id=2, number_of_threads=256)
@@ -608,21 +608,21 @@ class DmHd256Mx2:
                     nv0 = Float32(mVs[b, hk_row, ctq * 4 + 2 * hf])
                     nv1 = Float32(mVs[b, hk_row, ctq * 4 + 2 * hf + 1])
                     for jj in cutlass.range_constexpr(2):
-                        cs[jj] = dmh.dm_mx256_c(kc[jj], row_s)
-                        ca[jj] = dmh.dm_mx256_dp_scale(vc[jj], row_a)
+                        cs[jj] = dm_mx256_c(kc[jj], row_s)
+                        ca[jj] = dm_mx256_dp_scale(vc[jj], row_a)
                         osbo[jj] = sb_of(kc[jj])
                 for jj in cutlass.range_constexpr(0 if self.dqopt else 2):
                     cj = ct * 4 + 2 * hf + jj
                     if const_expr(self.rows_are_keys):
                         qsj = Float32(mQs[b, h, cj])
                         dosj = Float32(mdOs[b, h, cj])
-                        cs[jj] = dmh.dm_mx256_c(row_s, qsj)
-                        ca[jj] = dmh.dm_mx256_dp_scale(row_a, dosj)
+                        cs[jj] = dm_mx256_c(row_s, qsj)
+                        ca[jj] = dm_mx256_dp_scale(row_a, dosj)
                     else:
                         ksj = Float32(mKs[b, hk_row, cj])
                         vsj = Float32(mVs[b, hk_row, cj])
-                        cs[jj] = dmh.dm_mx256_c(ksj, row_s)
-                        ca[jj] = dmh.dm_mx256_dp_scale(vsj, row_a)
+                        cs[jj] = dm_mx256_c(ksj, row_s)
+                        ca[jj] = dm_mx256_dp_scale(vsj, row_a)
                 for j in cutlass.range_constexpr(0 if self.dqopt else 4):
                     if const_expr(self.mode == "dv"):
                         osb[j] = sb_of(Float32(mdOs[b, h, ct * 4 + j]))
@@ -674,7 +674,7 @@ class DmHd256Mx2:
                                     for pa_ in pend_c:
                                         st_shared_v4(*pa_)
                                 else:
-                                    dm_utils.tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * ((t - 1) & 1) + 4 * hf + qd, sfw_c)
+                                    tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * ((t - 1) & 1) + 4 * hf + qd, sfw_c)
                                     cute.arch.fence_view_async_tmem_store()
                 if const_expr(self.q3 and self.kn in ("sfb0", "sfb1")):
                     if t == int(self.kn[3]) + 1:
@@ -683,8 +683,8 @@ class DmHd256Mx2:
                             if const_expr(self.unsafe):
                                 one_ = Int32(0x7F7F7F7F)
                                 sfo = self.COL_SF + self.SF_STRIDE * int(self.kn[3]) + self.SFB_OFF
-                                dm_utils.tmem_st_x4(tb + sfo, one_, one_, one_, one_)
-                                dm_utils.tmem_st_x4(tb + sfo + 4, one_, one_, one_, one_)
+                                tmem_st_x4(tb + sfo, one_, one_, one_, one_)
+                                tmem_st_x4(tb + sfo + 4, one_, one_, one_, one_)
                                 cute.arch.fence_view_async_tmem_store()
                 if const_expr(self.kn == "ld"):
                     if warp == 3:
@@ -708,9 +708,9 @@ class DmHd256Mx2:
                                     s0 = -Float32.inf if c0 > rtok else s0
                                     s1 = -Float32.inf if c0 + 1 > rtok else s1
                             if const_expr(self.rows_are_keys):
-                                p0, p1 = dmh.dm_mx256_p_pair2(s0, s1, cs[jj], l2v[q2], l2v[q2 + 1])
+                                p0, p1 = dm_mx256_p_pair2(s0, s1, cs[jj], l2v[q2], l2v[q2 + 1])
                             else:
-                                p0, p1 = dmh.dm_mx256_p_pair(s0, s1, cs[jj], l2r)
+                                p0, p1 = dm_mx256_p_pair(s0, s1, cs[jj], l2r)
                             vals[jj][i + q2] = p0
                             vals[jj][i + q2 + 1] = p1
                 if const_expr((self.dbg & 8) and self.mode != "dk"):
@@ -723,7 +723,7 @@ class DmHd256Mx2:
                             else:
                                 hpl[i] = hmix(f2i(vals[jj][i]), hidx(rtok, ctok0 + cb + i))
                         if const_expr(self.rows_are_keys):
-                            lk_cols_u32(hpl, lane, _gaddr(mHash) + (Int64(l) * N + ctok0 + cb) * 32)
+                            lk_cols_u32(hpl, lane, global_address(mHash) + (Int64(l) * N + ctok0 + cb) * 32)
                         else:
                             hs_ = Int32(0)
                             for i in cutlass.range_constexpr(32):
@@ -733,10 +733,10 @@ class DmHd256Mx2:
                     for jj in cutlass.range_constexpr(2):
                         cb = col0 + 32 * jj
                         dstp = Int64(16)
-                        dpa = _gaddr(mDump) + ((Int64(l) * N + rtok) * N + ctok0 + cb) * 16
+                        dpa = global_address(mDump) + ((Int64(l) * N + rtok) * N + ctok0 + cb) * 16
                         if const_expr(self.rows_are_keys):
                             dstp = Int64(N) * 16
-                            dpa = _gaddr(mDump) + ((Int64(l) * N + ctok0 + cb) * N + rtok) * 16
+                            dpa = global_address(mDump) + ((Int64(l) * N + ctok0 + cb) * N + rtok) * 16
                         for i in cutlass.range_constexpr(32):
                             st_global_f32(dpa, sv[jj][i])
                             if const_expr(self.mode != "dk"):
@@ -808,10 +808,10 @@ class DmHd256Mx2:
                         for jj in cutlass.range_constexpr(2):
                             cb = col0 + 32 * jj
                             dstp = Int64(16)
-                            dpa = _gaddr(mDump) + ((Int64(l) * N + rtok) * N + ctok0 + cb) * 16
+                            dpa = global_address(mDump) + ((Int64(l) * N + rtok) * N + ctok0 + cb) * 16
                             if const_expr(self.rows_are_keys):
                                 dstp = Int64(N) * 16
-                                dpa = _gaddr(mDump) + ((Int64(l) * N + ctok0 + cb) * N + rtok) * 16
+                                dpa = global_address(mDump) + ((Int64(l) * N + ctok0 + cb) * N + rtok) * 16
                             for i in cutlass.range_constexpr(32):
                                 st_global_f32(dpa + 4, dvv[jj][i])
                                 st_global_f32(dpa + 12, vals[jj][i])
@@ -822,7 +822,7 @@ class DmHd256Mx2:
                             hn = hx * rep + (t + 1) // ncs
                             ctn = c_lo + (t + 1) - ((t + 1) // ncs) * ncs
                             if ctid < 128:
-                                st_shared_f32(ldn + ctid * 4, dmh.dm_mx256_l2(Float32(mLse[b, hn, ctn * 128 + ctid])))
+                                st_shared_f32(ldn + ctid * 4, dm_mx256_l2(Float32(mLse[b, hn, ctn * 128 + ctid])))
                             else:
                                 st_shared_f32(ldn + ctid * 4, Float32(mDelta[b, hn, ctn * 128 + ctid - 128]))
                     # ---- block max exchange ----
@@ -834,7 +834,7 @@ class DmHd256Mx2:
                             if warp == 4 * int(self.kn[2]):
                                 spin(self.DLY)                 # control xh<h>: warp 0 / 4 late BEFORE its slot stores
                         for jj in cutlass.range_constexpr(2):
-                            a_ = dm_utils.redux_max_abs_f32(am2[jj])
+                            a_ = redux_max_abs_f32(am2[jj])
                             if lane == 0:
                                 st_shared_f32(xb + ((2 * hf + jj) * 4 + qd) * 4, a_)
                     if const_expr((self.dbg & 1) and self.mode == "dq"):
@@ -873,7 +873,7 @@ class DmHd256Mx2:
                                 idp = idp + Float64(ld_shared_f32(sId_addr + ((par * 128 + r) * 8 + 4 * jj + 2) * 4))
                     if const_expr(self.mode == "dk"):
                         mo = ld_shared_f32(xb + ((1 - hf) * 128 + r) * 4)
-                        sb = dm_utils.pow2_sb(dm_utils.redux_max_abs_f32(cute.arch.fmax(cute.arch.fmax(am2[0], am2[1]), mo)))
+                        sb = pow2_sb(redux_max_abs_f32(cute.arch.fmax(cute.arch.fmax(am2[0], am2[1]), mo)))
                         sbs = [sb, sb]
                         sball = [sb] * 4
                     elif const_expr(self.dqopt and self.xs):
@@ -881,8 +881,8 @@ class DmHd256Mx2:
                         xv = ld_shared_f32(xb + (8 * hf + (lane & 7)) * 4)       # lanes 4c..4c+3: chunk 2 hf + c, quadrants 0..3
                         xv = max_f32(xv, cute.arch.shuffle_sync_bfly(xv, offset=1))   # lane 4c: max(m0, m1); 4c+2: max(m2, m3)
                         xv = max_f32(xv, cute.arch.shuffle_sync_bfly(xv, offset=2))   # lane 4c: max(max(m0, m1), max(m2, m3))
-                        sbs[0] = dm_utils.pow2_sb(cute.arch.shuffle_sync(xv, offset=0))
-                        sbs[1] = dm_utils.pow2_sb(cute.arch.shuffle_sync(xv, offset=4))
+                        sbs[0] = pow2_sb(cute.arch.shuffle_sync(xv, offset=0))
+                        sbs[1] = pow2_sb(cute.arch.shuffle_sync(xv, offset=4))
                     elif const_expr(self.dqopt and self.x2):
                         sball = [Int32(0)] * 4
                         m4s = [ld_shared_v4f(xb + (2 * hf + jj) * 16) for jj in range(2)]
@@ -895,17 +895,17 @@ class DmHd256Mx2:
                             cute.arch.fence_view_async_tmem_load()
                         for jj in cutlass.range_constexpr(2):
                             m4 = m4s[jj]
-                            sbs[jj] = dm_utils.pow2_sb(max_f32(max_f32(m4[0], m4[1]), max_f32(m4[2], m4[3])))
+                            sbs[jj] = pow2_sb(max_f32(max_f32(m4[0], m4[1]), max_f32(m4[2], m4[3])))
                     elif const_expr(self.dqopt):
                         sball = [Int32(0)] * 4
                         for jj in cutlass.range_constexpr(2):
                             m4 = ld_shared_v4f(xb + (2 * hf + jj) * 16)
-                            sbs[jj] = dm_utils.pow2_sb(max_f32(max_f32(m4[0], m4[1]), max_f32(m4[2], m4[3])))
+                            sbs[jj] = pow2_sb(max_f32(max_f32(m4[0], m4[1]), max_f32(m4[2], m4[3])))
                     else:
                         sball = [Int32(0)] * 4
                         for j in cutlass.range_constexpr(4):
                             m4 = ld_shared_v4f(xb + j * 16)
-                            sball[j] = dm_utils.pow2_sb(max_f32(max_f32(m4[0], m4[1]), max_f32(m4[2], m4[3])))
+                            sball[j] = pow2_sb(max_f32(max_f32(m4[0], m4[1]), max_f32(m4[2], m4[3])))
                         sbs = [sel_eq_i32(hf, Int32(0), sball[0], sball[2]), sel_eq_i32(hf, Int32(0), sball[1], sball[3])]
                     if const_expr(self.kn == "cd" and self.unsafe):
                         pass
@@ -919,13 +919,13 @@ class DmHd256Mx2:
                         am = Float32(0.0)
                         for i in cutlass.range_constexpr(32):
                             am = cute.arch.fmax(am, vals[jj][i])
-                        sbs[jj] = dm_utils.pow2_sb(am)
+                        sbs[jj] = pow2_sb(am)
                     if const_expr(self.rows_are_keys):
                         if t + 1 < total:
                             hn = hx * rep + (t + 1) // ncs
                             ctn = c_lo + (t + 1) - ((t + 1) // ncs) * ncs
                             if ctid < 128:
-                                st_shared_f32(ldn + ctid * 4, dmh.dm_mx256_l2(Float32(mLse[b, hn, ctn * 128 + ctid])))
+                                st_shared_f32(ldn + ctid * 4, dm_mx256_l2(Float32(mLse[b, hn, ctn * 128 + ctid])))
                             else:
                                 st_shared_f32(ldn + ctid * 4, Float32(mDelta[b, hn, ctn * 128 + ctid - 128]))
                     if hf == 1:
@@ -943,11 +943,11 @@ class DmHd256Mx2:
                             tc_fence_after()                   # BW3
                 if const_expr(self.esf and self.kn not in ("cw0", "cw1", "sf0", "sf1")):
                     # esf: this thread's SFA word first (after the cd acquire + BW3 fence above), completed with the codes below
-                    v0e = dm_utils.add_sb_clamp(sbs[0], osbo[0])
-                    v1e = dm_utils.add_sb_clamp(sbs[1], osbo[1])
+                    v0e = add_sb_clamp(sbs[0], osbo[0])
+                    v1e = add_sb_clamp(sbs[1], osbo[1])
                     ze = Int32(0)
                     sfe = sel_eq_i32(hf, Int32(0), pack4(v0e, v1e, ze, ze), pack4(ze, ze, v0e, v1e))
-                    dm_utils.tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfe)
+                    tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfe)
                 # ---- codes -> smem stage stg (own two chunks) ----
                 cbase = crow + stg * self.bytes_c
                 pend = []                    # control cw<h>: code stores deferred (emitted below), else stored here
@@ -955,7 +955,7 @@ class DmHd256Mx2:
                     j2 = 2 * hf + jj
                     hsl = [Int32(0)] * 32
                     hcl = [Int32(0)] * 32
-                    inv = dm_utils.inv_pow2_from_sb(sbs[jj])
+                    inv = inv_pow2_from_sb(sbs[jj])
                     for hv in cutlass.range_constexpr(2):
                         w = [None] * 4
                         for u in cutlass.range_constexpr(4):
@@ -979,7 +979,7 @@ class DmHd256Mx2:
                                     hcl[e_] = hmix(((w[u] >> (8 * q)) & 255) | (sbs[jj] << 8), ix)
                     if const_expr((self.dbg & 8) and self.has_dp):
                         if const_expr(self.rows_are_keys):
-                            a0_ = _gaddr(mHash) + (Int64(l) * N + ctok0 + 32 * j2) * 32
+                            a0_ = global_address(mHash) + (Int64(l) * N + ctok0 + 32 * j2) * 32
                             lk_cols_u32(hsl, lane, a0_ + 8)
                             lk_cols_u32(hcl, lane, a0_ + 16)
                             lk_cols_f64(vals[jj], lane, a0_ + 24)
@@ -998,10 +998,10 @@ class DmHd256Mx2:
                         mSB[l, rtok, ct * 4 + j2] = sbs[jj]
                 if const_expr(self.dbg & 2):
                     stc = Int64(1)
-                    ca0 = _gaddr(mCodes) + (Int64(l) * N + rtok) * N + ctok0
+                    ca0 = global_address(mCodes) + (Int64(l) * N + rtok) * N + ctok0
                     if const_expr(self.rows_are_keys):
                         stc = Int64(N)
-                        ca0 = _gaddr(mCodes) + (Int64(l) * N + ctok0) * N + rtok
+                        ca0 = global_address(mCodes) + (Int64(l) * N + ctok0) * N + rtok
                     for vv in cutlass.range(4, unroll=1):
                         v = 4 * hf + vv
                         x4 = ld_shared_v4i(cbase + ((v ^ rsw) * 16))
@@ -1012,8 +1012,8 @@ class DmHd256Mx2:
                                 cp = cp + stc
                 sfw = Int32(0)
                 if const_expr(self.dqopt):
-                    v0_ = dm_utils.add_sb_clamp(sbs[0], osbo[0])
-                    v1_ = dm_utils.add_sb_clamp(sbs[1], osbo[1])
+                    v0_ = add_sb_clamp(sbs[0], osbo[0])
+                    v1_ = add_sb_clamp(sbs[1], osbo[1])
                     z_ = Int32(0)
                     sfw = sel_eq_i32(hf, Int32(0), pack4(v0_, v1_, z_, z_), pack4(z_, z_, v0_, v1_))
                 if const_expr(self.kn in ("cw0", "cw1", "sf0", "sf1")):
@@ -1037,9 +1037,9 @@ class DmHd256Mx2:
                                 st_shared_v4(*pa_)
                     if const_expr(self.unsafe and not late_cw):
                         if hf != hk_:
-                            dm_utils.tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfw)
+                            tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfw)
                     else:
-                        dm_utils.tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfw)
+                        tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfw)
                     cute.arch.fence_view_async_tmem_store()
                     cute.arch.fence_view_async_shared()
                     tc_fence_before()
@@ -1055,7 +1055,7 @@ class DmHd256Mx2:
                                     for pa_ in pend:
                                         st_shared_v4(*pa_)
                                 else:
-                                    dm_utils.tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfw)
+                                    tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfw)
                                     cute.arch.fence_view_async_tmem_store()
                     if const_expr(self.q3):
                         if const_expr(late_cw):
@@ -1065,11 +1065,11 @@ class DmHd256Mx2:
                 else:
                     if const_expr(self.dqopt):
                         if const_expr(not self.esf):          # esf: stored before the quantization (above)
-                            dm_utils.tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfw)
+                            tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + 4 * hf + qd, sfw)
                     elif hf == 0:
-                        sfa = pack4(dm_utils.add_sb_clamp(sball[0], osb[0]), dm_utils.add_sb_clamp(sball[1], osb[1]),
-                                    dm_utils.add_sb_clamp(sball[2], osb[2]), dm_utils.add_sb_clamp(sball[3], osb[3]))
-                        dm_utils.tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + qd, sfa)
+                        sfa = pack4(add_sb_clamp(sball[0], osb[0]), add_sb_clamp(sball[1], osb[1]),
+                                    add_sb_clamp(sball[2], osb[2]), add_sb_clamp(sball[3], osb[3]))
+                        tmem_st_x1(tb + self.COL_SF + self.SF_STRIDE * stg + qd, sfa)
                     cute.arch.fence_view_async_tmem_store()
                     cute.arch.fence_view_async_shared()
                     tc_fence_before()
@@ -1086,8 +1086,8 @@ class DmHd256Mx2:
                                     if const_expr(self.unsafe):
                                         one_ = Int32(0x7F7F7F7F)
                                         sfo = self.COL_SF + self.SF_STRIDE * int(self.kn[3]) + self.SFB_OFF
-                                        dm_utils.tmem_st_x4(tb + sfo, one_, one_, one_, one_)
-                                        dm_utils.tmem_st_x4(tb + sfo + 4, one_, one_, one_, one_)
+                                        tmem_st_x4(tb + sfo, one_, one_, one_, one_)
+                                        tmem_st_x4(tb + sfo + 4, one_, one_, one_, one_)
                                         cute.arch.fence_view_async_tmem_store()
                         else:
                             if hf == 0:
@@ -1095,16 +1095,16 @@ class DmHd256Mx2:
                                 if const_expr(self.unsafe):
                                     one_ = Int32(0x7F7F7F7F)
                                     sfo = self.COL_SF + self.SF_STRIDE * int(self.kn[3]) + self.SFB_OFF
-                                    dm_utils.tmem_st_x4(tb + sfo, one_, one_, one_, one_)
-                                    dm_utils.tmem_st_x4(tb + sfo + 4, one_, one_, one_, one_)
+                                    tmem_st_x4(tb + sfo, one_, one_, one_, one_)
+                                    tmem_st_x4(tb + sfo + 4, one_, one_, one_, one_)
                                     cute.arch.fence_view_async_tmem_store()
             if const_expr((self.dbg & 1) and self.mode == "dq"):
                 if hf == 0:
-                    ia = _gaddr(mIdent) + (Int64(b * H + hx) * N + rtok) * 32
+                    ia = global_address(mIdent) + (Int64(b * H + hx) * N + rtok) * 32
                     st_global_f64x2(ia, idn, idd)
                     st_global_f64x2(ia + 16, idp, Float64(0.0))
             if const_expr((self.dbg & 8) and self.mode == "dq"):
-                ha = _gaddr(mHash) + (Int64(b * H + hx) * N + rtok) * 32
+                ha = global_address(mHash) + (Int64(b * H + hx) * N + rtok) * 32
                 red_add_u64(ha, lk_p)
                 red_add_u64(ha + 8, lk_s)
                 red_add_u64(ha + 16, lk_c)
@@ -1117,7 +1117,7 @@ class DmHd256Mx2:
             nho = H
             if const_expr(self.rows_are_keys):
                 nho = Hk
-            ob = _gaddr(mOut) + (((Int64(b) * N + rtok) * nho + hx) * D) * 2
+            ob = global_address(mOut) + (((Int64(b) * N + rtok) * nho + hx) * D) * 2
             for cq in cutlass.range_constexpr(4):
                 cblk = 4 * hf + cq
                 ov = tmem_ld32(tb + self.COL_OUT + 32 * cblk)

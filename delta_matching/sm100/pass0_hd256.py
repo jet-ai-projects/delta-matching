@@ -14,8 +14,8 @@ import flash_attn.cute.interface as fi
 from flash_attn.cute import cache_utils
 
 from .dm_pass0_hd256_sm100 import DMPass0Hd256Sm100
-from .fwd import _fingerprint
-from . import fastpath
+from .compile_cache_sm100 import fingerprint
+from . import launch_cache_sm100
 
 D = 256
 _LOCK = threading.Lock()
@@ -34,7 +34,7 @@ def _variant(exp_variant: str):
         _CLASSES[exp_variant] = type(f"DMPass0Hd256Sm100_{exp_variant.replace('+', '_F_')}", (DMPass0Hd256Sm100,),
                                      {"dm_exp_variant": exp_variant})
         if cache_utils.CUTE_DSL_CACHE_ENABLED:
-            c = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / _fingerprint() / f"pass0hmx_{exp_variant}")
+            c = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / fingerprint() / f"pass0hmx_{exp_variant}")
         else:
             c = cache_utils.JITCache()
         _CACHES[exp_variant] = c
@@ -66,7 +66,7 @@ def dm_delta_hd256(q8, qs, k8, ks, v8, vs, do8, dos, lse, causal: bool, exp_vari
            _aux(do8.contiguous().view(torch.uint8), 3), _aux(lse.contiguous(), 2)]
     names = ["qs", "ks", "vs", "dos", "do8", "lse"]
     inp = dict(q8=q8, k8=k8, v8=v8, **{n: t for n, t in zip(names, aux)})
-    return fastpath.call("pass0_hd256", inp, (bool(causal), exp_variant, repr(sorted(over.items()))),
+    return launch_cache_sm100.call("pass0_hd256", inp, (bool(causal), exp_variant, repr(sorted(over.items()))),
                          lambda: _slow(q8, k8, v8, aux, causal, over, exp_variant), cmp=[1])[1]
 
 
@@ -95,7 +95,7 @@ def _slow(q8, k8, v8, aux, causal, over, exp_variant):
     with _LOCK:
         cls, cache = _variant(exp_variant)
         fi.FlashAttentionForwardSm100 = cls
-        fi._flash_attn_fwd.compile_cache = fastpath.RecCache(cache)
+        fi._flash_attn_fwd.compile_cache = launch_cache_sm100.RecCache(cache)
         fi.select_fwd_config = select
         try:
             o_unused, delta, *_ = fi._flash_attn_fwd(q8, k8, v8, softmax_scale=1.0, causal=causal, return_lse=True,

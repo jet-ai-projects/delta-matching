@@ -5,64 +5,25 @@ fingerprint of FA4's sources AND this package's kernel sources, so AOT compiles 
 reused by GPU runs.  The compile key does not depend on B / N, only on (causal, GQA ratio, config).
 """
 import dataclasses
-import hashlib
 import os
 import threading
-from pathlib import Path
 
 import torch
 import flash_attn.cute.interface as fi
 from flash_attn.cute import cache_utils, config as fa_config
 
 from .dm_fwd_sm100 import DMForwardSm100
-from . import fastpath
-_env = fastpath.env
+from . import launch_cache_sm100
+from .compile_cache_sm100 import compile_env, fingerprint
+from delta_matching.sm100.attention_math_sm100 import ex2_poly6_2
+_env = launch_cache_sm100.env
 
-_HERE = Path(__file__).resolve().parent
 _LOCK = threading.Lock()
 # ex2_emu_freq=0: every forward exp on MUFU ex2.approx (no FA4 deg-3 FMA polynomial). Accuracy rule (no accuracy
 # trade-offs): vs FA4's causal fp8 emulation (deg-3 on 25% of exps) all-MUFU has 100-1000x fewer P codes differing from
 # RN_e4m3(exact 2^x), ~9x (up to 46x) lower LSE error and no worse O.
 # DM_FWD_OPTS=ex2_emu_freq=N re-enables the emulation for experiments only.
 FORCE = dict(use_2cta_instrs=False, pack_gqa=False, use_s_ping_pong=False, num_splits=1, ex2_emu_freq=0)
-
-
-_STATIC_ENV = []
-
-
-def compile_env():
-    """every compile-time input of the DM kernels that FA4's compile key (dtype / head dims / causal /
-    GQA ratio / config incl. registers / deterministic / arch / ...) and the opts string do NOT carry, rendered as one
-    string that is hashed into the persistent cache directory (_fingerprint) and into the in-process cache memos:
-      DM_ABL (bwd ablation knobs, read in DMBackwardSm100.__init__), DM_TCF_SKIP (read while tracing), the dm_utils fence
-      emission settings in effect (DM_TCF_IMPL / DM_TCF_MASK, read at dm_utils import), the pass-0 register splits in effect
-      (DM_P0_C3REGS / DM_P0_TLREGS, read at pass0 import; also in the config), and the CuTe DSL compile settings (CUTE_DSL_LINEINFO,
-      _COMPILER_OPT, _DEBUG, ... = the DSL's own cache_key_str() minus arch, which FA4's key has, and the runtime lib path).
-    Opts strings (DM_FWD_OPTS, effective DM_BWD_OPTS incl. b6=, DM_P0_EXP variant) are hashed by the callers."""
-    from . import dm_utils, pass0 as _p0
-    if not _STATIC_ENV:
-        try:
-            from cutlass.cutlass_dsl import CuTeDSL
-            dsl = ";".join(x for x in CuTeDSL._get_dsl().envar.cache_key_str().split(";")
-                           if x and not x.startswith(("arch=", "shared_libs=")))
-        except Exception as e:  # noqa: BLE001
-            dsl = f"unknown:{type(e).__name__}"
-        # NOT hashed: the SM count (AOT fakes 148, GB200 reports 152): measured not to change the compiled object (whole .o
-        # byte-identical for fwd / pass 0 / bwd), and hashing it would make every GPU run miss
-        # the AOT entries (compile inside a lease).
-        _STATIC_ENV.append(f"dsl={dsl}|tcf_impl={dm_utils._TCF_IMPL}|tcf_mask={dm_utils._TCF_MASK}|"
-                           f"p0regs={sorted(_p0.REGS_C3.items())}{sorted(_p0.REGS_TL.items())}")
-    return f"{_STATIC_ENV[0]}|abl={_env('DM_ABL', '')}|tcf_skip={_env('DM_TCF_SKIP', '')}"
-
-
-def _fingerprint(opts=""):
-    h = hashlib.sha256(cache_utils._compute_source_fingerprint().encode())
-    h.update(opts.encode())   # kernel variant knobs (DM_FWD_OPTS, read in DMForwardSm100.__init__)
-    h.update(compile_env().encode())   # compile-time inputs outside FA4's key and the opts
-    for f in sorted(_HERE.glob("*.py")):
-        h.update(f.name.encode())
-        h.update(f.read_bytes())
-    return h.hexdigest()[:24]
 
 
 _CACHES = {}
@@ -74,7 +35,7 @@ def _cache():
     mk = (opts, compile_env())   # memo keyed on every compile-time input, not only the opts
     if mk not in _CACHES:
         if cache_utils.CUTE_DSL_CACHE_ENABLED:
-            _CACHES[mk] = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / _fingerprint(opts) / "fwd")
+            _CACHES[mk] = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / fingerprint(opts) / "fwd")
         else:
             _CACHES[mk] = cache_utils.JITCache()
     return _CACHES[mk]
@@ -146,7 +107,7 @@ def dm_fwd(q8, qs, k8, ks, v8, vs, causal: bool, config_override: dict | None = 
     else:
         qsc, ksc, vsc = qs.contiguous(), ks.contiguous(), vs.contiguous()
     fopts = _env("DM_FWD_OPTS", "")
-    return fastpath.call("fwd", dict(q8=q8, k8=k8, v8=v8, qsc=qsc, ksc=ksc, vsc=vsc),
+    return launch_cache_sm100.call("fwd", dict(q8=q8, k8=k8, v8=v8, qsc=qsc, ksc=ksc, vsc=vsc),
                          (bool(causal), fopts, repr(sorted(over.items())), compile_env()),
                          lambda: _dm_fwd_slow(q8, k8, v8, qsc, ksc, vsc, causal, over))
 
@@ -171,12 +132,11 @@ def _dm_fwd_slow(q8, k8, v8, qsc, ksc, vsc, causal, over):
     with _LOCK:
         if "poly6" in _env("DM_FWD_OPTS", "").split(","):
             # poly6: the FA4 ex2-emulation slots (ex2_emu_freq / ex2_emu_start_frg) use the degree-6 polynomial
-            # (dm_utils.ex2_poly6_2: at least as accurate as ex2.approx.ftz on every element metric) - trace-time only
-            from . import dm_utils as _du
-            _fu.ex2_emulation_2 = lambda x, y, **kw: _du.ex2_poly6_2(x, y)
+            # (ex2_poly6_2: at least as accurate as ex2.approx.ftz on every element metric) - trace-time only
+            _fu.ex2_emulation_2 = lambda x, y, **kw: ex2_poly6_2(x, y)
         fi.FlashAttentionForwardSm100 = DMForwardSm100
         fi._validate_tensor = validate
-        fi._flash_attn_fwd.compile_cache = fastpath.RecCache(_cache())
+        fi._flash_attn_fwd.compile_cache = launch_cache_sm100.RecCache(_cache())
         fi.select_fwd_config = _select(orig[3], over)
         fi.to_cute_tensor = tct
         try:

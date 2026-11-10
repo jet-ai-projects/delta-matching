@@ -22,9 +22,23 @@ import os
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Int64, const_expr
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 import flash_attn.cute.flash_bwd_postprocess as _fpp
-from . import dm_utils
+from delta_matching.sm100.cute_ptx_sm100 import fence_proxy_async_global, ld_shared_b32, poll_acquire_ge_or_trap, st_shared_b32
+
+@dsl_user_op
+def poll_acquire_nz_or_trap(addr: cutlass.Int64, limit: Int32, *, loc=None, ip=None) -> Int32:
+    """rw8k tconv: spin with ld.acquire.gpu until the int32 at addr is non-zero (trap after `limit` polls); returns it."""
+    return Int32(llvm.inline_asm(
+        T.i32(), [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), Int32(limit).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .pred p;\n\t.reg .b32 it;\n\tmov.b32 it, 0;\n"
+        "DM_PNZ:\n\tld.acquire.gpu.global.b32 $0, [$1];\n\tsetp.ne.s32 p, $0, 0;\n\t@p bra DM_PNZD;\n\t"
+        "add.s32 it, it, 1;\n\tsetp.gt.s32 p, it, $2;\n\t@p trap;\n\tnanosleep.u32 256;\n\tbra DM_PNZ;\n"
+        "DM_PNZD:\n\t}",
+        "=r,l,r", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
 
 _SRC = inspect.getsource(_fpp)
 
@@ -114,11 +128,11 @@ class DMTailConv(_Base):
         if tidx == 0:
             if const_expr(self.dm_ctl == "qdrop"):
                 # CONTROL: wait for an entry value no producer ever writes (must trap, not hang)
-                dm_utils.poll_acquire_ge_or_trap(mDmQ.iterator.toint() + Int64(4) * Int64(1 + pos), Int32(1 << 30), Int32(1 << 22))
-            v0 = dm_utils.poll_acquire_nz_or_trap(mDmQ.iterator.toint() + Int64(4) * Int64(1 + pos), Int32(1 << 24))
-            dm_utils.st_shared_b32(saddr, v0)
+                poll_acquire_ge_or_trap(mDmQ.iterator.toint() + Int64(4) * Int64(1 + pos), Int32(1 << 30), Int32(1 << 22))
+            v0 = poll_acquire_nz_or_trap(mDmQ.iterator.toint() + Int64(4) * Int64(1 + pos), Int32(1 << 24))
+            st_shared_b32(saddr, v0)
         cute.arch.barrier()
-        t = dm_utils.ld_shared_b32(saddr) - 1
+        t = ld_shared_b32(saddr) - 1
         cute.arch.barrier()
         mt = cute.size(mDmSem, mode=[2])
         nh = cute.size(mDmSem, mode=[1])
@@ -145,16 +159,16 @@ class DMTailConv(_Base):
                 ns = cute.size(mDmSem, mode=[3])
                 base = mDmSem.iterator.toint() + Int64(4) * Int64(((batch_idx * nh + head_idx) * nt + m_block) * ns)
                 for r in cutlass.range_constexpr(cute.size(mDmSem, mode=[3])):
-                    dm_utils.poll_acquire_ge_or_trap(base + Int64(4 * r), fin, Int32(1 << 24))
+                    poll_acquire_ge_or_trap(base + Int64(4 * r), fin, Int32(1 << 24))
             cute.arch.barrier()
-            dm_utils.fence_proxy_async_global()
+            fence_proxy_async_global()
 
 
 def _cache():
     from flash_attn.cute import cache_utils
-    from .fwd import _fingerprint
+    from .compile_cache_sm100 import fingerprint
     if cache_utils.CUTE_DSL_CACHE_ENABLED:
-        return cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / _fingerprint() / "tconv")
+        return cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / fingerprint() / "tconv")
     return cache_utils.JITCache()
 
 

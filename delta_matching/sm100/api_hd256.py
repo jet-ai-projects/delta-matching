@@ -15,7 +15,7 @@ from .pass0_hd256 import dm_delta_hd256
 from .bwd_hd256mx import dm_bwd_hd256mx
 from .bwd_hd256kv2 import dm_bwd_hd256kv2, kv2_launch
 from .bwd_hd256dqr import dm_bwd_hd256dqr
-from .fastpath import env as _env
+from .launch_cache_sm100 import env as _env
 
 LAST_IDENT_PLAN = None     # debug only: plan of the last dm_attn_debug_hd256(identity=True) call ("mx" | None = kv2 | chunk list)
 BWD_IMPL_DEFAULT = "dqr"    # host impl switch (DM_H256_BWD_IMPL): "mx" = DmHd256Mx dv+dk+dq, "kv2" = DmHd256Mx dq + DmHd256Kv2,

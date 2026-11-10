@@ -17,8 +17,8 @@ import cutlass.cute as cute
 from cutlass import Int32
 
 from .dm_bwd_hd256mx_sm100 import DmHd256Mx
-from .fwd import _fingerprint
-from .fastpath import env as _env
+from .compile_cache_sm100 import fingerprint
+from .launch_cache_sm100 import env as _env
 
 D = 256
 NUMERICS = "sm100-mx-d256"
@@ -43,7 +43,7 @@ PROF = []
 def _cache():
     if "c" not in _CACHE:
         if cache_utils.CUTE_DSL_CACHE_ENABLED:
-            _CACHE["c"] = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / _fingerprint() / "bwdhmx")
+            _CACHE["c"] = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / fingerprint() / "bwdhmx")
         else:
             _CACHE["c"] = cache_utils.JITCache()
     return _CACHE["c"]

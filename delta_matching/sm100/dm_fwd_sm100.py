@@ -29,7 +29,8 @@ from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from cutlass.base_dsl.arch import Arch
-from cutlass.cutlass_dsl import BaseDSL
+from cutlass.cutlass_dsl import BaseDSL, T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 from quack import copy_utils, layout_utils
 
@@ -37,7 +38,10 @@ from flash_attn.cute.paged_kv import PagedKVManager, resolve_paged_token
 from flash_attn.cute.tensormap_utils import acquire_tensormap, bound_rows, cta_tensormap_slot
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
-from delta_matching.sm100 import dm_utils
+from delta_matching.sm100.cute_ptx_sm100 import bitcast_f32_i32, bitcast_i32_f32, ceil_f32, clock64, floor_f32, ld_shared_b32, mbar_init, nanosleep_1us, st_shared_b32, st_shared_v4_b32, tc_commit, tmem_st_x4
+from delta_matching.sm100.fp8_e8m0_scale_sm100 import byte_pow2_f32, byte_shl23_f32, exp2i_f32, pack_bytes4, pow2_exponent_byte, ue8m0_byte
+from delta_matching.sm100.mma_sm100 import gemm_ptx_bs
+from delta_matching.sm100.tcgen05_fence_sm100 import FENCE_MODE, begin_kernel_fences, end_kernel_fences, fence_warp_relay, mark_fenced, mbar_arrive, mbar_wait_parity, mbar_wait_parity_nh, tcgen05_fence_after, tcgen05_fence_before
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask, mask_r2p_lambda, r2p_bitmask_below
@@ -91,6 +95,145 @@ from flash_attn.cute.config import (
 # rescale_threshold lets the row max lag by that many log2 units, so P can reach
 # 2^(max_offset + rescale_threshold); above the dtype max the top probabilities saturate
 # while the FP32 denominator still counts them in full, shrinking the output (#2716).
+
+def block_scaled_idesc(idesc_plain: int, k: int) -> int:
+    """Block-scaled (kind::mxf8f6f4, E8M0 scales) instruction descriptor from the plain f8f6f4 one:
+    bits [4,6) c_format -> b_sf_id, bit 23 -> scale_format E8M0, bits [29,31) -> a_sf_id (= k-step byte)."""
+    d = idesc_plain & ~(0x3 << 4) & ~(0x7 << 29)
+    return d | (1 << 23) | ((k & 3) << 29) | ((k & 3) << 4)
+
+
+def gemm_ptx_bs_ts(
+    op, acc_tmem_addr, tCrA, tCrB, sB, sfa_tmem_addr, sfb_tmem_addr,
+    mbar_ptr=None, mbar_phase=None, split_arrive=None, zero_init=False, tA_addr=None, cta_group: int = 1, offs_a=None,
+):
+    """TS block-scaled MMA: A (e4m3) from TMEM, B (e4m3) from smem, SFA/SFB (UE8M0) in TMEM.
+    One 32-bit SF word per row holds the 4 k-step scales; k-step k selects byte k via sf_id (idesc).
+    Mirrors flash_attn.cute.blackwell_helpers.gemm_ptx_partial (TS branch)."""
+    from flash_attn.cute import mma_sm100_desc as sm100_desc
+    from flash_attn.cute.blackwell_helpers import i64_to_i32x2
+    idesc_plain: int = sm100_desc.mma_op_to_idesc(op)
+    nk = cute.size(tCrA.shape[2])
+    assert nk <= 4, "one SF word covers 4 k-steps"
+    sB_layout = sB.layout
+    sB_swizzle = sB.iterator.type.swizzle_type
+    smem_desc_base_b: int = sm100_desc.make_smem_desc_base(
+        cute.recast_layout(128, op.b_dtype.width, sB_layout[0]), sB_swizzle,
+        sm100_desc.Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else sm100_desc.Major.MN)
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    tCrA_layout = cute.recast_layout(32, tCrA.element_type.width, tCrA.layout)
+    offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(nk)] if offs_a is None else list(offs_a)
+    offset_b = [cute.crd2idx((0, 0, k), tCrB.layout) for k in range(nk)]
+    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
+    pred_str = "p" if isinstance(zero_init, cutlass.Boolean) else "0" if zero_init else "1"
+    tA_addr = tCrA[None, None, 0].iterator.toint() if tA_addr is None else tA_addr
+    input_args = [
+        Int32(cute.arch.make_warp_uniform(tA_addr)).ir_value(),
+        Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+        (Int32(1) - Int32(zero_init)).ir_value() if isinstance(zero_init, cutlass.Boolean) else Int32(not zero_init).ir_value(),
+        Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+        Int32(cute.arch.make_warp_uniform(sfa_tmem_addr)).ir_value(),
+        Int32(cute.arch.make_warp_uniform(sfb_tmem_addr)).ir_value(),
+    ]
+    split_idx = nk
+    wait_str = ""
+    if mbar_ptr is not None:
+        split_idx = split_arrive // op.shape_mnk[2]
+        input_args.append(mbar_ptr.toint().ir_value())
+        input_args.append(Int32(mbar_phase).ir_value())
+        wait_str = (".reg .pred P1; \n\tLAB_WAIT: \n\t"
+                    "mbarrier.try_wait.parity.shared::cta.b64 P1, [$6], $7, 10000000; \n\t"
+                    "@P1 bra DONE; \n\tbra     LAB_WAIT; \n\tDONE: \n\t"
+                    + ("tcgen05.fence::after_thread_sync; \n\t" if FENCE_MODE[0] >= 1 else ""))
+    instr = f"tcgen05.mma.cta_group::{cta_group}.kind::mxf8f6f4.block_scale.scale_vec::1X"
+
+    def one(k, pred):
+        return (f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                f"@leader_thread {instr} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, "
+                f"{hex(block_scaled_idesc(idesc_plain, k))}, [tmem_sfa], [tmem_sfb], {pred};\n\t")
+
+    body = ("{\n\t.reg .pred leader_thread;\n\t.reg .pred p;\n\t.reg .b32 tmem_acc, tmem_a, tmem_sfa, tmem_sfb;\n\t"
+            ".reg .b32 smem_desc_b_lo_start, smem_desc_b_lo, smem_desc_b_hi;\n\t.reg .b64 smem_desc_b;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            "mov.b32 tmem_acc, $3;\n\tmov.b32 tmem_a, $0;\n\tmov.b32 tmem_sfa, $4;\n\tmov.b32 tmem_sfb, $5;\n\t"
+            "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            "setp.ne.b32 p, $2, 0;\n\t"
+            + one(0, pred_str)
+            + "".join(one(k, "1") for k in range(1, split_idx))
+            + wait_str
+            + "".join(one(k, "1") for k in range(split_idx, nk))
+            + "}\n")
+    llvm.inline_asm(None, input_args, body, ",".join(["r"] * len(input_args)),
+                    has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+@dsl_user_op
+def exp2_h2_e4m3x4(x0: Float32, x1: Float32, x2: Float32, x3: Float32, *, loc=None, ip=None):
+    """4 x (fp32 -> f16, ex2.approx.f16x2, -> e4m3).  Returns (word of 4 e4m3 codes [x0 in byte 0],
+    f16x2 exp of (x0, x1), f16x2 exp of (x2, x3)) as Int32 bit patterns."""
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.i32(), T.i32(), T.i32()]),
+        [Float32(v).ir_value(loc=loc, ip=ip) for v in (x0, x1, x2, x3)],
+        "{\n\t.reg .b32 h0, h1, e0, e1;\n\t.reg .b16 c0, c1;\n\t"
+        "cvt.rn.f16x2.f32 h0, $4, $3;\n\t"
+        "cvt.rn.f16x2.f32 h1, $6, $5;\n\t"
+        "ex2.approx.f16x2 e0, h0;\n\t"
+        "ex2.approx.f16x2 e1, h1;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f16x2 c0, e0;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f16x2 c1, e1;\n\t"
+        "mov.b32 $0, {c0, c1};\n\t"
+        "mov.b32 $1, e0;\n\tmov.b32 $2, e1;\n\t}",
+        "=r,=r,=r,f,f,f,f", has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return (Int32(llvm.extractvalue(T.i32(), res, [0], loc=loc, ip=ip)), Int32(llvm.extractvalue(T.i32(), res, [1], loc=loc, ip=ip)),
+            Int32(llvm.extractvalue(T.i32(), res, [2], loc=loc, ip=ip)))
+
+
+@dsl_user_op
+def hadd2(a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(llvm.inline_asm(T.i32(), [Int32(a).ir_value(loc=loc, ip=ip), Int32(b).ir_value(loc=loc, ip=ip)],
+                                 "add.rn.f16x2 $0, $1, $2;", "=r,r,r", has_side_effects=False, is_align_stack=False,
+                                 asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def h2_sum_f32(a: Int32, *, loc=None, ip=None) -> Float32:
+    """f32(lo) + f32(hi) of an f16x2."""
+    return Float32(llvm.inline_asm(
+        T.f32(), [Int32(a).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b16 l, h;\n\t.reg .f32 fl, fh;\n\tmov.b32 {l, h}, $1;\n\t"
+        "cvt.f32.f16 fl, l;\n\tcvt.f32.f16 fh, h;\n\tadd.f32 $0, fl, fh;\n\t}",
+        "=f,r", has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+def hadd2_tree(hs):
+    """Pairwise f16x2 tree sum of a Python list (plain Python, unrolled at trace time)."""
+    while len(hs) > 1:
+        hs = [hadd2(hs[2 * t], hs[2 * t + 1]) for t in range(len(hs) // 2)]
+    return hs[0]
+
+
+@dsl_user_op
+def byte_pow2_f32_rt(word: Int32, pos: Int32, *, loc=None, ip=None) -> Float32:
+    """byte_pow2_f32 with a runtime bit position pos = 8 j (same bfe/shl -> same value)."""
+    return Float32(llvm.inline_asm(
+        T.f32(), [Int32(word).ir_value(loc=loc, ip=ip), Int32(pos).ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .b32 t;\n\tbfe.u32 t, $1, $2, 8;\n\tshl.b32 $0, t, 23;\n\t}",
+        "=f,r,r", has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def tmem_ld_32x32b_x8(addr: Int32, *, loc=None, ip=None):
+    """ordinv planted control only: raw tcgen05.ld.32x32b.x8 (thread t = lane base + t, 8 consecutive columns)."""
+    regs = ",".join(f"${i}" for i in range(8))
+    res = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32()] * 8), [Int32(addr).ir_value(loc=loc, ip=ip)],
+        "tcgen05.ld.sync.aligned.32x32b.x8.b32 {" + regs + "}, [$8];",
+        ",".join(["=f"] * 8) + ",r", has_side_effects=True, is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+    return [Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(8)]
+
 
 # log2 of the largest finite value representable in each supported input dtype.
 _LOG2_DTYPE_MAX = {
@@ -1103,7 +1246,7 @@ class DMForwardSm100:
         using tensor memory access (TMA) for efficient data loading, warp specialization for different
         computation phases, and optional attention masking.
         """
-        dm_utils.tcf_begin(int(self.dm_opts.get("tcf", "1")))   # tcgen05 thread-sync fences (dm_utils.TCF)
+        begin_kernel_fences(int(self.dm_opts.get("tcf", "1")))   # tcgen05 thread-sync fences (FENCE_MODE)
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1298,39 +1441,39 @@ class DMForwardSm100:
             )
 
 
-        # mark the tcgen05 hand-off pipelines / barriers (dm_utils.tcf_mark)
-        dm_utils.tcf_mark("ua", pipeline_s_p_o, pipeline_o_acc)
-        dm_utils.tcf_mark("au", pipeline_p_lastsplit)
-        dm_utils.tcf_mark("bar", sm_stats_barrier, tmem_alloc_barrier)
+        # mark the tcgen05 hand-off pipelines / barriers (mark_fenced)
+        mark_fenced("ua", pipeline_s_p_o, pipeline_o_acc)
+        mark_fenced("au", pipeline_p_lastsplit)
+        mark_fenced("bar", sm_stats_barrier, tmem_alloc_barrier)
         # Cluster arrive after barrier init
         if const_expr(self.dm_sspv):
             self.dm_sfree = Int32(storage.mbar_dm_sfree.data_ptr().toint())
             self.dm_pvdone = Int32(storage.mbar_dm_pvdone.data_ptr().toint())
             self.dm_cread = Int32(storage.mbar_dm_cread.data_ptr().toint())
             if cute.arch.thread_idx()[0] == 0:
-                dm_utils.mbar_init(self.dm_sfree, 4 * cute.arch.WARP_SIZE)
-                dm_utils.mbar_init(self.dm_pvdone, 1)
-                dm_utils.mbar_init(self.dm_pvdone + 8, 1)
+                mbar_init(self.dm_sfree, 4 * cute.arch.WARP_SIZE)
+                mbar_init(self.dm_pvdone, 1)
+                mbar_init(self.dm_pvdone + 8, 1)
                 if const_expr(self.dm_dbs):
-                    _ = [dm_utils.mbar_init(self.dm_cread + 8 * _b, cute.arch.WARP_SIZE) for _b in range(32)]   # per warp: 32 arrivals
+                    _ = [mbar_init(self.dm_cread + 8 * _b, cute.arch.WARP_SIZE) for _b in range(32)]   # per warp: 32 arrivals
                 else:
-                    dm_utils.mbar_init(self.dm_cread, 4 * cute.arch.WARP_SIZE)
-                    dm_utils.mbar_init(self.dm_cread + 8, 4 * cute.arch.WARP_SIZE)
+                    mbar_init(self.dm_cread, 4 * cute.arch.WARP_SIZE)
+                    mbar_init(self.dm_cread + 8, 4 * cute.arch.WARP_SIZE)
                 cute.arch.mbarrier_init_fence()
         if const_expr(self.dm_slice):
             self.dm_slbar = Int32(storage.mbar_dm_slice.data_ptr().toint())
             self.dm_slbuf = Int32(storage.sDmSlice.data_ptr().toint())
             if cute.arch.thread_idx()[0] == 0:
                 for _s in range(2):
-                    dm_utils.mbar_init(self.dm_slbar + 8 * _s, 16)        # kbfull[s]: one arrival per slice warp
-                    dm_utils.mbar_init(self.dm_slbar + 16 + 8 * _s, 16)   # bsfull[s]
-                    dm_utils.mbar_init(self.dm_slbar + 32 + 8 * _s, 4)    # bsempty[s]: one per correction warp
+                    mbar_init(self.dm_slbar + 8 * _s, 16)        # kbfull[s]: one arrival per slice warp
+                    mbar_init(self.dm_slbar + 16 + 8 * _s, 16)   # bsfull[s]
+                    mbar_init(self.dm_slbar + 32 + 8 * _s, 4)    # bsempty[s]: one per correction warp
                 cute.arch.mbarrier_init_fence()
         if const_expr(self.dm_ordw):
             self.dm_ord = Int32(storage.mbar_dm_ord.data_ptr().toint())
             if cute.arch.thread_idx()[0] == 0:
-                dm_utils.mbar_init(self.dm_ord, 1)
-                dm_utils.mbar_init(self.dm_ord + 8, 1)
+                mbar_init(self.dm_ord, 1)
+                mbar_init(self.dm_ord + 8, 1)
                 cute.arch.mbarrier_init_fence()
         pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
 
@@ -1700,7 +1843,7 @@ class DMForwardSm100:
                 )
                 tmem_alloc_barrier.arrive_unaligned()
 
-        dm_utils.tcf_end()
+        end_kernel_fences()
         return
 
     @cute.jit
@@ -2098,7 +2241,7 @@ class DMForwardSm100:
         # ]
         gemm_Pi = [
             partial(
-                dm_utils.gemm_ptx_bs_ts,
+                gemm_ptx_bs_ts,
                 pv_mma_op,
                 self.tmem_o_offset[stage % self.q_stage],
                 tOrP[None, None, None, stage],
@@ -2141,8 +2284,8 @@ class DMForwardSm100:
             dm_sfmap = tuple((0, k) for k in range(4))
             dm_q = Int32(0)
             with cute.arch.elect_one():
-                dm_utils.tc_commit(self.dm_pvdone)
-                dm_utils.tc_commit(self.dm_pvdone + 8)
+                tc_commit(self.dm_pvdone)
+                tc_commit(self.dm_pvdone + 8)
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -2233,9 +2376,9 @@ class DMForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         if dm_q > 0:
-                            dm_utils.mbar_wait_parity(self.dm_sfree, (dm_q - 1) & 1)
+                            mbar_wait_parity(self.dm_sfree, (dm_q - 1) & 1)
                         if const_expr(self.dm_opts.get("tcf", "1") == "1"):
-                            dm_utils.tc_fence_after()
+                            tcgen05_fence_after()
                         cute.arch.fence_view_async_tmem_load()
                         gemm_Si[stage](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
                         pipeline_s_p_o.producer_commit_w_index(stage)
@@ -2260,23 +2403,23 @@ class DMForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         for stage in cutlass.range_constexpr(self.q_stage):
-                            dm_utils.mbar_wait_parity(self.dm_sfree, (dm_q - 1) & 1)
+                            mbar_wait_parity(self.dm_sfree, (dm_q - 1) & 1)
                             if const_expr(self.dm_opts.get("tcf", "1") == "1"):
-                                dm_utils.tc_fence_after()
+                                tcgen05_fence_after()
                             cute.arch.fence_view_async_tmem_load()
                             gemm_Si[stage](smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
                             pipeline_s_p_o.producer_commit_w_index(stage)
                             dm_q += 1
                             pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
                             if const_expr(self.dm_opts.get("tcf", "1") == "1"):
-                                dm_utils.tc_fence_after()   # SF/O tcgen05.st of softmax/correction before this PV
-                            dm_utils.gemm_ptx_bs(
+                                tcgen05_fence_after()   # SF/O tcgen05.st of softmax/correction before this PV
+                            gemm_ptx_bs(
                                 pv_mma_op, self.tmem_o_offset[stage], dm_tCrP[None, None, None, stage], tOrVi,
                                 self.dm_sP[None, None, None, stage], sV_cur,
                                 self.dm_sf_abs[stage], self.dm_sf_abs[stage] + 4, dm_sfmap, dm_sfmap,
                                 zero_init=not O_should_accumulate, cta_group=self.cta_group_size)
                             with cute.arch.elect_one():
-                                dm_utils.tc_commit(self.dm_pvdone + 8 * stage)
+                                tc_commit(self.dm_pvdone + 8 * stage)
                         pipeline_kv.consumer_release(mma_kv_release_state)
                         pipeline_kv.consumer_release(mma_kv_consumer_state)
                         mma_kv_consumer_state.advance()
@@ -2293,14 +2436,14 @@ class DMForwardSm100:
                     for stage in cutlass.range_constexpr(self.q_stage):
                         pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
                         if const_expr(self.dm_opts.get("tcf", "1") == "1"):
-                            dm_utils.tc_fence_after()
-                        dm_utils.gemm_ptx_bs(
+                            tcgen05_fence_after()
+                        gemm_ptx_bs(
                             pv_mma_op, self.tmem_o_offset[stage], dm_tCrP[None, None, None, stage], tOrVi,
                             self.dm_sP[None, None, None, stage], sV_cur,
                             self.dm_sf_abs[stage], self.dm_sf_abs[stage] + 4, dm_sfmap, dm_sfmap,
                             zero_init=not O_should_accumulate, cta_group=self.cta_group_size)
                         with cute.arch.elect_one():
-                            dm_utils.tc_commit(self.dm_pvdone + 8 * stage)
+                            tc_commit(self.dm_pvdone + 8 * stage)
                         pipeline_o_acc.producer_commit_w_index(stage)
                     P_full_O_rescaled_phase ^= 1
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
@@ -2327,15 +2470,15 @@ class DMForwardSm100:
                         if const_expr(self.dm_ordw):
                             # ordinv: the previous work tile's last PV_s (reads SF in S_s) must be complete before QK_s
                             if dm_pvn > 0:
-                                dm_utils.mbar_wait_parity(self.dm_ord + 8 * stage, (dm_pvn - 1) & 1)
-                                dm_utils.tc_fence_after()
+                                mbar_wait_parity(self.dm_ord + 8 * stage, (dm_pvn - 1) & 1)
+                                tcgen05_fence_after()
                         if const_expr(self.dm_ordpc == 1):
                             if dm_pvn > 0:   # DEBUG planted control at the work-tile boundary (previous tile's last PV_s)
                                 dm_pc_a = ((cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) * 32) << 16
                                 dm_pc_a = dm_pc_a + Int32(tStS[(None, None), 0, 0, 0].iterator.toint()) + Int32(
                                     self.tmem_s_offset[stage] + (self.dm_sl_sfcol if self.dm_slice else self.dm_sf_col))
                                 dm_pc_w = Int32(-2139062144)   # 0x80808080
-                                dm_utils.tmem_st_x4(dm_pc_a, dm_pc_w, dm_pc_w, dm_pc_w, dm_pc_w)
+                                tmem_st_x4(dm_pc_a, dm_pc_w, dm_pc_w, dm_pc_w, dm_pc_w)
                                 cute.arch.fence_view_async_tmem_store()
                         # gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
                         gemm_Si[stage](
@@ -2369,7 +2512,7 @@ class DMForwardSm100:
                             # the last iteration of the previous work tile.
                             pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
                             if const_expr(self.dm_slice):
-                                dm_utils.tc_fence_after()   # slice: P / SF / O tcgen05.st of other warps before this PV
+                                tcgen05_fence_after()   # slice: P / SF / O tcgen05.st of other warps before this PV
                             # 3. gemm
                             # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                             # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
@@ -2386,7 +2529,7 @@ class DMForwardSm100:
                             )
                             if const_expr(self.dm_ordw):
                                 with cute.arch.elect_one():
-                                    dm_utils.tc_commit(self.dm_ord + 8 * stage)   # ordinv: PV_s(i) completion #dm_pvn
+                                    tc_commit(self.dm_ord + 8 * stage)   # ordinv: PV_s(i) completion #dm_pvn
                             # Don't need to signal O_full to the correction warps since the
                             # correction warps wait for the softmax warps anyway. By the time the softmax
                             # warps finished, S_i for the next iteration must have been done, so O_i-1
@@ -2415,15 +2558,15 @@ class DMForwardSm100:
                             if const_expr(self.dm_ordw):
                                 # ordinv C0: PV_s(i) read SFA/SFB from S_s; wait its completion before QK_s(i+1) overwrites S_s.
                                 # Phase-safe: PV_s(i-1) is complete (P_full(i) needs S_s(i) loaded, whose commit tracks it).
-                                dm_utils.mbar_wait_parity(self.dm_ord + 8 * stage, dm_pvn & 1)
-                                dm_utils.tc_fence_after()
+                                mbar_wait_parity(self.dm_ord + 8 * stage, dm_pvn & 1)
+                                tcgen05_fence_after()
                             if const_expr(self.dm_ordpc == 1):
                                 # DEBUG planted control: poison SFA of S_s (lanes of this warp's quadrant) before QK_s(i+1)
                                 dm_pc_a = ((cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) * 32) << 16
                                 dm_pc_a = dm_pc_a + Int32(tStS[(None, None), 0, 0, 0].iterator.toint()) + Int32(
                                     self.tmem_s_offset[stage] + (self.dm_sl_sfcol if self.dm_slice else self.dm_sf_col))
                                 dm_pc_w = Int32(-2139062144)   # 0x80808080
-                                dm_utils.tmem_st_x4(dm_pc_a, dm_pc_w, dm_pc_w, dm_pc_w, dm_pc_w)
+                                tmem_st_x4(dm_pc_a, dm_pc_w, dm_pc_w, dm_pc_w, dm_pc_w)
                                 cute.arch.fence_view_async_tmem_store()
                             # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
                             gemm_Si[stage](
@@ -2454,7 +2597,7 @@ class DMForwardSm100:
                         # 2. acquire corrected Oi_partial and Pi
                         pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
                         if const_expr(self.dm_slice):
-                            dm_utils.tc_fence_after()
+                            tcgen05_fence_after()
                         # 3. gemm
                         # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                         # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
@@ -2471,7 +2614,7 @@ class DMForwardSm100:
                         )
                         if const_expr(self.dm_ordw):
                             with cute.arch.elect_one():
-                                dm_utils.tc_commit(self.dm_ord + 8 * stage)
+                                tc_commit(self.dm_ord + 8 * stage)
                         # 4. release accumulated O0_partial
                         # We do need O_full here since for the last tile, by the time the softmax warp
                         # has signaled to the correction warps, the softmax warp has just finished
@@ -2870,20 +3013,20 @@ class DMForwardSm100:
                         sScale[tidx + stage * self.m_block_size + dm_so] = softmax.row_sum[0]
                         if const_expr(mLSE is not None or learnable_sink is not None):
                             sScale[tidx + stage * self.m_block_size + self.s_p_o_stage * self.m_block_size + dm_so] = softmax.row_max[0]
-                        dm_utils.mbar_arrive(self._dm_sb(0, stage, dm_slot, warp_idx))
+                        mbar_arrive(self._dm_sb(0, stage, dm_slot, warp_idx))
                         dm_ecnt[0] = dm_e + 1
                     else:
                         if const_expr(self.dm_crd):
                             # ss_pv crd: the correction must have read the previous sScale value of this stage before it is overwritten
                             dm_wc = dm_wcnt[0]
                             if dm_wc > 0:
-                                dm_utils.mbar_wait_parity(self.dm_cread + 8 * (stage), (dm_wc - 1) & 1)
+                                mbar_wait_parity(self.dm_cread + 8 * (stage), (dm_wc - 1) & 1)
                             dm_wcnt[0] = dm_wc + 1
                         if const_expr(self.dm_late):
                             # late final stats: PV_s(K-1) complete => the correction read scale_s(K-1) (and, across tiles, its previous
                             # final-stats read preceded its O release that PV_s(0) of this tile waited for); waits global completion #j (j = steps
                             # before this tile + K); exact: completed count in {j, j+1} (PV of the next tile needs a later P store)
-                            dm_utils.mbar_wait_parity(self.dm_pvdone + 8 * stage, s_p_o_consumer_count)
+                            mbar_wait_parity(self.dm_pvdone + 8 * stage, s_p_o_consumer_count)
                         sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
                         if const_expr(mLSE is not None or learnable_sink is not None):
                             sScale[
@@ -2969,20 +3112,20 @@ class DMForwardSm100:
                         sScale[tidx + sm_stats_index * self.m_block_size + dm_so] = softmax.row_sum[0]
                         if const_expr(mLSE is not None or learnable_sink is not None):
                             sScale[tidx + sm_stats_index * self.m_block_size + self.s_p_o_stage * self.m_block_size + dm_so] = softmax.row_max[0]
-                        dm_utils.mbar_arrive(self._dm_sb(0, sm_stats_index, dm_slot, warp_idx))
+                        mbar_arrive(self._dm_sb(0, sm_stats_index, dm_slot, warp_idx))
                         dm_ecnt[0] = dm_e + 1
                     else:
                         if const_expr(self.dm_crd):
                             # ss_pv crd: the correction must have read the previous sScale value of this stage before it is overwritten
                             dm_wc = dm_wcnt[0]
                             if dm_wc > 0:
-                                dm_utils.mbar_wait_parity(self.dm_cread + 8 * (sm_stats_index), (dm_wc - 1) & 1)
+                                mbar_wait_parity(self.dm_cread + 8 * (sm_stats_index), (dm_wc - 1) & 1)
                             dm_wcnt[0] = dm_wc + 1
                         if const_expr(self.dm_late):
                             # late final stats: PV_s(K-1) complete => the correction read scale_s(K-1) (and, across tiles, its previous
                             # final-stats read preceded its O release that PV_s(0) of this tile waited for); waits global completion #j (j = steps
                             # before this tile + K); exact: completed count in {j, j+1} (PV of the next tile needs a later P store)
-                            dm_utils.mbar_wait_parity(self.dm_pvdone + 8 * stage, s_p_o_consumer_count)
+                            mbar_wait_parity(self.dm_pvdone + 8 * stage, s_p_o_consumer_count)
                         sScale[tidx + sm_stats_index * self.m_block_size] = softmax.row_sum[0]
                         if const_expr(mLSE is not None or learnable_sink is not None):
                             sScale[
@@ -3109,7 +3252,7 @@ class DMForwardSm100:
             st[2] = Int32(descale_tensors.k_descale[batch_idx, kv_head_idx, 2 * cutlass.max(n_block - 1, 0)])
         else:
             dm_kw = Int32(descale_tensors.k_descale[batch_idx, kv_head_idx, 2 * n_block])
-        dm_ks = dm_utils.byte_pow2_f32_rt(dm_kw, q * 8)
+        dm_ks = byte_pow2_f32_rt(dm_kw, q * 8)
         ph = st[0]
         nstep = st[1]
         for s in cutlass.range_constexpr(2):
@@ -3147,36 +3290,36 @@ class DMForwardSm100:
                         lm[t] = utils.fmax(lm[t], rS[i + 2 * t], rS[i + 2 * t + 1])
                 v = utils.fmax(utils.fmax(lm[0], lm[1]), lm[2], lm[3])
             xb = v * c
-            dm_utils.st_shared_b32(self.dm_slbuf + 4 * ((s * 4 + q) * self.m_block_size + tidx), dm_utils.bitcast_f32_i32(xb))
+            st_shared_b32(self.dm_slbuf + 4 * ((s * 4 + q) * self.m_block_size + tidx), bitcast_f32_i32(xb))
             if const_expr(self.dm_ordpc in (4, 5)):
                 dm_pc_a = sbase + ((cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) * 32 << 16) + col + 16
             if const_expr((self.dm_ordpc == 4 and self.dm_ordld) or self.dm_ordpc == 5):
                 # ordpc=5: the re-load at the SAME place as ordpc=4 with ordld, i.e. before the
                 # arrival; only the wait::ld is controlled by ordld (with ordld=0 its completion is forced after the arrival)
-                dm_pv = dm_utils.tmem_ld_32x32b_x8(dm_pc_a)   # re-load of this block's cols 16..23 (q = 0: the SF columns)
+                dm_pv = tmem_ld_32x32b_x8(dm_pc_a)   # re-load of this block's cols 16..23 (q = 0: the SF columns)
             if const_expr(self.dm_ordld):
                 # ordinv: the correction WG's SF tcgen05.st overwrites S_s cols 16..23 that slice WG 0 loaded; PTX
                 # 9.7.18.6.4.4/.5: a cross-thread ld -> st hand-off needs tcgen05.wait::ld before the fence + arrive
                 # (register use of the loaded values is not a memory ordering)
                 cute.arch.fence_view_async_tmem_load()
-            dm_utils.tc_fence_before()     # this warp's S loads ordered before the kb-published arrival (SF overwrites S)
-            dm_utils.tcf_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
+            tcgen05_fence_before()     # this warp's S loads ordered before the kb-published arrival (SF overwrites S)
+            fence_warp_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
             cute.arch.sync_warp()
             with cute.arch.elect_one():
-                dm_utils.mbar_arrive(self.dm_slbar + 8 * s)
+                mbar_arrive(self.dm_slbar + 8 * s)
             if const_expr(self.dm_ordpc in (4, 5)):
                 dm_pois = Float32(0.0)
                 if const_expr(self.dm_ordpc == 5 and not self.dm_ordld):
                     cute.arch.fence_view_async_tmem_load()
                 if const_expr(self.dm_ordpc == 4 and not self.dm_ordld):
-                    dm_utils.nanosleep_1us()
-                    dm_utils.nanosleep_1us()
-                    dm_pv = dm_utils.tmem_ld_32x32b_x8(dm_pc_a)   # the re-load at the latest point PTX permits without wait::ld
+                    nanosleep_1us()
+                    nanosleep_1us()
+                    dm_pv = tmem_ld_32x32b_x8(dm_pc_a)   # the re-load at the latest point PTX permits without wait::ld
                     cute.arch.fence_view_async_tmem_load()
                 for j in cutlass.range_constexpr(8):
-                    if dm_utils.bitcast_f32_i32(dm_pv[j]) != dm_utils.bitcast_f32_i32(dm_sv[j]):
+                    if bitcast_f32_i32(dm_pv[j]) != bitcast_f32_i32(dm_sv[j]):
                         dm_pois = Float32(float("nan"))
-            kb = cute.arch.fmax(dm_utils.floor_f32(xb), Float32(-1e30))
+            kb = cute.arch.fmax(floor_f32(xb), Float32(-1e30))
             bias = Float32(7.0) - kb
             for i in cutlass.range_constexpr(0, 32, 2):
                 rS[i], rS[i + 1] = cute.arch.fma_packed_f32x2((rS[i], rS[i + 1]), (c, c), (bias, bias))
@@ -3186,9 +3329,9 @@ class DMForwardSm100:
             rP8.store(rS.load().to(self.q_dtype))
             cute.copy(thr_st, rP, cute.make_tensor(tSt_st.iterator + col, tSt_st.layout))
             cute.arch.fence_view_async_tmem_store()
-            dm_utils.tc_fence_before()     # P tcgen05.st ordered before the P-full arrival (PV reads it)
+            tcgen05_fence_before()     # P tcgen05.st ordered before the P-full arrival (PV reads it)
             if const_expr(self.dm_opts.get("warr", "0") == "1"):
-                dm_utils.tcf_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
+                fence_warp_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
                     pipeline_s_p_o.consumer_release_w_index(s)
@@ -3202,13 +3345,13 @@ class DMForwardSm100:
                 bsum = bsum + dm_pois   # DEBUG planted control: a re-load that saw the SF store poisons l (-> O, LSE NaN)
             if nstep > 0:
                 if const_expr(self.dm_opts.get("slnobe", "0") != "1"):   # slnobe=1: DEBUG planted WAR bug (no bsempty wait)
-                    dm_utils.mbar_wait_parity(self.dm_slbar + 32 + 8 * s, (nstep - 1) & 1)
-            dm_utils.st_shared_b32(self.dm_slbuf + 4 * (1024 + (s * 4 + q) * self.m_block_size + tidx),
-                                   dm_utils.bitcast_f32_i32(bsum))
-            dm_utils.tcf_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
+                    mbar_wait_parity(self.dm_slbar + 32 + 8 * s, (nstep - 1) & 1)
+            st_shared_b32(self.dm_slbuf + 4 * (1024 + (s * 4 + q) * self.m_block_size + tidx),
+                                   bitcast_f32_i32(bsum))
+            fence_warp_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
             cute.arch.sync_warp()
             with cute.arch.elect_one():
-                dm_utils.mbar_arrive(self.dm_slbar + 16 + 8 * s)
+                mbar_arrive(self.dm_slbar + 16 + 8 * s)
         st[0] = ph ^ 1
         st[1] = nstep + 1
 
@@ -3270,21 +3413,21 @@ class DMForwardSm100:
                 # one step even when the range is empty (seqlen_k == 0): slices and MMA always run the first step
                 for k in cutlass.range(cutlass.max(total_block_count, 1), unroll=1):
                     n_block = n_block_max - 1 - k
-                    sfb_word = dm_utils.bitcast_i32_f32(cnt[1])   # V scale word of n_block (prefetched one step ahead)
+                    sfb_word = bitcast_i32_f32(cnt[1])   # V scale word of n_block (prefetched one step ahead)
                     cnt[1] = Int32(descale_tensors.k_descale[batch_idx, kv_head_idx, 2 * cutlass.max(n_block - 1, 0) + 1])
                     nstep = cnt[0]
                     for s in cutlass.range_constexpr(2):
                         # ---- row max / rescale / SF bytes (today's softmax_step prefix, verbatim ops) ----
                         if const_expr(self.dm_opts.get("slnokb", "0") != "1"):   # slnokb=1: DEBUG planted RAW bug (no kbfull wait)
-                            dm_utils.mbar_wait_parity(self.dm_slbar + 8 * s, nstep & 1)
-                        dm_utils.tc_fence_after()
-                        x = [dm_utils.bitcast_i32_f32(dm_utils.ld_shared_b32(
+                            mbar_wait_parity(self.dm_slbar + 8 * s, nstep & 1)
+                        tcgen05_fence_after()
+                        x = [bitcast_i32_f32(ld_shared_b32(
                             self.dm_slbuf + 4 * ((s * 4 + j) * self.m_block_size + tidx))) for j in range(4)]
                         if const_expr(dm_lean):
                             dm_xmax = utils.fmax(utils.fmax(x[0], x[1], x[2]), x[3])
                         else:
                             dm_xmax = cute.arch.fmax(cute.arch.fmax(x[0], x[1]), cute.arch.fmax(x[2], x[3]))
-                        dm_mcand = dm_utils.ceil_f32(dm_xmax)
+                        dm_mcand = ceil_f32(dm_xmax)
                         m_old = rst[s]
                         row_max = m_old
                         acc_scale = Float32(1.0)
@@ -3294,21 +3437,21 @@ class DMForwardSm100:
                         else:
                             if dm_mcand > m_old + Float32(self.dm_rescale_T):
                                 row_max = dm_mcand
-                                acc_scale = dm_utils.exp2i_f32(m_old - dm_mcand)
+                                acc_scale = exp2i_f32(m_old - dm_mcand)
                         rst[s] = row_max
                         m_safe = row_max if row_max != -Float32.inf else Float32(0.0)
                         dm_w = [None] * 4
                         dm_sfa = [None] * 4
                         for j in cutlass.range_constexpr(4):
-                            kb = cute.arch.fmax(dm_utils.floor_f32(x[j]), Float32(-1e30))
+                            kb = cute.arch.fmax(floor_f32(x[j]), Float32(-1e30))
                             e = kb - Float32(7.0) - m_safe
                             if const_expr(dm_lean):
-                                dm_sfa[j] = dm_utils.ue8m0_byte(e)
-                                dm_w[j] = dm_utils.byte_shl23_f32(dm_sfa[j])
+                                dm_sfa[j] = ue8m0_byte(e)
+                                dm_w[j] = byte_shl23_f32(dm_sfa[j])
                             else:
-                                dm_w[j] = dm_utils.exp2i_f32(e)
-                                dm_sfa[j] = dm_utils.ue8m0_byte(e)
-                        sfa_word = dm_utils.bitcast_i32_f32(dm_utils.pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3]))
+                                dm_w[j] = exp2i_f32(e)
+                                dm_sfa[j] = ue8m0_byte(e)
+                        sfa_word = bitcast_i32_f32(pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3]))
                         for j in cutlass.range_constexpr(4):
                             rSF[j] = sfa_word
                             rSF[4 + j] = sfb_word
@@ -3323,25 +3466,25 @@ class DMForwardSm100:
                                 self.correction_rescale(thr_mma_pv, tOtO[None, None, None, s], tidx, acc_scale)
                         cute.arch.fence_view_async_tmem_store()
                         cute.arch.fence_view_async_tmem_load()   # (k == 0) previous tile's epilogue O loads done
-                        dm_utils.tc_fence_before()
+                        tcgen05_fence_before()
                         if const_expr(self.dm_opts.get("warr", "0") == "1"):
-                            dm_utils.tcf_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
+                            fence_warp_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
                             cute.arch.sync_warp()
                             with cute.arch.elect_one():
                                 pipeline_s_p_o.consumer_release_w_index(s)    # SF written + O rescaled (+ O free at k == 0)
                         else:
                             pipeline_s_p_o.consumer_release_w_index(s)
                         # ---- l = l * acc + sum_b s_b w_b (today's order) ----
-                        dm_utils.mbar_wait_parity(self.dm_slbar + 16 + 8 * s, nstep & 1)
+                        mbar_wait_parity(self.dm_slbar + 16 + 8 * s, nstep & 1)
                         if const_expr(int(self.dm_opts.get("slcdly", "0")) > 0):   # DEBUG: widen the sB WAR window
                             for _i in cutlass.range_constexpr(int(self.dm_opts.get("slcdly", "0"))):
-                                dm_utils.nanosleep_1us()
-                        bs = [dm_utils.bitcast_i32_f32(dm_utils.ld_shared_b32(
+                                nanosleep_1us()
+                        bs = [bitcast_i32_f32(ld_shared_b32(
                             self.dm_slbuf + 4 * (1024 + (s * 4 + j) * self.m_block_size + tidx))) for j in range(4)]
-                        dm_utils.tcf_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
+                        fence_warp_relay()   # fwdfence v3: every lane fences + warp sync before the elected leader's release
                         cute.arch.sync_warp()
                         with cute.arch.elect_one():
-                            dm_utils.mbar_arrive(self.dm_slbar + 32 + 8 * s)
+                            mbar_arrive(self.dm_slbar + 32 + 8 * s)
                         dm_l = rst[2 + s] * acc_scale
                         if k == 0:
                             dm_l = Float32(0.0)
@@ -3358,7 +3501,7 @@ class DMForwardSm100:
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
                     scale = scale * Float32(1.0)
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
-                    dm_utils.tc_fence_after()
+                    tcgen05_fence_after()
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
                     self.correction_epilogue(
@@ -3408,9 +3551,9 @@ class DMForwardSm100:
 
     def _dm_wait(self, mbar, phase):
         if const_expr(self.dm_opts.get("wnh", "1") == "1"):
-            dm_utils.mbar_wait_parity_nh(mbar, phase)
+            mbar_wait_parity_nh(mbar, phase)
         else:
-            dm_utils.mbar_wait_parity(mbar, phase)
+            mbar_wait_parity(mbar, phase)
 
     def _dm_sb(self, kind, stage, slot, warp):
         """dbs mbarrier address: kind 0 = full (softmax -> correction), 1 = empty (correction -> softmax)."""
@@ -3486,7 +3629,7 @@ class DMForwardSm100:
             # packed UE8M0 bytes: k_descale[b, hk, 2*n_block] = K scale bytes, [.., 2*n_block+1] = V scale bytes (= SFB word)
             dm_kw = Int32(dm_scales.k_descale[batch_idx, kv_head_idx, 2 * n_block])
             dm_vw = Int32(dm_scales.k_descale[batch_idx, kv_head_idx, 2 * n_block + 1])
-            dm_ks = [dm_utils.byte_pow2_f32(dm_kw, j) for j in range(4)]
+            dm_ks = [byte_pow2_f32(dm_kw, j) for j in range(4)]
         else:
             dm_ks = [Float32(dm_scales.k_descale[batch_idx, kv_head_idx, nb4 + j]) for j in range(4)]
             dm_vs = [Float32(dm_scales.v_descale[batch_idx, kv_head_idx, nb4 + j]) for j in range(4)]
@@ -3502,7 +3645,7 @@ class DMForwardSm100:
             s_p_o_index = stage
             pipeline_s_p_o.consumer_wait_w_index_phase(stage, s_p_o_consumer_count)
             if const_expr(self.dm_sspv and self.dm_opts.get("tcf", "1") == "1"):
-                dm_utils.tc_fence_after()   # QK_s commit (S full) -> this WG's S tcgen05.ld
+                tcgen05_fence_after()   # QK_s commit (S full) -> this WG's S tcgen05.ld
         tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         hw_row_max = Float32(-Float32.inf)
         if const_expr(self.use_ldred_rowmax):
@@ -3520,8 +3663,8 @@ class DMForwardSm100:
             # S scratch fully read by this warpgroup -> the MMA warp may issue the next QK into it
             cute.arch.fence_view_async_tmem_load()
             if const_expr(self.dm_opts.get("tcf", "1") == "1"):
-                dm_utils.tc_fence_before()   # S loads ordered before the arrive that lets the next QK overwrite S
-            dm_utils.mbar_arrive(self.dm_sfree)
+                tcgen05_fence_before()   # S loads ordered before the arrive that lets the next QK overwrite S
+            mbar_arrive(self.dm_sfree)
         # tSrS_t2r = copy_utils.load_t2r(thr_tmem_load, tScS_shape, tStS_t2r)
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
@@ -3574,7 +3717,7 @@ class DMForwardSm100:
             dm_xmax = utils.fmax(utils.fmax(dm_bmax[0], dm_bmax[1], dm_bmax[2]), dm_bmax[3])
         else:
             dm_xmax = cute.arch.fmax(cute.arch.fmax(dm_bmax[0], dm_bmax[1]), cute.arch.fmax(dm_bmax[2], dm_bmax[3]))
-        dm_mcand = dm_utils.ceil_f32(dm_xmax)
+        dm_mcand = ceil_f32(dm_xmax)
         acc_scale = Float32(1.0)
         row_max = dm_mcand
         if const_expr(is_first):
@@ -3585,7 +3728,7 @@ class DMForwardSm100:
             row_max = m_old
             if dm_mcand > m_old + Float32(self.dm_rescale_T):
                 row_max = dm_mcand
-                acc_scale = dm_utils.exp2i_f32(m_old - dm_mcand)
+                acc_scale = exp2i_f32(m_old - dm_mcand)
         softmax.row_max[0] = row_max
         m_safe = row_max if row_max != -Float32.inf else Float32(0.0)
         # fully masked blocks: kb clamps to -1e30 -> weight 0, SF byte 0, finite bias (x stays -inf -> p 0)
@@ -3593,21 +3736,21 @@ class DMForwardSm100:
         dm_w = [None] * 4
         dm_sfa = [None] * 4
         for j in cutlass.range_constexpr(4):
-            kb = cute.arch.fmax(dm_utils.floor_f32(dm_bmax[j]), Float32(-1e30))
+            kb = cute.arch.fmax(floor_f32(dm_bmax[j]), Float32(-1e30))
             e = kb - Float32(7.0) - m_safe
             dm_bias[j] = Float32(7.0) - kb
             if const_expr(dm_lean):
                 # one cvt/clamp builds the UE8M0 byte; the weight 2^e is the same byte shifted into the fp32 exponent
-                dm_sfa[j] = dm_utils.ue8m0_byte(e)
-                dm_w[j] = dm_utils.byte_shl23_f32(dm_sfa[j])
+                dm_sfa[j] = ue8m0_byte(e)
+                dm_w[j] = byte_shl23_f32(dm_sfa[j])
             else:
-                dm_w[j] = dm_utils.exp2i_f32(e)
-                dm_sfa[j] = dm_utils.ue8m0_byte(e)
-        sfa_word = dm_utils.bitcast_i32_f32(dm_utils.pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3]))
+                dm_w[j] = exp2i_f32(e)
+                dm_sfa[j] = ue8m0_byte(e)
+        sfa_word = bitcast_i32_f32(pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3]))
         if const_expr(self.dm_opts.get("kvpack", "1") == "1"):
-            sfb_word = dm_utils.bitcast_i32_f32(dm_vw)
+            sfb_word = bitcast_i32_f32(dm_vw)
         else:
-            sfb_word = dm_utils.bitcast_i32_f32(dm_utils.pack_bytes4(*[dm_utils.pow2_exponent_byte(dm_vs[j]) for j in range(4)]))
+            sfb_word = bitcast_i32_f32(pack_bytes4(*[pow2_exponent_byte(dm_vs[j]) for j in range(4)]))
         tSrSF = cute.make_rmem_tensor(thr_tmem_store_sf.partition_S(cute.make_identity_tensor((self.m_block_size, 8))).shape, Float32)
         for j in cutlass.range_constexpr(4):
             tSrSF[j] = sfa_word
@@ -3629,7 +3772,7 @@ class DMForwardSm100:
             if const_expr(not is_first):
                 sScale[thr_tmem_load.thr_idx + sm_stats_index * self.m_block_size
                        + dm_slot * (2 * self.s_p_o_stage * self.m_block_size)] = acc_scale
-            dm_utils.mbar_arrive(self._dm_sb(0, sm_stats_index, dm_slot, warp_idx))
+            mbar_arrive(self._dm_sb(0, sm_stats_index, dm_slot, warp_idx))
             dm_ecnt_l[0] = dm_e + 1
         elif const_expr(not self.dm_late):
             if const_expr(not is_first):
@@ -3639,7 +3782,7 @@ class DMForwardSm100:
                     dm_wcnt_l = self._dm_wcnt
                     dm_wc = dm_wcnt_l[0]
                     if dm_wc > 0:
-                        dm_utils.mbar_wait_parity(self.dm_cread + 8 * (sm_stats_index), (dm_wc - 1) & 1)
+                        mbar_wait_parity(self.dm_cread + 8 * (sm_stats_index), (dm_wc - 1) & 1)
                     dm_wcnt_l[0] = dm_wc + 1
                 sScale[thread_idx + sm_stats_index * self.m_block_size] = acc_scale
             if const_expr(not self.use_s_ping_pong or not is_first):
@@ -3697,7 +3840,7 @@ class DMForwardSm100:
             cute.arch.fence_view_async_tmem_store()
             if const_expr(self.split_P_arrive > 0):
                 cute.arch.sync_warp()
-                dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                 with cute.arch.elect_one():
                     pipeline_p_lastsplit.producer_commit_w_index(s_p_o_index)
             else:
@@ -3724,11 +3867,11 @@ class DMForwardSm100:
                     hs = []
                     for w in cutlass.range_constexpr(8):
                         i0 = 32 * j + 4 * w
-                        word, e0, e1 = dm_utils.exp2_h2_e4m3x4(tSrS_t2r[i0], tSrS_t2r[i0 + 1], tSrS_t2r[i0 + 2], tSrS_t2r[i0 + 3])
-                        tSrP_r2t_f32[8 * j + w] = dm_utils.bitcast_i32_f32(word)
+                        word, e0, e1 = exp2_h2_e4m3x4(tSrS_t2r[i0], tSrS_t2r[i0 + 1], tSrS_t2r[i0 + 2], tSrS_t2r[i0 + 3])
+                        tSrP_r2t_f32[8 * j + w] = bitcast_i32_f32(word)
                         hs.append(e0)
                         hs.append(e1)
-                    dm_bsum[j] = dm_utils.h2_sum_f32(dm_utils.hadd2_tree(hs))
+                    dm_bsum[j] = h2_sum_f32(hadd2_tree(hs))
             else:
                 softmax.apply_exp2_convert(
                     tSrS_t2r,
@@ -3742,9 +3885,9 @@ class DMForwardSm100:
                 # SF_s and P_s(previous tile) are free once PV_s(previous) completed (completion #k incl. a dummy #0);
                 # waited only after the exps so the PV latency hides under them
                 if const_expr(self.dm_opts.get("nosw", "0") != "1"):
-                    dm_utils.mbar_wait_parity(self.dm_pvdone + 8 * stage, s_p_o_consumer_count)
+                    mbar_wait_parity(self.dm_pvdone + 8 * stage, s_p_o_consumer_count)
                 if const_expr(self.dm_opts.get("tcf", "1") == "1"):
-                    dm_utils.tc_fence_after()   # SF tcgen05.st must not be ordered before PV_s(k-1)'s completion
+                    tcgen05_fence_after()   # SF tcgen05.st must not be ordered before PV_s(k-1)'s completion
                 if const_expr(self.dm_late):
                     # late: PV_s(k-1) complete => the correction already read scale_s(k-1) (it read it before its
                     # O-rescaled(k-1) arrival, which PV_s(k-1) waited for) => the single sScale_s slot is free
@@ -3757,10 +3900,10 @@ class DMForwardSm100:
                 tidx_row = Int32(thr_tmem_load.thr_idx)
                 dm_prow = Int32(self.dm_sP.iterator.toint()) + Int32(16384) * stage + tidx_row * 128
                 for c in cutlass.range_constexpr(8):
-                    dm_utils.st_shared_v4_b32(
+                    st_shared_v4_b32(
                         dm_prow + ((Int32(c) ^ (tidx_row & 7)) << 4),
-                        dm_utils.bitcast_f32_i32(tSrP_r2t_f32[4 * c]), dm_utils.bitcast_f32_i32(tSrP_r2t_f32[4 * c + 1]),
-                        dm_utils.bitcast_f32_i32(tSrP_r2t_f32[4 * c + 2]), dm_utils.bitcast_f32_i32(tSrP_r2t_f32[4 * c + 3]))
+                        bitcast_f32_i32(tSrP_r2t_f32[4 * c]), bitcast_f32_i32(tSrP_r2t_f32[4 * c + 1]),
+                        bitcast_f32_i32(tSrP_r2t_f32[4 * c + 2]), bitcast_f32_i32(tSrP_r2t_f32[4 * c + 3]))
                 cute.arch.fence_view_async_shared()
             for i in cutlass.range_constexpr(0 if const_expr(self.dm_sspv) else cute.size(tStP_r2t.shape[2])):
                 cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
@@ -3771,10 +3914,10 @@ class DMForwardSm100:
                         pipeline_s_p_o.consumer_release_w_index(s_p_o_index)
             cute.arch.fence_view_async_tmem_store()
             if const_expr(self.dm_opts.get("tcf", "1") != "0"):   # fwdfence: default path too (all lanes)
-                dm_utils.tc_fence_before()   # SF tcgen05.st ordered before the P-full release
+                tcgen05_fence_before()   # SF tcgen05.st ordered before the P-full release
             if const_expr(self.split_P_arrive > 0):
                 cute.arch.sync_warp()
-                dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                 with cute.arch.elect_one():
                     pipeline_p_lastsplit.producer_commit_w_index(s_p_o_index)
             else:
@@ -3930,12 +4073,12 @@ class DMForwardSm100:
                     # dbs: consume the initial (data-less) event of each stage: wait full, release empty
                     dm_r = dm_rcnt[0]
                     self._dm_wait(self._dm_sb(0, 0, dm_r & 1, warp_idx), (dm_r >> 1) & 1)
-                    dm_utils.mbar_arrive(self._dm_sb(1, 0, dm_r & 1, warp_idx))
+                    mbar_arrive(self._dm_sb(1, 0, dm_r & 1, warp_idx))
                     dm_rcnt[0] = dm_r + 1
                     pipeline_sm_stats.consumer_release_w_index(0)
                     dm_r = dm_rcnt[1]
                     self._dm_wait(self._dm_sb(0, 1, dm_r & 1, warp_idx), (dm_r >> 1) & 1)
-                    dm_utils.mbar_arrive(self._dm_sb(1, 1, dm_r & 1, warp_idx))
+                    mbar_arrive(self._dm_sb(1, 1, dm_r & 1, warp_idx))
                     dm_rcnt[1] = dm_r + 1
                 else:
                     if const_expr(not self.use_s_ping_pong):
@@ -3957,7 +4100,7 @@ class DMForwardSm100:
                     dm_trt[5] = Float32(0.0)
                     dm_trt[6] = Float32(0.0)
                     dm_trt[7] = Float32(0.0)
-                    dm_trt0 = dm_utils.clock64()
+                    dm_trt0 = clock64()
                 for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
                         if const_expr(self.use_s_ping_pong):
@@ -3965,7 +4108,7 @@ class DMForwardSm100:
                         else:
                             sm_stats_index = stage
                         if const_expr(self.dm_trc > 0):
-                            dm_trb = dm_utils.clock64()
+                            dm_trb = clock64()
                         # wait for S0 / S1
                         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
                         if const_expr(self.dm_dbs):
@@ -3973,14 +4116,14 @@ class DMForwardSm100:
                             self._dm_wait(self._dm_sb(0, stage, dm_r & 1, warp_idx), (dm_r >> 1) & 1)
                             scale = sScale[tidx + stage * self.m_block_size
                                            + (dm_r & 1) * (2 * self.s_p_o_stage * self.m_block_size)]
-                            dm_utils.mbar_arrive(self._dm_sb(1, stage, dm_r & 1, warp_idx))   # slot free for event r+2
+                            mbar_arrive(self._dm_sb(1, stage, dm_r & 1, warp_idx))   # slot free for event r+2
                             dm_rcnt[stage] = dm_r + 1
                         else:
                             if const_expr(self.dm_trc > 0):
-                                dm_tra = dm_utils.clock64()
+                                dm_tra = clock64()
                             sm_stats_barrier.arrive_and_wait_w_index(index=sm_stats_index * 4 + warp_idx)
                             if const_expr(self.dm_trc > 0):
-                                dm_trc_s = dm_utils.clock64()
+                                dm_trc_s = clock64()
                                 dm_trt[0] = dm_trt[0] + Float32(dm_trc_s - dm_tra)
                             # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                             # cute.arch.fence_view_async_tmem_load()
@@ -3989,10 +4132,10 @@ class DMForwardSm100:
                             if const_expr(self.dm_sspv and self.dm_opts.get("nsr", "0") == "1"):
                                 scale = Float32(1.0)   # DEBUG ONLY (wrong when a rescale is due): no sScale read
                             if const_expr(self.dm_crd):
-                                dm_utils.mbar_arrive(self.dm_cread + 8 * sm_stats_index)   # read done -> softmax may overwrite
+                                mbar_arrive(self.dm_cread + 8 * sm_stats_index)   # read done -> softmax may overwrite
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         if const_expr(self.dm_trc > 0 and not self.dm_dbs):
-                            dm_trt[6] = dm_trt[6] + Float32(dm_utils.clock64() - dm_trc_s)
+                            dm_trt[6] = dm_trt[6] + Float32(clock64() - dm_trc_s)
                         # should_rescale = True
                         # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
                         # Don't need O_full anymore, since by the time softmax has signaled the correction
@@ -4005,29 +4148,29 @@ class DMForwardSm100:
                             # it a non-rescaling correction warp can arrive twice in one phase and complete it before
                             # a slow softmax warp released its P/SF rows.
                             if const_expr(self.dm_trc > 0):
-                                dm_tra = dm_utils.clock64()
-                            dm_utils.mbar_wait_parity(self.dm_pvdone + 8 * stage, dm_ck & 1)
+                                dm_tra = clock64()
+                            mbar_wait_parity(self.dm_pvdone + 8 * stage, dm_ck & 1)
                             if const_expr(self.dm_trc > 0):
-                                dm_trt[1] = dm_trt[1] + Float32(dm_utils.clock64() - dm_tra)
+                                dm_trt[1] = dm_trt[1] + Float32(clock64() - dm_tra)
                             if const_expr(self.dm_opts.get("tcf", "1") == "1"):
-                                dm_utils.tc_fence_after()   # O rescale (tcgen05.ld/st) after PV_s(k-1) completes
+                                tcgen05_fence_after()   # O rescale (tcgen05.ld/st) after PV_s(k-1) completes
                         if should_rescale:
                             if const_expr(self.dm_sspv and self.dm_opts.get("cwu", "1") != "1"
                                           and self.dm_opts.get("nocw", "0") != "1"):
                                 # (debug cwu=0: the former conditional wait)
-                                dm_utils.mbar_wait_parity(self.dm_pvdone + 8 * stage, dm_ck & 1)
+                                mbar_wait_parity(self.dm_pvdone + 8 * stage, dm_ck & 1)
                                 if const_expr(self.dm_opts.get("tcf", "1") == "1"):
-                                    dm_utils.tc_fence_after()
+                                    tcgen05_fence_after()
                             if const_expr(self.use_s_ping_pong):
                                 # Ping-pong issues QK(i+1) before PV(i), so S_i+1 does not imply O_i is done
                                 pipeline_o_acc.consumer_wait_w_index_phase(
                                     o_acc_consumer_count & 1, (o_acc_consumer_count >> 1) & 1
                                 )
                             if const_expr(self.dm_trc > 0):
-                                dm_tra = dm_utils.clock64()
+                                dm_tra = clock64()
                             self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
                             if const_expr(self.dm_trc > 0):
-                                dm_trt[3] = dm_trt[3] + Float32(dm_utils.clock64() - dm_tra)
+                                dm_trt[3] = dm_trt[3] + Float32(clock64() - dm_tra)
                                 dm_trt[4] = dm_trt[4] + Float32(1.0)
                         # Notify mma warp that O has been rescaled
                         if const_expr(self.use_s_ping_pong):
@@ -4036,14 +4179,14 @@ class DMForwardSm100:
                             o_acc_consumer_count += 1
                         else:
                             if const_expr(self.dm_trc > 0):
-                                dm_trr = dm_utils.clock64()
+                                dm_trr = clock64()
                             if const_expr(self.dm_opts.get("tcf", "1") != "0"):
                                 cute.arch.fence_view_async_tmem_load()   # fwdfence: O rescale loads complete (formal)
-                                dm_utils.tc_fence_before()   # O rescale tcgen05.st ordered before the release
+                                tcgen05_fence_before()   # O rescale tcgen05.st ordered before the release
                             pipeline_s_p_o.consumer_release_w_index(stage)
                             pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
                             if const_expr(self.dm_trc > 0):
-                                dm_tre = dm_utils.clock64()
+                                dm_tre = clock64()
                                 dm_trt[7] = dm_trt[7] + Float32(dm_tre - dm_trr)
                                 dm_trt[5] = dm_trt[5] + Float32(dm_tre - dm_trb)
                     sm_stats_consumer_phase ^= 1
@@ -4053,7 +4196,7 @@ class DMForwardSm100:
                 if const_expr(self.q_stage == 2):
                     pipeline_sm_stats.consumer_release_w_index(1)
                 if const_expr(self.dm_trc > 0):
-                    dm_trt[2] = Float32(dm_utils.clock64() - dm_trt0)
+                    dm_trt[2] = Float32(clock64() - dm_trt0)
                 # End of seqlen_corr_loop_steps
 
                 # Even in the case of self.overlap_sO_sQ, we can write to stage 0 of sO without
@@ -4086,7 +4229,7 @@ class DMForwardSm100:
                             row_max = sScale[tidx + stage * self.m_block_size + self.s_p_o_stage * self.m_block_size + dm_so]
                         else:
                             row_max = None
-                        dm_utils.mbar_arrive(self._dm_sb(1, stage, dm_r & 1, warp_idx))
+                        mbar_arrive(self._dm_sb(1, stage, dm_r & 1, warp_idx))
                         dm_rcnt[stage] = dm_r + 1
                     else:
                         sm_stats_barrier.arrive_and_wait_w_index(index=sm_stats_index * 4 + warp_idx)
@@ -4099,7 +4242,7 @@ class DMForwardSm100:
                         else:
                             row_max = None
                         if const_expr(self.dm_crd):
-                            dm_utils.mbar_arrive(self.dm_cread + 8 * sm_stats_index)
+                            mbar_arrive(self.dm_cread + 8 * sm_stats_index)
                     pipeline_sm_stats.consumer_release_w_index(sm_stats_index)
                     if const_expr(learnable_sink is not None):
                         # Only the first split owns the sink column; empty rows occur with splitKV.
@@ -4124,7 +4267,7 @@ class DMForwardSm100:
                     else:
                         pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                         if const_expr(self.dm_sspv and self.dm_opts.get("tcf", "1") == "1"):
-                            dm_utils.tc_fence_after()   # last PV_s commit -> epilogue O tcgen05.ld
+                            tcgen05_fence_after()   # last PV_s commit -> epilogue O tcgen05.ld
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
                     gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
@@ -4153,7 +4296,7 @@ class DMForwardSm100:
                             # epilogue O tcgen05.ld complete + ordered before the release that lets the next
                             # work tile's PV_s (zero-init) overwrite O_s
                             cute.arch.fence_view_async_tmem_load()
-                            dm_utils.tc_fence_before()
+                            tcgen05_fence_before()
                         pipeline_s_p_o.consumer_release_w_index(stage)
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_commit_w_index(stage)

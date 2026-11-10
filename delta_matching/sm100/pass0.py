@@ -9,14 +9,14 @@ import os
 import threading
 
 import torch
-from . import dm_common
 import flash_attn.cute.interface as fi
 from flash_attn.cute import cache_utils
 
 from .dm_pass0_sm100 import DMPass0Sm100
-from .fwd import _fingerprint, compile_env
-from . import fastpath
-_env = fastpath.env
+from .compile_cache_sm100 import compile_env, fingerprint
+from . import launch_cache_sm100
+from delta_matching.sm100.attention_math_sm100 import b6_m
+_env = launch_cache_sm100.env
 
 _LOCK = threading.Lock()
 FORCE = dict(use_2cta_instrs=False, pack_gqa=False, use_s_ping_pong=False, num_splits=1, use_tma_o=False,
@@ -30,7 +30,7 @@ REGS_TL = dict(softmax=int(_tlr[0]), correction=int(_tlr[1]), other=int(_tlr[2])
 
 def _make_cache():
     if cache_utils.CUTE_DSL_CACHE_ENABLED:
-        return cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / _fingerprint() / "pass0")
+        return cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / fingerprint() / "pass0")
     return cache_utils.JITCache()
 
 
@@ -45,7 +45,7 @@ def _variant(exp_variant: str):
     if mk not in _CACHES:
         c = _make_cache()
         if cache_utils.CUTE_DSL_CACHE_ENABLED:
-            c = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / _fingerprint() / f"pass0_{exp_variant}")
+            c = cache_utils.JITPersistentCache(cache_utils.get_cache_path() / "dm_sm100" / fingerprint() / f"pass0_{exp_variant}")
         _CACHES[mk] = c
     return _CLASSES[exp_variant], _CACHES[mk]
 
@@ -67,8 +67,8 @@ def dm_delta(q8, qs, k8, ks, v8, vs, do8, dos, lse, causal: bool, config_overrid
              exp_variant: str | None = None):
     if exp_variant is None:
         exp_variant = _env("DM_P0_EXP", "p3_16_0+ma+h2+pf+sq+ts+tl")   # +tl two lanes per row, 4 compute warps/SMSP; +ts double-float TwoSum cross-tile sums; +pf scale prefetch; +sq per-stage specialized code; h2 halves; every exp via dm_bwd_p_pair (MUFU), bitwise the backward's P -> rowsum(dS) = 0 at fp32 round-off
-    if dm_common.b6_m() > 0 and "+b6_" not in exp_variant:
-        exp_variant = exp_variant + f"+b6_{dm_common.b6_m()}"
+    if b6_m() > 0 and "+b6_" not in exp_variant:
+        exp_variant = exp_variant + f"+b6_{b6_m()}"
     over = dict(FORCE)
     if config_override:
         over.update(config_override)
@@ -87,7 +87,7 @@ def dm_delta(q8, qs, k8, ks, v8, vs, do8, dos, lse, causal: bool, config_overrid
     names = ["qs", "ks", "vs", "dos", "do8", "lse"]
     inp = dict(q8=q8, k8=k8, v8=v8, **{n: t for n, t in zip(names, aux)})
     # the O output of pass 0 is an unused scratch buffer: returned to the fast path (as an output) and dropped here
-    return fastpath.call("pass0", inp, (bool(causal), exp_variant, repr(sorted(over.items())), compile_env()),
+    return launch_cache_sm100.call("pass0", inp, (bool(causal), exp_variant, repr(sorted(over.items())), compile_env()),
                          lambda: _dm_delta_slow(q8, k8, v8, aux, causal, over, exp_variant), cmp=[1])[1]
 
 
@@ -130,7 +130,7 @@ def _dm_delta_slow(q8, k8, v8, aux, causal, over, exp_variant):
     with _LOCK:
         cls, cache = _variant(exp_variant)
         fi.FlashAttentionForwardSm100 = cls
-        fi._flash_attn_fwd.compile_cache = fastpath.RecCache(cache)
+        fi._flash_attn_fwd.compile_cache = launch_cache_sm100.RecCache(cache)
         fi.select_fwd_config = select
         try:
             o_unused, delta, *_ = fi._flash_attn_fwd(q8, k8, v8, softmax_scale=1.0, causal=causal, return_lse=True,

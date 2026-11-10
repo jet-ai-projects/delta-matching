@@ -43,12 +43,12 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from delta_matching.sm100 import dm_common_hd256 as dmh
-from delta_matching.sm100 import dm_utils
-from delta_matching.sm100.dm_common_hd256 import (tmem_ld32, e4m3x4, bf16x2, st_global_v4, st_global_v4f,
-                                                 st_global_f32, ld_shared_f32, st_shared_f32, abs_f32, max_f32,
-                                                 add_f32, mul_f32, _asm, _gaddr)
-from delta_matching.sm100.dm_common_hd256 import ld_shared_v4 as dm_utils_ld_shared_v4
+from delta_matching.sm100.cute_ptx_sm100 import tmem_ld32, e4m3x4, bf16x2, st_global_v4, st_global_v4f, st_global_f32, ld_shared_f32, st_shared_f32, abs_f32, max_f32, add_f32, mul_f32, inline_asm, global_address
+from delta_matching.sm100.cute_ptx_sm100 import ld_shared_v4 as dm_utils_ld_shared_v4
+from delta_matching.sm100.attention_math_sm100 import dm_mx256_c, dm_mx256_dp_scale, dm_mx256_l2, dm_mx256_p_pair, dm_mx256_p_pair2
+from delta_matching.sm100.cute_ptx_sm100 import redux_max_abs_f32, tmem_st_x1, tmem_st_x4
+from delta_matching.sm100.fp8_e8m0_scale_sm100 import add_sb_clamp, inv_pow2_from_sb, pow2_sb
+from delta_matching.sm100.mma_sm100 import gemm_ptx_bs
 
 F8 = cutlass.Float8E4M3FN
 SM = 0.0625          # 256 ** -0.5, exact
@@ -56,13 +56,13 @@ SM = 0.0625          # 256 ** -0.5, exact
 
 @dsl_user_op
 def st_shared_v4(addr: Int32, a: Int32, b: Int32, c: Int32, d: Int32, *, loc=None, ip=None):
-    _asm(None, [Int32(x).ir_value(loc=loc, ip=ip) for x in (addr, a, b, c, d)],
+    inline_asm(None, [Int32(x).ir_value(loc=loc, ip=ip) for x in (addr, a, b, c, d)],
          "st.shared.v4.b32 [$0], {$1, $2, $3, $4};", "r,r,r,r,r", True, loc, ip)
 
 
 @dsl_user_op
 def ld_shared_v4f(addr: Int32, *, loc=None, ip=None):
-    res = _asm(llvm.StructType.get_literal([T.f32()] * 4), [Int32(addr).ir_value(loc=loc, ip=ip)],
+    res = inline_asm(llvm.StructType.get_literal([T.f32()] * 4), [Int32(addr).ir_value(loc=loc, ip=ip)],
                "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];", "=f,=f,=f,=f,r", True, loc, ip)
     return [Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
 
@@ -70,7 +70,7 @@ def ld_shared_v4f(addr: Int32, *, loc=None, ip=None):
 @dsl_user_op
 def spin(cycles: int, *, loc=None, ip=None):
     """Busy-wait ~cycles SM clocks (positive-control delay knobs only; never in the default build)."""
-    _asm(None, [], "{\n\t.reg .u64 t0, t1;\n\t.reg .pred p;\n\tmov.u64 t0, %clock64;\n\tLSPIN:\n\t"
+    inline_asm(None, [], "{\n\t.reg .u64 t0, t1;\n\t.reg .pred p;\n\tmov.u64 t0, %clock64;\n\tLSPIN:\n\t"
          "mov.u64 t1, %clock64;\n\tsub.u64 t1, t1, t0;\n\tsetp.lt.u64 p, t1, " + str(int(cycles)) + ";\n\t"
          "@p bra LSPIN;\n\t}", "", True, loc, ip)
 
@@ -79,57 +79,57 @@ def spin(cycles: int, *, loc=None, ip=None):
 def tmem_st32(addr: Int32, v, *, loc=None, ip=None):
     """tcgen05.st.32x32b.x32: this thread's lane, 32 fp32 columns at addr."""
     regs = ",".join(f"${i + 1}" for i in range(32))
-    _asm(None, [Int32(addr).ir_value(loc=loc, ip=ip)] + [Float32(x).ir_value(loc=loc, ip=ip) for x in v],
+    inline_asm(None, [Int32(addr).ir_value(loc=loc, ip=ip)] + [Float32(x).ir_value(loc=loc, ip=ip) for x in v],
          "tcgen05.st.sync.aligned.32x32b.x32.b32 [$0], {" + regs + "};", ",".join(["r"] + ["f"] * 32), True, loc, ip)
 
 
 @dsl_user_op
 def sb_of(x: Float32, *, loc=None, ip=None) -> Int32:
     """Biased exponent byte of an fp32 power of two (its UE8M0 code)."""
-    return Int32(_asm(T.i32(), [Float32(x).ir_value(loc=loc, ip=ip)],
+    return Int32(inline_asm(T.i32(), [Float32(x).ir_value(loc=loc, ip=ip)],
                       "{\n\t.reg .b32 t;\n\tmov.b32 t, $1;\n\tbfe.u32 $0, t, 23, 8;\n\t}", "=r,f", False, loc, ip))
 
 
 @dsl_user_op
 def pack4(b0: Int32, b1: Int32, b2: Int32, b3: Int32, *, loc=None, ip=None) -> Int32:
     """bytes [b0, b1, b2, b3] little-endian (each < 256)."""
-    return Int32(_asm(T.i32(), [Int32(x).ir_value(loc=loc, ip=ip) for x in (b0, b1, b2, b3)],
+    return Int32(inline_asm(T.i32(), [Int32(x).ir_value(loc=loc, ip=ip) for x in (b0, b1, b2, b3)],
                       "{\n\t.reg .b32 t;\n\tshl.b32 t, $4, 8;\n\tor.b32 t, t, $3;\n\tshl.b32 t, t, 8;\n\tor.b32 t, t, $2;\n\t"
                       "shl.b32 t, t, 8;\n\tor.b32 $0, t, $1;\n\t}", "=r,r,r,r,r", False, loc, ip))
 
 
 @dsl_user_op
 def tc_fence_before(*, loc=None, ip=None):
-    _asm(None, [], "tcgen05.fence::before_thread_sync;", "", True, loc, ip)
+    inline_asm(None, [], "tcgen05.fence::before_thread_sync;", "", True, loc, ip)
 
 
 @dsl_user_op
 def tc_fence_after(*, loc=None, ip=None):
-    _asm(None, [], "tcgen05.fence::after_thread_sync;", "", True, loc, ip)
+    inline_asm(None, [], "tcgen05.fence::after_thread_sync;", "", True, loc, ip)
 
 
 @dsl_user_op
 def st_global_u8(addr: Int64, v: Int32, *, loc=None, ip=None):
-    _asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
+    inline_asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
          "st.global.u8 [$0], $1;", "l,r", True, loc, ip)
 
 
 @dsl_user_op
 def st_global_f64x2(addr: Int64, a: Float64, b: Float64, *, loc=None, ip=None):
-    _asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Float64(a).ir_value(loc=loc, ip=ip),
+    inline_asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Float64(a).ir_value(loc=loc, ip=ip),
                 Float64(b).ir_value(loc=loc, ip=ip)],
          "st.global.v2.f64 [$0], {$1, $2};", "l,d,d", True, loc, ip)
 
 
 @dsl_user_op
 def f2i(x: Float32, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [Float32(x).ir_value(loc=loc, ip=ip)], "mov.b32 $0, $1;", "=r,f", False, loc, ip))
+    return Int32(inline_asm(T.i32(), [Float32(x).ir_value(loc=loc, ip=ip)], "mov.b32 $0, $1;", "=r,f", False, loc, ip))
 
 
 @dsl_user_op
 def hmix(v: Int32, idx: Int32, *, loc=None, ip=None) -> Int32:
     """dbg 8 coupling hash of one element (value bits v at element index idx); summed (mod 2^32, order-free) per block."""
-    return Int32(_asm(T.i32(), [Int32(v).ir_value(loc=loc, ip=ip), Int32(idx).ir_value(loc=loc, ip=ip)],
+    return Int32(inline_asm(T.i32(), [Int32(v).ir_value(loc=loc, ip=ip), Int32(idx).ir_value(loc=loc, ip=ip)],
                       "{\n\t.reg .b32 x, y;\n\tmul.lo.u32 x, $1, 0x9E3779B1;\n\tmul.lo.u32 y, $2, 0x85EBCA6B;\n\t"
                       "add.u32 x, x, y;\n\tshr.u32 y, x, 15;\n\txor.b32 x, x, y;\n\tmul.lo.u32 x, x, 0x2C1B3C6D;\n\t"
                       "shr.u32 y, x, 12;\n\txor.b32 x, x, y;\n\tmul.lo.u32 x, x, 0x297A2D39;\n\tshr.u32 y, x, 15;\n\t"
@@ -138,24 +138,24 @@ def hmix(v: Int32, idx: Int32, *, loc=None, ip=None) -> Int32:
 
 @dsl_user_op
 def redux_add_u32(x: Int32, *, loc=None, ip=None) -> Int32:
-    return Int32(_asm(T.i32(), [Int32(x).ir_value(loc=loc, ip=ip)], "redux.sync.add.u32 $0, $1, 0xffffffff;", "=r,r",
+    return Int32(inline_asm(T.i32(), [Int32(x).ir_value(loc=loc, ip=ip)], "redux.sync.add.u32 $0, $1, 0xffffffff;", "=r,r",
                       True, loc, ip))
 
 
 @dsl_user_op
 def zext64(x: Int32, *, loc=None, ip=None) -> Int64:
-    return Int64(_asm(T.i64(), [Int32(x).ir_value(loc=loc, ip=ip)], "cvt.u64.u32 $0, $1;", "=l,r", False, loc, ip))
+    return Int64(inline_asm(T.i64(), [Int32(x).ir_value(loc=loc, ip=ip)], "cvt.u64.u32 $0, $1;", "=l,r", False, loc, ip))
 
 
 @dsl_user_op
 def red_add_u64(addr: Int64, v: Int64, *, loc=None, ip=None):
-    _asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int64(v).ir_value(loc=loc, ip=ip)],
+    inline_asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int64(v).ir_value(loc=loc, ip=ip)],
          "red.global.add.u64 [$0], $1;", "l,l", True, loc, ip)
 
 
 @dsl_user_op
 def red_add_f64(addr: Int64, v: Float64, *, loc=None, ip=None):
-    _asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Float64(v).ir_value(loc=loc, ip=ip)],
+    inline_asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Float64(v).ir_value(loc=loc, ip=ip)],
          "red.global.add.f64 [$0], $1;", "l,d", True, loc, ip)
 
 
@@ -168,20 +168,20 @@ def bfly_sum_f64(x: Float64, *, loc=None, ip=None) -> Float64:
                  f"shfl.sync.bfly.b32 olo, lo, {m}, 31, 0xffffffff;\n\tshfl.sync.bfly.b32 ohi, hi, {m}, 31, 0xffffffff;\n\t"
                  "mov.b64 o, {olo, ohi};\n\tadd.rn.f64 a, a, o;\n\t")
     body += "mov.f64 $0, a;\n\t}"
-    return Float64(_asm(T.f64(), [Float64(x).ir_value(loc=loc, ip=ip)], body, "=d,d", True, loc, ip))
+    return Float64(inline_asm(T.f64(), [Float64(x).ir_value(loc=loc, ip=ip)], body, "=d,d", True, loc, ip))
 
 
 @dsl_user_op
 def sel_eq_i32(x: Int32, y: Int32, a: Int32, b: Int32, *, loc=None, ip=None) -> Int32:
     """a if x == y else b"""
-    return Int32(_asm(T.i32(), [Int32(v).ir_value(loc=loc, ip=ip) for v in (x, y, a, b)],
+    return Int32(inline_asm(T.i32(), [Int32(v).ir_value(loc=loc, ip=ip) for v in (x, y, a, b)],
                       "{\n\t.reg .pred p;\n\tsetp.eq.s32 p, $1, $2;\n\tselp.b32 $0, $3, $4, p;\n\t}", "=r,r,r,r,r",
                       False, loc, ip))
 
 
 @dsl_user_op
 def sel_eq_f64(x: Int32, y: Int32, a: Float64, b: Float64, *, loc=None, ip=None) -> Float64:
-    return Float64(_asm(T.f64(), [Int32(x).ir_value(loc=loc, ip=ip), Int32(y).ir_value(loc=loc, ip=ip),
+    return Float64(inline_asm(T.f64(), [Int32(x).ir_value(loc=loc, ip=ip), Int32(y).ir_value(loc=loc, ip=ip),
                                   Float64(a).ir_value(loc=loc, ip=ip), Float64(b).ir_value(loc=loc, ip=ip)],
                         "{\n\t.reg .pred p;\n\tsetp.eq.s32 p, $1, $2;\n\tselp.f64 $0, $3, $4, p;\n\t}", "=d,r,r,d,d",
                         False, loc, ip))
@@ -474,7 +474,7 @@ class DmHd256Mx:
                             if const_expr(self.unsafe):
                                 tf.release()
                             spin(self.DLY)
-                        dm_utils.gemm_ptx_bs(
+                        gemm_ptx_bs(
                             mma_op, tmem_base + self.COL_OUT, tCrC[(None, None, None, 0)], tCrT[(None, None, None, 0)],
                             sC[(None, None, None, 0)], sT[(None, None, None, 0)],
                             tmem_base + self.COL_SFA, tmem_base + self.COL_SFB,
@@ -507,7 +507,7 @@ class DmHd256Mx:
                             if const_expr(self.unsafe):
                                 tf.release()
                             spin(self.DLY)
-                        dm_utils.gemm_ptx_bs(
+                        gemm_ptx_bs(
                             mma_op, tmem_base + self.COL_OUT, tCrC[(None, None, None, 0)], tCrT[(None, None, None, 0)],
                             sC[(None, None, None, 0)], sT[(None, None, None, 0)],
                             tmem_base + self.COL_SFA, tmem_base + self.COL_SFB,
@@ -541,7 +541,7 @@ class DmHd256Mx:
             else:
                 row_s = Float32(mQs[b, hx, rtok // 32])
                 row_a = Float32(mdOs[b, hx, rtok // 32])
-                l2r = dmh.dm_mx256_l2(Float32(mLse[b, hx, rtok]))
+                l2r = dm_mx256_l2(Float32(mLse[b, hx, rtok]))
                 dlr = Float32(mDelta[b, hx, rtok])
             one = Int32(0x7F7F7F7F)
             num = Float64(0.0)
@@ -572,8 +572,8 @@ class DmHd256Mx:
                     if const_expr(self.rows_are_keys):
                         qsj = Float32(mQs[b, h, ct * 4 + j])
                         dosj = Float32(mdOs[b, h, ct * 4 + j])
-                        cs[j] = dmh.dm_mx256_c(row_s, qsj)
-                        ca[j] = dmh.dm_mx256_dp_scale(row_a, dosj)
+                        cs[j] = dm_mx256_c(row_s, qsj)
+                        ca[j] = dm_mx256_dp_scale(row_a, dosj)
                         if const_expr(self.mode == "dv"):
                             osb[j] = sb_of(dosj)
                         else:
@@ -581,15 +581,15 @@ class DmHd256Mx:
                     else:
                         ksj = Float32(mKs[b, hk_row, ct * 4 + j])
                         vsj = Float32(mVs[b, hk_row, ct * 4 + j])
-                        cs[j] = dmh.dm_mx256_c(ksj, row_s)
-                        ca[j] = dmh.dm_mx256_dp_scale(vsj, row_a)
+                        cs[j] = dm_mx256_c(ksj, row_s)
+                        ca[j] = dm_mx256_dp_scale(vsj, row_a)
                         osb[j] = sb_of(ksj)
                 ldb = sLD_addr + par * 1024
                 if const_expr(self.kn == "ld" and self.unsafe):
                     ldb = sLD_addr
                 if const_expr(self.rows_are_keys):
                     # stage l2 / delta of the 128 queries of this tile (parity buffers; one barrier per tile)
-                    st_shared_f32(ldb + r * 4, dmh.dm_mx256_l2(Float32(mLse[b, h, ctok0 + r])))
+                    st_shared_f32(ldb + r * 4, dm_mx256_l2(Float32(mLse[b, h, ctok0 + r])))
                     st_shared_f32(ldb + 512 + r * 4, Float32(mDelta[b, h, ctok0 + r]))
                     cute.arch.barrier(barrier_id=2, number_of_threads=128)
                     if const_expr(self.kn == "ld"):
@@ -645,9 +645,9 @@ class DmHd256Mx:
                                     s0 = -Float32.inf if c0 > rtok else s0
                                     s1 = -Float32.inf if c0 + 1 > rtok else s1
                             if const_expr(self.rows_are_keys):
-                                p0, p1 = dmh.dm_mx256_p_pair2(s0, s1, cs[j], l2v[q2], l2v[q2 + 1])
+                                p0, p1 = dm_mx256_p_pair2(s0, s1, cs[j], l2v[q2], l2v[q2 + 1])
                             else:
-                                p0, p1 = dmh.dm_mx256_p_pair(s0, s1, cs[j], l2r)
+                                p0, p1 = dm_mx256_p_pair(s0, s1, cs[j], l2r)
                             pv[q2] = p0
                             pv[q2 + 1] = p1
                         if const_expr((self.dbg & 8) and self.mode != "dk"):
@@ -679,7 +679,7 @@ class DmHd256Mx:
                                 id3 = add_f32(id3, pv[q])
                     if const_expr((self.dbg & 8) and self.mode != "dk"):
                         if const_expr(self.rows_are_keys):
-                            lk_cols_u32(hpl, lane, _gaddr(mHash) + (Int64(l) * N + ctok0 + 32 * j) * 32)
+                            lk_cols_u32(hpl, lane, global_address(mHash) + (Int64(l) * N + ctok0 + 32 * j) * 32)
                         else:
                             hs_ = Int32(0)
                             for i in cutlass.range_constexpr(32):
@@ -693,7 +693,7 @@ class DmHd256Mx:
                             qi0 = ctok0 + 32 * j
                             ki0 = rtok
                             stp = Int64(N) * 16
-                        pa = _gaddr(mDump) + ((Int64(l) * N + qi0) * N + ki0) * 16 + 4
+                        pa = global_address(mDump) + ((Int64(l) * N + qi0) * N + ki0) * 16 + 4
                         for i in cutlass.range_constexpr(32):     # raw dP_acc (its TMEM cols get the dS stash)
                             st_global_f32(pa, dv_[i])
                             pa = pa + stp
@@ -702,8 +702,8 @@ class DmHd256Mx:
                         am = Float32(0.0)
                         for i in cutlass.range_constexpr(32):
                             am = cute.arch.fmax(am, vals[i])
-                        sbs[j] = dm_utils.pow2_sb(am)
-                        inv = dm_utils.inv_pow2_from_sb(sbs[j])
+                        sbs[j] = pow2_sb(am)
+                        inv = inv_pow2_from_sb(sbs[j])
                         for hv in cutlass.range_constexpr(2):
                             w = [None] * 4
                             for u in cutlass.range_constexpr(4):
@@ -736,10 +736,10 @@ class DmHd256Mx:
                             dsj = tmem_ld32(stash + 32 * j)
                         cute.arch.fence_view_async_tmem_load()
                         dstp = Int64(16)
-                        dpa = _gaddr(mDump) + ((Int64(l) * N + rtok) * N + ctok0 + 32 * j) * 16
+                        dpa = global_address(mDump) + ((Int64(l) * N + rtok) * N + ctok0 + 32 * j) * 16
                         if const_expr(self.rows_are_keys):
                             dstp = Int64(N) * 16
-                            dpa = _gaddr(mDump) + ((Int64(l) * N + ctok0 + 32 * j) * N + rtok) * 16
+                            dpa = global_address(mDump) + ((Int64(l) * N + ctok0 + 32 * j) * N + rtok) * 16
                         for i in cutlass.range_constexpr(0, 32, 2):
                             c0 = ctok0 + 32 * j + i
                             s0 = sv[i]
@@ -754,10 +754,10 @@ class DmHd256Mx:
                             if const_expr(self.mode == "dk"):
                                 p0, p1 = Float32(0.0), Float32(0.0)     # dk dump: S_acc, dP_acc, dS (P covered by dv / dq)
                             elif const_expr(self.rows_are_keys):
-                                p0, p1 = dmh.dm_mx256_p_pair2(s0, s1, cs[j], ld_shared_f32(ldb + (32 * j + i) * 4),
+                                p0, p1 = dm_mx256_p_pair2(s0, s1, cs[j], ld_shared_f32(ldb + (32 * j + i) * 4),
                                                               ld_shared_f32(ldb + (32 * j + i + 1) * 4))
                             else:
-                                p0, p1 = dmh.dm_mx256_p_pair(s0, s1, cs[j], l2r)
+                                p0, p1 = dm_mx256_p_pair(s0, s1, cs[j], l2r)
                             pp = [p0, p1]
                             for u in cutlass.range_constexpr(2):
                                 st_global_f32(dpa, sv[i + u])
@@ -772,12 +772,12 @@ class DmHd256Mx:
                 else:
                     # ---- block scales (unadorned sb per 32-col chunk) ----
                     if const_expr(self.mode == "dk"):
-                        sb = dm_utils.pow2_sb(dm_utils.redux_max_abs_f32(amk))
+                        sb = pow2_sb(redux_max_abs_f32(amk))
                         sbs = [sb] * 4
                     elif const_expr(self.mode == "dq"):
                         slot = amax_addr + par * 64
                         for j in cutlass.range_constexpr(4):
-                            am = dm_utils.redux_max_abs_f32(amq[j])
+                            am = redux_max_abs_f32(amq[j])
                             if const_expr(self.kn == "am" and j == 0):
                                 if warp == 0:
                                     spin(self.DLY)
@@ -788,7 +788,7 @@ class DmHd256Mx:
                         for j in cutlass.range_constexpr(4):
                             m4 = ld_shared_v4f(slot + j * 16)
                             am = max_f32(max_f32(m4[0], m4[1]), max_f32(m4[2], m4[3]))
-                            sbs[j] = dm_utils.pow2_sb(am)
+                            sbs[j] = pow2_sb(am)
                     # ---- codes -> smem (after out(t-1) consumed the previous codes / SFs) ----
                     if const_expr(self.mode != "dv" and not (self.kn == "cd" and self.unsafe)):
                         ce = cd_p.acquire_and_advance()
@@ -796,7 +796,7 @@ class DmHd256Mx:
                             tc_fence_after()     # BW3
                     for j in cutlass.range_constexpr(4):
                         if const_expr(self.mode != "dv"):
-                            inv = dm_utils.inv_pow2_from_sb(sbs[j])
+                            inv = inv_pow2_from_sb(sbs[j])
                             dsj = tmem_ld32(stash + 32 * j)
                             cute.arch.fence_view_async_tmem_load()
                             hsl = [Int32(0)] * 32
@@ -824,7 +824,7 @@ class DmHd256Mx:
                                             hcl[16 * hv + 4 * u + q] = hmix(((w[u] >> (8 * q)) & 255) | (sbs[j] << 8), ix)
                             if const_expr(self.dbg & 8):
                                 if const_expr(self.rows_are_keys):
-                                    a0_ = _gaddr(mHash) + (Int64(l) * N + ctok0 + 32 * j) * 32
+                                    a0_ = global_address(mHash) + (Int64(l) * N + ctok0 + 32 * j) * 32
                                     lk_cols_u32(hsl, lane, a0_ + 8)
                                     lk_cols_u32(hcl, lane, a0_ + 16)
                                     lk_cols_f64(dsj, lane, a0_ + 24)
@@ -844,10 +844,10 @@ class DmHd256Mx:
                     if const_expr(self.dbg & 2):
                         # codes dump from the own smem row (after all chunks are written)
                         stc = Int64(1)
-                        ca0 = _gaddr(mCodes) + (Int64(l) * N + rtok) * N + ctok0
+                        ca0 = global_address(mCodes) + (Int64(l) * N + rtok) * N + ctok0
                         if const_expr(self.rows_are_keys):
                             stc = Int64(N)
-                            ca0 = _gaddr(mCodes) + (Int64(l) * N + ctok0) * N + rtok
+                            ca0 = global_address(mCodes) + (Int64(l) * N + ctok0) * N + rtok
                         for v in cutlass.range(8, unroll=1):
                             x4 = dm_utils_ld_shared_v4(crow + ((v ^ rsw) * 16))
                             cp = ca0 + Int64(16 * v) * stc
@@ -855,13 +855,13 @@ class DmHd256Mx:
                                 for q in cutlass.range_constexpr(4):
                                     st_global_u8(cp, x4[u] >> (8 * q))
                                     cp = cp + stc
-                    sfa = pack4(dm_utils.add_sb_clamp(sbs[0], osb[0]), dm_utils.add_sb_clamp(sbs[1], osb[1]),
-                                dm_utils.add_sb_clamp(sbs[2], osb[2]), dm_utils.add_sb_clamp(sbs[3], osb[3]))
+                    sfa = pack4(add_sb_clamp(sbs[0], osb[0]), add_sb_clamp(sbs[1], osb[1]),
+                                add_sb_clamp(sbs[2], osb[2]), add_sb_clamp(sbs[3], osb[3]))
                     # SFA (M=128): row r at lane r, column COL_SFA + r // 32;
                     # SFB (N=256): column COL_SFB + n // 32, lanes 32 q + n % 32 -> 8 columns of 1.0 (0x7F)
-                    dm_utils.tmem_st_x1(tb + self.COL_SFA + warp, sfa)
-                    dm_utils.tmem_st_x4(tb + self.COL_SFB, one, one, one, one)
-                    dm_utils.tmem_st_x4(tb + self.COL_SFB + 4, one, one, one, one)
+                    tmem_st_x1(tb + self.COL_SFA + warp, sfa)
+                    tmem_st_x4(tb + self.COL_SFB, one, one, one, one)
+                    tmem_st_x4(tb + self.COL_SFB + 4, one, one, one, one)
                     cute.arch.fence_view_async_tmem_store()
                     cute.arch.fence_view_async_shared()
                     tc_fence_before()
@@ -871,16 +871,16 @@ class DmHd256Mx:
             if const_expr(self.delta_only):
                 fw = fin_c.wait_and_advance()
                 fw.release()
-                st_global_f64x2(_gaddr(mIdent) + (Int64(b * H + hx) * N + rtok) * 16, num, den)
+                st_global_f64x2(global_address(mIdent) + (Int64(b * H + hx) * N + rtok) * 16, num, den)
             else:
                 if const_expr((self.dbg & 8) and self.mode == "dq"):
-                    ha = _gaddr(mHash) + (Int64(b * H + hx) * N + rtok) * 32
+                    ha = global_address(mHash) + (Int64(b * H + hx) * N + rtok) * 32
                     red_add_u64(ha, lk_p)
                     red_add_u64(ha + 8, lk_s)
                     red_add_u64(ha + 16, lk_c)
                     red_add_f64(ha + 24, lk_r)
                 if const_expr((self.dbg & 1) and self.mode == "dq"):
-                    ia = _gaddr(mIdent) + (Int64(b * H + hx) * N + rtok) * 32
+                    ia = global_address(mIdent) + (Int64(b * H + hx) * N + rtok) * 32
                     st_global_f64x2(ia, idn, idd)
                     st_global_f64x2(ia + 16, idp, Float64(0.0))
                 # ---- epilogue: out row (256 fp32 in TMEM) -> bf16 ----
@@ -892,7 +892,7 @@ class DmHd256Mx:
                 nho = H
                 if const_expr(self.rows_are_keys):
                     nho = Hk
-                ob = _gaddr(mOut) + (((Int64(b) * N + rtok) * nho + hout) * D) * 2
+                ob = global_address(mOut) + (((Int64(b) * N + rtok) * nho + hout) * D) * 2
                 for cblk in cutlass.range_constexpr(8):
                     ov = tmem_ld32(tb + self.COL_OUT + 32 * cblk)
                     cute.arch.fence_view_async_tmem_load()

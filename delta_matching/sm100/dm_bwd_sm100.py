@@ -15,6 +15,8 @@ from cutlass.utils import LayoutEnum, TensorMapManager, TensorMapUpdateMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync
+from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import llvm
 
 from quack import layout_utils
 from flash_attn.cute import utils
@@ -37,6 +39,177 @@ from flash_attn.cute.tile_scheduler import (
 )
 
 from flash_attn.cute.tile_scheduler import WorkTileInfo as _DMWorkTileInfo
+
+@dsl_user_op
+def opaque_zero(i: Int32, *, loc=None, ip=None) -> Int32:
+    """DM d3nh: i >> 30 for a main-loop counter 0 <= i < 2^30 (bwd.py asserts the trip-count bound): 0 at run time and
+    loop-variant. LLVM cannot fold it (inline asm); ptxas does not today (the trip count is a run-time value), but that is
+    compiler behaviour, not a guarantee: if it ever folds, only the speed is lost (descriptors hoisted again), never
+    correctness. Regression check: MMA-role STL/LDL must stay 0."""
+    return Int32(llvm.inline_asm(T.i32(), [Int32(i).ir_value(loc=loc, ip=ip)], "shr.u32 $0, $1, 30;", "=r,r",
+                                 has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT,
+                                 loc=loc, ip=ip))
+
+
+def gemm_ptx_ss_w_idx(tiled_mma, acc, tCrA, tCrB, sA, sB, A_idx=None, B_idx=None, zero_init=False, cta_group=1, dz=None):
+    """SS (both operands smem descriptors) dense MMA over all k-steps: flash_attn.cute.blackwell_helpers.gemm_ptx_w_idx /
+    gemm_ptx_partial (non-TS branch, same PTX), plus DM d3nh's optional opaque zero dz."""
+    from flash_attn.cute import mma_sm100_desc as sm100_desc
+    from flash_attn.cute.blackwell_helpers import i64_to_i32x2, _tcgen05_mma_kind
+    rA = tCrA if A_idx is None else tCrA[None, None, None, A_idx]
+    rB = tCrB if B_idx is None else tCrB[None, None, None, B_idx]
+    sA = sA if A_idx is None else sA[None, None, None, A_idx]
+    sB = sB if B_idx is None else sB[None, None, None, B_idx]
+    op = cute.make_mma_atom(tiled_mma.op).op
+    acc_tmem_addr = acc.iterator.toint()
+    idesc: int = sm100_desc.mma_op_to_idesc(op)
+    kind = _tcgen05_mma_kind(op)
+
+    def desc_base(s, dtype_width, major_mode):
+        b = sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, dtype_width, s.layout[0]), s.iterator.type.swizzle_type,
+            sm100_desc.Major.K if major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else sm100_desc.Major.MN)
+        return i64_to_i32x2(b)
+
+    a_lo, a_hi = desc_base(sA, op.a_dtype.width, op.a_major_mode)
+    b_lo, b_hi = desc_base(sB, op.b_dtype.width, op.b_major_mode)
+    nk = cute.size(rA.shape[2])
+    offset_a = [cute.crd2idx((0, 0, k), rA.layout) for k in range(nk)]
+    offset_b = [cute.crd2idx((0, 0, k), rB.layout) for k in range(nk)]
+    start_a = Int32(a_lo | sm100_desc.make_smem_desc_start_addr(sA[None, None, 0].iterator))
+    start_b = Int32(b_lo | sm100_desc.make_smem_desc_start_addr(sB[None, None, 0].iterator))
+    pred_str = "p" if isinstance(zero_init, cutlass.Boolean) else "0" if zero_init else "1"
+    input_args = [Int32(cute.arch.make_warp_uniform(start_a)).ir_value(),
+                  Int32(cute.arch.make_warp_uniform(start_b)).ir_value(),
+                  ((Int32(1) - Int32(zero_init)) if isinstance(zero_init, cutlass.Boolean) else Int32(not zero_init)).ir_value(),
+                  Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value()]
+    if dz is not None:
+        input_args.append(Int32(dz).ir_value())
+    body = ("{\n\t.reg .pred leader_thread;\n\t.reg .pred p;\n\t.reg .b32 idesc, tmem_acc, a0, b_lo0, a_lo, b_lo, a_hi, b_hi;\n\t"
+            ".reg .b64 adesc, bdesc;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            f"mov.b32 idesc, {hex(idesc)};\n\t"
+            "mov.b32 tmem_acc, $3;\n\tmov.b32 a0, $0;\n\tmov.b32 b_lo0, $1;\n\t"
+            + descriptor_zero_add(dz, 4, False)
+            + f"mov.b32 a_hi, {hex(a_hi)};\n\tmov.b32 b_hi, {hex(b_hi)};\n\t"
+            "setp.ne.b32 p, $2, 0;\n\t")
+    for k in range(nk):
+        body += (f"add.u32 a_lo, a0, {hex(offset_a[k])};\n\tadd.u32 b_lo, b_lo0, {hex(offset_b[k])};\n\t"
+                 "mov.b64 adesc, {a_lo, a_hi};\n\tmov.b64 bdesc, {b_lo, b_hi};\n\t"
+                 f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], adesc, bdesc, idesc, "
+                 f"{pred_str if k == 0 else '1'};\n\t")
+    body += "}\n"
+    llvm.inline_asm(None, input_args, body, ",".join(["r"] * len(input_args)),
+                    has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT)
+
+
+def gemm_ptx_bs_w_idx(tiled_mma, acc, tCrA, tCrB, sA, sB, A_idx=None, B_idx=None, **kw):
+    rA = tCrA if A_idx is None else tCrA[None, None, None, A_idx]
+    rB = tCrB if B_idx is None else tCrB[None, None, None, B_idx]
+    sA_cur = None if sA is None else (sA if A_idx is None else sA[None, None, None, A_idx])
+    sB_cur = sB if B_idx is None else sB[None, None, None, B_idx]
+    op = cute.make_mma_atom(tiled_mma.op).op
+    gemm_ptx_bs(op, acc.iterator.toint(), rA, rB, sA_cur, sB_cur, **kw)
+
+
+@dsl_user_op
+def bytes4_same(b: Int32, *, loc=None, ip=None) -> Int32:
+    """Replicate a byte into all 4 bytes of a word."""
+    return Int32(llvm.inline_asm(T.i32(), [Int32(b).ir_value(loc=loc, ip=ip)],
+                                 "{\n\t.reg .b32 t;\n\tand.b32 t, $1, 0xff;\n\tmul.lo.u32 $0, t, 0x01010101;\n\t}",
+                                 "=r,r", has_side_effects=False, is_align_stack=False,
+                                 asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def st_async_peer_b32(local_addr: Int32, local_mbar: Int32, peer_rank: Int32, val: Int32, *, loc=None, ip=None):
+    """Store a 32-bit value into the peer CTA's smem at the same offset as local_addr, completing 4 tx bytes on the
+    peer's mbarrier at the offset of local_mbar (st.async + mapa)."""
+    llvm.inline_asm(None, [Int32(x).ir_value(loc=loc, ip=ip) for x in (local_addr, local_mbar, peer_rank, val)],
+                    "{\n\t.reg .b32 ra, rm;\n\t"
+                    "mapa.shared::cluster.u32 ra, $0, $2;\n\t"
+                    "mapa.shared::cluster.u32 rm, $1, $2;\n\t"
+                    "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [ra], $3, [rm];\n\t}",
+                    "r,r,r,r", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def absf(x: Float32, *, loc=None, ip=None) -> Float32:
+    """abs.f32 (ptxas folds it into the consuming FMNMX as an operand modifier)."""
+    return f32_unary("abs.f32 $0, $1;", x, loc, ip)
+
+
+@dsl_user_op
+def atom_add_relaxed_gpu_s32(addr: cutlass.Int64, val: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(llvm.inline_asm(T.i32(), [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), Int32(val).ir_value(loc=loc, ip=ip)],
+                                 "atom.relaxed.gpu.global.add.s32 $0, [$1], $2;", "=r,l,r", has_side_effects=True,
+                                 is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def st_relaxed_gpu_s32(addr: cutlass.Int64, val: Int32, *, loc=None, ip=None):
+    llvm.inline_asm(None, [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), Int32(val).ir_value(loc=loc, ip=ip)],
+                    "st.relaxed.gpu.global.s32 [$0], $1;", "l,r", has_side_effects=True, is_align_stack=False,
+                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def red_add_f64_from_f32(addr: cutlass.Int64, val: Float32, *, loc=None, ip=None):
+    """debug: red.global.add.f64 of an fp32 value (exactly widened)."""
+    llvm.inline_asm(None, [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), Float32(val).ir_value(loc=loc, ip=ip)],
+                    "{\n\t.reg .f64 d;\n\tcvt.f64.f32 d, $1;\n\tred.global.add.f64 [$0], d;\n\t}", "l,f",
+                    has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def st_sys_u32(addr: cutlass.Int64, val: Int32, *, loc=None, ip=None):
+    llvm.inline_asm(None, [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), Int32(val).ir_value(loc=loc, ip=ip)],
+                    "st.relaxed.sys.global.u32 [$0], $1;", "l,r", has_side_effects=True, is_align_stack=False,
+                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def cpasync_bulk_store_s2g(smem_ptr, gmem_ptr, store_bytes, *, loc=None, ip=None):
+    """cp.async.bulk smem -> gmem plain store (bulk_group), same grouping/wait semantics as the reduce-add variant."""
+    smem_ptr_i32 = smem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr.llvm_ptr, smem_ptr_i32, Int32(store_bytes).ir_value()],
+        "cp.async.bulk.global.shared::cta.bulk_group [$0], [$1], $2;",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
+    )
+
+
+@dsl_user_op
+def atom_add_global_u32(addr: cutlass.Int64, val: Int32, *, loc=None, ip=None) -> Int32:
+    return Int32(llvm.inline_asm(T.i32(), [cutlass.Int64(addr).ir_value(loc=loc, ip=ip), Int32(val).ir_value(loc=loc, ip=ip)],
+                                 "atom.relaxed.gpu.global.add.u32 $0, [$1], $2;", "=r,l,r",
+                                 has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def red_add_v4_f32(addr: cutlass.Int64, a: Float32, b: Float32, c: Float32, d: Float32, *, loc=None, ip=None):
+    """red.global.add.v4.f32 (sm_90+): 4 contiguous fp32 adds, 16-byte aligned address."""
+    llvm.inline_asm(None, [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)] + [Float32(x).ir_value(loc=loc, ip=ip) for x in (a, b, c, d)],
+                    "red.relaxed.gpu.global.add.v4.f32 [$0], {$1, $2, $3, $4};", "l,f,f,f,f", has_side_effects=True,
+                    is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def st_v4_f32(addr: cutlass.Int64, a: Float32, b: Float32, c: Float32, d: Float32, *, loc=None, ip=None):
+    llvm.inline_asm(None, [cutlass.Int64(addr).ir_value(loc=loc, ip=ip)] + [Float32(x).ir_value(loc=loc, ip=ip) for x in (a, b, c, d)],
+                    "st.global.v4.f32 [$0], {$1, $2, $3, $4};", "l,f,f,f,f", has_side_effects=True,
+                    is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def fence_acq_rel_gpu(*, loc=None, ip=None):
+    llvm.inline_asm(None, [], "fence.acq_rel.gpu;", "", has_side_effects=True, is_align_stack=False,
+                    asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip)
+
 
 _DM_HSWZ_CLS = {}
 
@@ -271,10 +444,10 @@ def dm_dynamic_scheduler(qh: int, hswz: bool, max_ctas: int, n_cons: int):
         @staticmethod
         def _fetch(params, sbase, k):
             s = k & 1
-            dm_utils.mbar_wait_parity_cluster(sbase + 8 * 3 + 8 * s, (k >> 1) & 1)
-            t = dm_utils.ld_shared_b32(sbase + 8 * 7 + 8 * s)
+            mbar_wait_parity_cluster(sbase + 8 * 3 + 8 * s, (k >> 1) & 1)
+            t = ld_shared_b32(sbase + 8 * 7 + 8 * s)
             with cute.arch.elect_one():
-                dm_utils.mbar_arrive_rank(sbase + 8 * 5 + 8 * s, Int32(0))
+                mbar_arrive_rank(sbase + 8 * 5 + 8 * s, Int32(0))
             cs = params.cluster_shape_mn[0]
             return t * cs + cute.arch.block_idx()[0] % cs
 
@@ -307,7 +480,11 @@ from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.utils import AuxData
-from delta_matching.sm100 import dm_utils
+from delta_matching.sm100.attention_math_sm100 import ex2_poly5_2, ex2_poly6_2
+from delta_matching.sm100.cute_ptx_sm100 import bitcast_f32_i32, bitcast_i32_f32, clock32, clock64, f32_unary, fence_proxy_async_global, globaltimer, ld_shared_b32, poll_acquire_ge_or_trap, red_add_u64, redux_max_abs_f32, smid, st_shared_b32, tmem_st_x1, tmem_st_x4
+from delta_matching.sm100.fp8_e8m0_scale_sm100 import add_sb_clamp, inv_pow2_from_sb, pack_bytes4, pow2_exponent_byte, pow2_sb
+from delta_matching.sm100.mma_sm100 import descriptor_zero_add, gemm_ptx_bs
+from delta_matching.sm100.tcgen05_fence_sm100 import FENCE_MODE, begin_kernel_fences, end_kernel_fences, fence_warp_relay, mark_fenced, mbar_arrive, mbar_arrive_expect_tx, mbar_arrive_local, mbar_arrive_rank, mbar_wait_parity, mbar_wait_parity_cluster, restore_fence_count, save_fence_count, tcgen05_fence_after, tcgen05_fence_before
 
 
 def utils_abs(x):
@@ -1849,13 +2026,13 @@ class DMBackwardSm100:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
-        dm_utils.tcf_begin(0 if "notcf" in self.dm_opts else 2 if "tcfb" in self.dm_opts else 1)   # tcgen05 thread-sync fences (dm_utils.TCF)
+        begin_kernel_fences(0 if "notcf" in self.dm_opts else 2 if "tcfb" in self.dm_opts else 1)   # tcgen05 thread-sync fences (FENCE_MODE)
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
         if const_expr("tl2" in self.dm_opts and aux_data.tensors is not None and len(aux_data.tensors) > 4):
             # DM tl2: kernel-entry globaltimer per CTA at [64 + 8 * bid + 4]
             if cute.arch.thread_idx()[0] == 0:
-                dm_utils.red_add_u64(aux_data.tensors[4].iterator.toint() + 8 * (64 + 8 * bidx + 4), dm_utils.globaltimer())
+                red_add_u64(aux_data.tensors[4].iterator.toint() + 8 * (64 + 8 * bidx + 4), globaltimer())
         # The CTA rank of a 2CTA pair; NOTE [SM100 backward coordinate spaces].
         mma_tile_coord_v = bidx % self.cta_group_size
         is_leader_cta = mma_tile_coord_v == 0
@@ -2104,10 +2281,10 @@ class DMBackwardSm100:
             defer_sync=False,
         )
 
-        # mark the tcgen05 hand-off pipelines / barriers (dm_utils.tcf_mark)
-        dm_utils.tcf_mark("ua", pipeline_S_P, pipeline_dP, pipeline_dKV, pipeline_dQ)
-        dm_utils.tcf_mark("au", pipeline_dS, pipeline_P)
-        dm_utils.tcf_mark("bar", self.compute_sync_barrier, tmem_alloc_barrier)
+        # mark the tcgen05 hand-off pipelines / barriers (mark_fenced)
+        mark_fenced("ua", pipeline_S_P, pipeline_dP, pipeline_dKV, pipeline_dQ)
+        mark_fenced("au", pipeline_dS, pipeline_P)
+        mark_fenced("bar", self.compute_sync_barrier, tmem_alloc_barrier)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
         if const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
             sQt = storage.sQt.get_tensor(
@@ -2346,10 +2523,10 @@ class DMBackwardSm100:
             # Alloc tmem buffer
             tmem.allocate(self.tmem_alloc_cols)
             if const_expr(self.dm_allocf):
-                dm_utils.tc_fence_before()   # allocf: tcgen05.alloc (writes tmem_hold) ordered before the alloc barrier
+                tcgen05_fence_before()   # allocf: tcgen05.alloc (writes tmem_hold) ordered before the alloc barrier
             tmem.wait_for_alloc()
             if const_expr(self.dm_allocf):
-                dm_utils.tc_fence_after()    # allocf: ... and the tmem_hold read (retrieve_ptr) after it
+                tcgen05_fence_after()    # allocf: ... and the tmem_hold read (retrieve_ptr) after it
             tmem_ptr = tmem.retrieve_ptr(Float32)
             if const_expr(self.dm_tconv):
                 # rw8k tconv: this CTA holds its TMEM (its last obstructable resource); the PDL dependent (the tail
@@ -2406,18 +2583,18 @@ class DMBackwardSm100:
             if const_expr(self.dm_allocf):
                 # allocf: the 2-CTA dealloc handshake inside TmemAllocator.free (remote mbarrier arrive -> wait -> tcgen05.dealloc) gets
                 # the fence pair too (blanket tcf mode for this call: fence::before the arrive, fence::after the wait)
-                _tcf_saved = dm_utils.TCF[0]
+                _tcf_saved = FENCE_MODE[0]
                 # the build-trap guard (tcf_end) must keep counting only the marked-pipeline wrapper fences: the blanket fences
                 # of this one call are not evidence that the pipeline wrappers are bound (S6 positive control)
-                _tcf_f0 = dm_utils._tcf_save_fences()
-                dm_utils.TCF[0] = 2
+                _tcf_f0 = save_fence_count()
+                FENCE_MODE[0] = 2
             tmem.free(tmem_ptr)
             if const_expr(self.dm_allocf):
-                dm_utils.TCF[0] = _tcf_saved
-                dm_utils._tcf_restore_fences(_tcf_f0)
+                FENCE_MODE[0] = _tcf_saved
+                restore_fence_count(_tcf_f0)
             if const_expr("tl4" in self.dm_opts and aux_data.tensors is not None and len(aux_data.tensors) > 4):
                 if cute.arch.lane_idx() == 0:
-                    dm_utils.red_add_u64(aux_data.tensors[4].iterator.toint() + 8 * (64 + 8 * bidx + 7), dm_utils.globaltimer())
+                    red_add_u64(aux_data.tensors[4].iterator.toint() + 8 * (64 + 8 * bidx + 7), globaltimer())
 
         # Compute
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
@@ -2425,7 +2602,7 @@ class DMBackwardSm100:
             self._dm_setmaxreg_inc(self.num_regs_compute)  # 8 warps
             tmem.wait_for_alloc()
             if const_expr(self.dm_allocf):
-                dm_utils.tc_fence_after()    # allocf: canonical alloc -> fence::before -> bar -> fence::after -> ld tmem_hold
+                tcgen05_fence_after()    # allocf: canonical alloc -> fence::before -> bar -> fence::after -> ld tmem_hold
             tmem_ptr = tmem.retrieve_ptr(Float32)
             self.compute_loop(
                 thr_mma_S,
@@ -2487,7 +2664,7 @@ class DMBackwardSm100:
                     self._dm_setmaxreg_inc(self.num_regs_dsq)
                 tmem.wait_for_alloc()
                 if const_expr(self.dm_allocf):
-                    dm_utils.tc_fence_after()    # allocf (see the MMA warp)
+                    tcgen05_fence_after()    # allocf (see the MMA warp)
                 tmem_ptr = tmem.retrieve_ptr(Float32)
                 self.dsq_loop(
                     thr_mma_S, tdPtdP, sdS, sdS_xchg, sdS_dK, pipeline_dP, pipeline_dS, dS_cluster_full_mbar_ptr,
@@ -2505,7 +2682,7 @@ class DMBackwardSm100:
                 self._dm_setmaxreg_inc(self.num_regs_reduce)
             tmem.wait_for_alloc()
             if const_expr(self.dm_allocf):
-                dm_utils.tc_fence_after()    # allocf: canonical alloc -> fence::before -> bar -> fence::after -> ld tmem_hold
+                tcgen05_fence_after()    # allocf: canonical alloc -> fence::before -> bar -> fence::after -> ld tmem_hold
             tmem_ptr = tmem.retrieve_ptr(Float32)
             self.dQacc_reduce(
                 mdQaccum,
@@ -2540,10 +2717,10 @@ class DMBackwardSm100:
             )
             if const_expr("tl4" in self.dm_opts and aux_data.tensors is not None and len(aux_data.tensors) > 4):
                 if warp_idx == self.reduce_warp_ids[0] and cute.arch.lane_idx() == 0:
-                    dm_utils.red_add_u64(aux_data.tensors[4].iterator.toint() + 8 * (64 + 8 * bidx + 6), dm_utils.globaltimer())
+                    red_add_u64(aux_data.tensors[4].iterator.toint() + 8 * (64 + 8 * bidx + 6), globaltimer())
             tmem_alloc_barrier.arrive()
 
-        dm_utils.tcf_end()
+        end_kernel_fences()
         return
 
     @cute.jit
@@ -3632,7 +3809,7 @@ class DMBackwardSm100:
         tdVrP = tiled_mma_dV.make_fragment_A(sP if const_expr(self.acc_m64) else tP)
 
         # mma_qk_fn = partial(gemm_w_idx, tiled_mma_S, tStS, tSrK, tSrQ, zero_init=True)
-        _ss_gemm = dm_utils.gemm_ptx_ss_w_idx if const_expr(self.dm_d3nh) else _dm_drop_dz(gemm_ptx_w_idx)
+        _ss_gemm = gemm_ptx_ss_w_idx if const_expr(self.dm_d3nh) else _dm_drop_dz(gemm_ptx_w_idx)
         mma_qk_fn = partial(
             _ss_gemm,
             tiled_mma_S,
@@ -3659,7 +3836,7 @@ class DMBackwardSm100:
         # mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO)
         assert not self.acc_m64, "DM: TMEM P / dS layout only"
         mma_pdo_fn = partial(
-            dm_utils.gemm_ptx_bs_w_idx,
+            gemm_ptx_bs_w_idx,
             tiled_mma_dV,
             tdVtdV,
             tdVrP,
@@ -3676,7 +3853,7 @@ class DMBackwardSm100:
         num_unroll_groups = 2 if const_expr(self.use_2cta_instrs) else 1
         dm_nk_dq = self.cluster_tile_n // 32
         mma_dsk_fn = partial(
-            dm_utils.gemm_ptx_bs_w_idx,
+            gemm_ptx_bs_w_idx,
             tiled_mma_dQ,
             tdQtdQ,
             tdQrdS,
@@ -3709,7 +3886,7 @@ class DMBackwardSm100:
         else:
             # Need to explicitly pass in tA_addr for correctness
             mma_dsq_fn = partial(
-                dm_utils.gemm_ptx_bs_w_idx,
+                gemm_ptx_bs_w_idx,
                 tiled_mma_dK,
                 tdKtdK,
                 tdKrdS,
@@ -3928,22 +4105,22 @@ class DMBackwardSm100:
                     if const_expr(dm_trace is not None):
                         dm_acc0, dm_acc1, dm_acc2, dm_acc3 = Int64(0), Int64(0), Int64(0), Int64(0)
                         dm_acc4, dm_acc5, dm_acc6, dm_acc7 = Int64(0), Int64(0), Int64(0), Int64(0)
-                        dm_tl0 = dm_utils.clock64()
+                        dm_tl0 = clock64()
                     for dm_mi in cutlass.range(main_loop_iters, unroll=1):
-                        dmz = dm_utils.opaque_zero(dm_mi) if const_expr(self.dm_d3nh) else None   # DM d3nh
+                        dmz = opaque_zero(dm_mi) if const_expr(self.dm_d3nh) else None   # DM d3nh
                         self._dm_prog(Int32(2), dm_pt, dm_mi, Int32(2))
                         # (1) S.T = K @ Q.T (next)
                         if const_expr(dm_trace is not None):
-                            dm_t0 = dm_utils.clock64()
+                            dm_t0 = clock64()
                         pipeline_Q.consumer_wait(consumer_state_Q)
                         if const_expr(dm_trace is not None):
-                            dm_acc0 = dm_acc0 + (dm_utils.clock64() - dm_t0)
+                            dm_acc0 = dm_acc0 + (clock64() - dm_t0)
                         self._tlev(dm_trace, dm_mi, 0, True)
                         if const_expr(dm_trace is not None):
-                            dm_t0 = dm_utils.clock64()
+                            dm_t0 = clock64()
                         pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
                         if const_expr(dm_trace is not None):
-                            dm_acc1 = dm_acc1 + (dm_utils.clock64() - dm_t0)
+                            dm_acc1 = dm_acc1 + (clock64() - dm_t0)
                         self._tlev(dm_trace, dm_mi, 1, True)
                         if const_expr(self.dm_ordw_v):
                             # ordinv C0: dV(t) read SFA/SFB_dv (S region cols 32..51); S^T(t+1) overwrites the S region
@@ -3960,16 +4137,16 @@ class DMBackwardSm100:
                         # pipeline_dS.consumer_wait(consumer_state_dS)
                         # (2) dK += dS.T @ Q (cur)
                         if const_expr(dm_trace is not None):
-                            dm_t0 = dm_utils.clock64()
+                            dm_t0 = clock64()
                         pipeline_Qt.consumer_wait(consumer_state_Qt)
                         if const_expr(dm_trace is not None):
-                            dm_acc2 = dm_acc2 + (dm_utils.clock64() - dm_t0)
+                            dm_acc2 = dm_acc2 + (clock64() - dm_t0)
                         self._tlev(dm_trace, dm_mi, 2, True)
                         if const_expr(dm_trace is not None):
-                            dm_t0 = dm_utils.clock64()
+                            dm_t0 = clock64()
                         pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
                         if const_expr(dm_trace is not None):
-                            dm_acc3 = dm_acc3 + (dm_utils.clock64() - dm_t0)
+                            dm_acc3 = dm_acc3 + (clock64() - dm_t0)
                         self._tlev(dm_trace, dm_mi, 3, True)
                         mma_dsq_fn(B_idx=consumer_state_Qt.index, zero_init=not accumulate_dK, dz=dmz)
                         if const_expr(self.dm_ordw_k):
@@ -3981,10 +4158,10 @@ class DMBackwardSm100:
 
                         # (3) dP.T = V @ dO.T (next)
                         if const_expr(dm_trace is not None):
-                            dm_t0 = dm_utils.clock64()
+                            dm_t0 = clock64()
                         pipeline_dO.consumer_wait(consumer_state_dO)
                         if const_expr(dm_trace is not None):
-                            dm_acc4 = dm_acc4 + (dm_utils.clock64() - dm_t0)
+                            dm_acc4 = dm_acc4 + (clock64() - dm_t0)
                         self._tlev(dm_trace, dm_mi, 4, True)
                         if const_expr(self.dm_ordw_k):
                             # ordinv C0: dK(t) read SFA/SFB_dk (dP region cols dS+32..); dP^T(t+1) overwrites the dP region
@@ -4003,20 +4180,20 @@ class DMBackwardSm100:
                             dm_dv_first = Int32(dm_p_rdy) - Int32(dm_dq_rdy)   # 1 iff P(t+1) ready and dQ(t) not
                             if dm_dv_first > 0:
                                 pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc ^ 1)  # S -> P (already complete)
-                                dm_utils.tc_fence_after()
+                                tcgen05_fence_after()
                                 mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False, dz=dmz)
                         # (5) dQ = dS @ K (cur)
                         if const_expr(dm_trace is not None):
-                            dm_t0 = dm_utils.clock64()
+                            dm_t0 = clock64()
                         pipeline_dS.consumer_wait(consumer_state_dS)
                         if const_expr(dm_trace is not None):
-                            dm_acc5 = dm_acc5 + (dm_utils.clock64() - dm_t0)
+                            dm_acc5 = dm_acc5 + (clock64() - dm_t0)
                         self._tlev(dm_trace, dm_mi, 5, True)
                         if const_expr(dm_trace is not None):
-                            dm_t0 = dm_utils.clock64()
+                            dm_t0 = clock64()
                         cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
                         if const_expr(dm_trace is not None):
-                            dm_acc6 = dm_acc6 + (dm_utils.clock64() - dm_t0)
+                            dm_acc6 = dm_acc6 + (clock64() - dm_t0)
                         self._tlev(dm_trace, dm_mi, 6, True)
                         mma_dsk_fn(dz=dmz)
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
@@ -4028,14 +4205,14 @@ class DMBackwardSm100:
                         # (4) dV += P.T @ dO (next)
                         producer_phase_acc ^= 1
                         if const_expr(dm_trace is not None):
-                            dm_t0 = dm_utils.clock64()
+                            dm_t0 = clock64()
                         if const_expr("rdo" not in self.dm_opts):
                             pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)  # S -> P
                         else:
                             if dm_dv_first <= 0:
                                 pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)  # S -> P
                         if const_expr(dm_trace is not None):
-                            dm_acc7 = dm_acc7 + (dm_utils.clock64() - dm_t0)
+                            dm_acc7 = dm_acc7 + (clock64() - dm_t0)
                         self._tlev(dm_trace, dm_mi, 7, True)
                         if const_expr("rdo" not in self.dm_opts):
                             mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False, dz=dmz)
@@ -4055,11 +4232,11 @@ class DMBackwardSm100:
                         consumer_state_dO.advance()
 
                     if const_expr(dm_trace is not None):
-                        dm_tot = dm_utils.clock64() - dm_tl0
+                        dm_tot = clock64() - dm_tl0
                         if cute.arch.lane_idx() == 0:
                             dm_base = dm_trace.iterator.toint()
                             for k_, a_ in enumerate((dm_acc0, dm_acc1, dm_acc2, dm_acc3, dm_acc4, dm_acc5, dm_acc6, dm_acc7, dm_tot, Int64(main_loop_iters))):
-                                dm_utils.red_add_u64(dm_base + 8 * k_, a_)
+                                red_add_u64(dm_base + 8 * k_, a_)
                     if const_expr(self.dm_pers == 0):
                         pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)  # unmatched by the compute warps (harmless with one tile per CTA)
 
@@ -4290,7 +4467,7 @@ class DMBackwardSm100:
         """ordinv ordw: wait for completion #(n-1) of ord[k] (n = commits issued so far; at most one outstanding)."""
         if n > 0:
             cute.arch.mbarrier_wait(self.dm_ord_ptr + k, phase=(n - 1) & 1)
-            dm_utils.tc_fence_after()
+            tcgen05_fence_after()
 
     @cute.jit
     def _dm_ord_plant(self, tStS: cute.Tensor, col: int):
@@ -4298,7 +4475,7 @@ class DMBackwardSm100:
         a = ((cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) * 32) << 16
         a = a + Int32(tStS.iterator.toint()) - Int32(self.tmem_S_offset) + Int32(col)
         w = Int32(-2139062144)
-        dm_utils.tmem_st_x4(a, w, w, w, w)
+        tmem_st_x4(a, w, w, w, w)
         cute.arch.fence_view_async_tmem_store()
 
     def _check_dS_exchange_layouts(self):
@@ -4354,18 +4531,18 @@ class DMBackwardSm100:
                     if k >= 1:
                         # claim tile k only when this CTA has finished tile k - 1 (its dK/dV epilogue drained): a
                         # claimed-but-not-started tile would block the deterministic semaphore chains through it
-                        dm_utils.mbar_wait_parity(sbase + 8 * 2, (k - 1) & 1)
+                        mbar_wait_parity(sbase + 8 * 2, (k - 1) & 1)
                     if k >= 2:
-                        dm_utils.mbar_wait_parity_cluster(sbase + 8 * 5 + 8 * s, ((k >> 1) - 1) & 1)
-                    t = dm_utils.atom_add_global_u32(counter, Int32(1))
-                    dm_utils.st_shared_b32(sbase + 8 * 7 + 8 * s, t)
-                    dm_utils.mbar_arrive_local(sbase + 8 * 3 + 8 * s)
-                    dm_utils.st_async_peer_b32(sbase + 8 * 7 + 8 * s, sbase + 8 * 3 + 8 * s, Int32(1), t)
+                        mbar_wait_parity_cluster(sbase + 8 * 5 + 8 * s, ((k >> 1) - 1) & 1)
+                    t = atom_add_global_u32(counter, Int32(1))
+                    st_shared_b32(sbase + 8 * 7 + 8 * s, t)
+                    mbar_arrive_local(sbase + 8 * 3 + 8 * s)
+                    st_async_peer_b32(sbase + 8 * 7 + 8 * s, sbase + 8 * 3 + 8 * s, Int32(1), t)
                     go = Int32(t < n_cl)
                 else:
-                    dm_utils.mbar_arrive_expect_tx(sbase + 8 * 3 + 8 * s, 4)
-                    dm_utils.mbar_wait_parity(sbase + 8 * 3 + 8 * s, (k >> 1) & 1)
-                    t = dm_utils.ld_shared_b32(sbase + 8 * 7 + 8 * s)
+                    mbar_arrive_expect_tx(sbase + 8 * 3 + 8 * s, 4)
+                    mbar_wait_parity(sbase + 8 * 3 + 8 * s, (k >> 1) & 1)
+                    t = ld_shared_b32(sbase + 8 * 7 + 8 * s)
                     go = Int32(t < n_cl)
                 k = k + 1
 
@@ -4374,10 +4551,10 @@ class DMBackwardSm100:
         # DM prog (debug): latest (tile, iter, step) per role, zero-copy to host-mapped memory (hang localization)
         if const_expr("prog" in self.dm_opts):
             if cute.arch.lane_idx() == 0:
-                dm_utils.st_sys_u32(self.dm_prog_addr + 4 * (cute.arch.block_idx()[0] * 32 + slot),
+                st_sys_u32(self.dm_prog_addr + 4 * (cute.arch.block_idx()[0] * 32 + slot),
                                     (tile << 24) + (it << 8) + step)
                 if slot == 2:
-                    dm_utils.st_sys_u32(self.dm_prog_addr + 4 * (cute.arch.block_idx()[0] * 32 + 8 + step),
+                    st_sys_u32(self.dm_prog_addr + 4 * (cute.arch.block_idx()[0] * 32 + 8 + step),
                                         (tile << 24) + (it << 8) + step)
 
     @cute.jit
@@ -4431,9 +4608,9 @@ class DMBackwardSm100:
         key-block bytes of CTA g's keys (k-steps 4g..4g+3). Uniform over n, so every lane gets the same words."""
         slot = t & 1
         if const_expr("dqx" not in self.dm_abl):
-            dm_utils.mbar_wait_parity(dm_mbar + 8 * slot, (t >> 1) & 1)
-        own = dm_utils.ld_shared_b32(dm_sdm + 4 * (24 + slot))
-        peer = dm_utils.ld_shared_b32(dm_sdm + 4 * (32 + slot))
+            mbar_wait_parity(dm_mbar + 8 * slot, (t >> 1) & 1)
+        own = ld_shared_b32(dm_sdm + 4 * (24 + slot))
+        peer = ld_shared_b32(dm_sdm + 4 * (32 + slot))
         w0 = own
         w1 = peer
         if cta_rank != 0:
@@ -4441,8 +4618,8 @@ class DMBackwardSm100:
             w1 = own
         lane = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) * 32
         one = Int32(0x7F7F7F7F)
-        dm_utils.tmem_st_x4((lane << 16) + self.dm_sfa_dq_col, one, one, w0, w0)
-        dm_utils.tmem_st_x4((lane << 16) + self.dm_sfa_dq_col + 4, w1, w1, one, one)
+        tmem_st_x4((lane << 16) + self.dm_sfa_dq_col, one, one, w0, w0)
+        tmem_st_x4((lane << 16) + self.dm_sfa_dq_col + 4, w1, w1, one, one)
 
     @cute.jit
     def split_wg(
@@ -4834,8 +5011,8 @@ class DMBackwardSm100:
             dm_s0, dm_s1, dm_s2, dm_s3, dm_s4 = Int32(0), Int32(0), Int32(0), Int32(0), Int32(0)
             dm_s5, dm_s6, dm_s7, dm_s8, dm_s9 = Int32(0), Int32(0), Int32(0), Int32(0), Int32(0)
             dm_s10, dm_s11, dm_s12, dm_s13 = Int32(0), Int32(0), Int32(0), Int32(0)
-            dm_tprev = dm_utils.clock32()
-            dm_tl0 = dm_utils.globaltimer()
+            dm_tprev = clock32()
+            dm_tl0 = globaltimer()
         dm_pt = Int32(0)
         while work_tile.is_valid_tile:
             self._dm_prog(Int32(3) + cute.arch.warp_idx() // 4 % 2, dm_pt, Int32(0), Int32(1))
@@ -4922,7 +5099,7 @@ class DMBackwardSm100:
             dm_kv_blk = cutlass.min(dm_kv_blk, (seqlen.seqlen_k + 31) // 32 - 1)
             dm_ks = Float32(aux_data.tensors[1][batch_idx, kv_head, dm_kv_blk])
             dm_vs = Float32(aux_data.tensors[2][batch_idx, kv_head, dm_kv_blk])
-            dm_ksb = dm_utils.pow2_exponent_byte(dm_ks)
+            dm_ksb = pow2_exponent_byte(dm_ks)
             dm_nst = cute.size(tScS_t2r, mode=[1])
             dm_qoff = [dm_idx0[None, st, 0, 0][0][1] // 32 for st in range(dm_nst)]
             if const_expr(dm_nst == 1):
@@ -4979,13 +5156,13 @@ class DMBackwardSm100:
                       )
                       m_block_oob = m_block >= m_block_max
                   if const_expr(dm_tr is not None):
-                      dm_now = dm_utils.clock32()
+                      dm_now = clock32()
                       dm_s0 = dm_s0 + (dm_now - dm_tprev)
                       dm_tprev = dm_now
                   # Prefetch 1 stage of LSE
                   pipeline_LSE.consumer_wait(consumer_state_LSE)
                   if const_expr(dm_tr is not None):
-                      dm_now = dm_utils.clock32()
+                      dm_now = clock32()
                       dm_s1 = dm_s1 + (dm_now - dm_tprev)
                       dm_tprev = dm_now
                   tSrLSE_s2r = cute.make_rmem_tensor(tScS_t2r[None, 0, 0, 0].shape, Float32)
@@ -5011,7 +5188,7 @@ class DMBackwardSm100:
                       else:
                           pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
                       if const_expr(dm_tr is not None):
-                          dm_now = dm_utils.clock32()
+                          dm_now = clock32()
                           dm_s2 = dm_s2 + (dm_now - dm_tprev)
                           dm_tprev = dm_now
                           self._tlev(dm_tr, iter_idx, 8, dm_tid == 0)
@@ -5024,12 +5201,12 @@ class DMBackwardSm100:
                           # dQ(t-1) overwrite the S tail (and write the dQ(t-1) SFs) now instead of after the exps
                           if iter_idx > 0:
                               cute.arch.fence_view_async_tmem_load()
-                              dm_utils.tc_fence_before()
+                              tcgen05_fence_before()
                               cute.arch.sync_warp()
                               if cute.arch.lane_idx() == 0:
-                                  dm_utils.mbar_arrive(dm_mbar + 8 * 10)
+                                  mbar_arrive(dm_mbar + 8 * 10)
                   if const_expr(dm_tr is not None):
-                      dm_now = dm_utils.clock32()
+                      dm_now = clock32()
                       dm_s3 = dm_s3 + (dm_now - dm_tprev)
                       dm_tprev = dm_now
                       self._tlev(dm_tr, iter_idx, 9, dm_tid == 0)
@@ -5039,14 +5216,14 @@ class DMBackwardSm100:
                       # issue the next QK into the slot
                       cute.arch.fence_view_async_tmem_load()
                       cute.arch.sync_warp()
-                      dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                      fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                       with cute.arch.elect_one():
                           pipeline_S_P.consumer_release(consumer_state_S)
                       consumer_state_S.advance()
                   elif const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_SERIAL):
                       # Signal S tmem load completion using pipeline_S_P: dP overlaps S
                       cute.arch.fence_view_async_tmem_load()
-                      dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                      fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                       with cute.arch.elect_one():
                           pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                   elif const_expr(self.cta_schedule == CtaSchedule.TWO_CTA_PIPELINED):
@@ -5062,14 +5239,14 @@ class DMBackwardSm100:
                                   if const_expr("esr" not in self.dm_opts):   # DM esr: arrived right after the S load instead
                                       # DM dsq: S(t) read by this warp (wait::ld done before the pair barrier) -> the reduce warps may let
                                       # dQ(t-1) overwrite the S tail; they install the dQ(t-1) SFs and commit pipeline_dS(t-1)
-                                      dm_utils.tc_fence_before()
+                                      tcgen05_fence_before()
                                       cute.arch.sync_warp()
                                       if cute.arch.lane_idx() == 0:
-                                          dm_utils.mbar_arrive(dm_mbar + 8 * 10)
+                                          mbar_arrive(dm_mbar + 8 * 10)
                               else:
                                   self._dm_write_dq_sf(dm_t - 1, dm_sdm, dm_mbar, cta_rank_in_cluster)
                                   cute.arch.fence_view_async_tmem_store()
-                                  dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                                  fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                                   with cute.arch.elect_one():
                                       pipeline_dS.producer_commit(producer_state_dS)
                                   producer_state_dS.advance()
@@ -5167,8 +5344,8 @@ class DMBackwardSm100:
                   for stage in cutlass.range_constexpr(num_stages):
                       dm_c[stage] = (dm_ks * dm_qsv[stage]) * Float32(math.log2(math.e))
                       dm_a[stage] = dm_vs * dm_dosv[stage]
-                      dm_qsb[stage] = dm_utils.pow2_exponent_byte(dm_qsv[stage])
-                      dm_sfa_dv[stage] = dm_utils.pow2_exponent_byte(dm_dosv[stage])
+                      dm_qsb[stage] = pow2_exponent_byte(dm_qsv[stage])
+                      dm_sfa_dv[stage] = pow2_exponent_byte(dm_dosv[stage])
                   for stage in cutlass.range_constexpr(num_stages):
                       tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                       tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -5200,7 +5377,7 @@ class DMBackwardSm100:
                           if const_expr("noexp" in self.dm_abl or self.dm_b6 > 0):
                               pass   # b6: exps below, per 32x32 block
                           elif const_expr("poly3" in self.dm_opts):
-                              # FA4 degree-3 FMA polynomial for every element: bitwise = dm_common.dm_bwd_p_pair_poly in
+                              # FA4 degree-3 FMA polynomial for every element: bitwise = dm_bwd_p_pair_poly in
                               # pass 0 (own-P delta keeps rowsum(dS)=0 at round-off; P error 8.8e-5 << 2e-3 tolerance)
                               tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = utils.ex2_emulation_2(tSrS_cur[2 * v], tSrS_cur[2 * v + 1])
                           elif const_expr(self.dm_p3 is not None and v % self.dm_p3[0] < self.dm_p3[1]):
@@ -5208,7 +5385,7 @@ class DMBackwardSm100:
                               tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = utils.ex2_emulation_2(tSrS_cur[2 * v], tSrS_cur[2 * v + 1])
                           elif const_expr(self.dm_p5 is not None and v % self.dm_p5[0] < self.dm_p5[1]):
                               # accurate (1.7e-7) degree-5 FMA polynomial for a static subset of pairs (MUFU offload)
-                              tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = dm_utils.ex2_poly5_2(tSrS_cur[2 * v], tSrS_cur[2 * v + 1])
+                              tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = ex2_poly5_2(tSrS_cur[2 * v], tSrS_cur[2 * v + 1])
                           else:
                               tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                               tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
@@ -5217,13 +5394,13 @@ class DMBackwardSm100:
                           # (qb + kb) % m == 0 (warp-uniform) - the same rule and op sequence as pass 0 -> bitwise P
                           if (m_block * (self.tile_m // 32) + dm_qoff[stage] + dm_kv_blk) % self.dm_b6 == 0:
                               for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
-                                  tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = dm_utils.ex2_poly6_2(tSrS_cur[2 * v], tSrS_cur[2 * v + 1])
+                                  tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = ex2_poly6_2(tSrS_cur[2 * v], tSrS_cur[2 * v + 1])
                           else:
                               for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
                                   tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                                   tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
                       if const_expr(dm_tr is not None):
-                          dm_now = dm_utils.clock32()
+                          dm_now = clock32()
                           dm_s10 = dm_s10 + (dm_now - dm_tprev)
                           dm_tprev = dm_now
                       if const_expr(self.acc_m64):
@@ -5246,16 +5423,16 @@ class DMBackwardSm100:
                                   for t in cutlass.range_constexpr(4):
                                       pm[t] = utils.fmax(pm[t], tSrS_cur[v + 2 * t], tSrS_cur[v + 2 * t + 1])
                               p_amax = utils.fmax(utils.fmax(pm[0], pm[1]), pm[2], pm[3])
-                          p_sb = dm_utils.pow2_sb(p_amax)
-                          p_inv = dm_utils.inv_pow2_from_sb(p_sb)
-                          dm_sfa_dv[stage] = dm_utils.add_sb_clamp(p_sb, dm_sfa_dv[stage])
+                          p_sb = pow2_sb(p_amax)
+                          p_inv = inv_pow2_from_sb(p_sb)
+                          dm_sfa_dv[stage] = add_sb_clamp(p_sb, dm_sfa_dv[stage])
                           tSrPq = cute.make_fragment_like(tSrS_cur, Float32)
                           for v in cutlass.range_constexpr(cute.size(tSrS_cur) // 2):
                               tSrPq[2 * v], tSrPq[2 * v + 1] = cute.arch.mul_packed_f32x2(
                                   (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]), (p_inv, p_inv))
                           tSrP_r2t[None, stage, 0, 0].store(tSrPq.load().to(self.q_dtype))
                           if const_expr(dm_tr is not None):
-                              dm_now = dm_utils.clock32()
+                              dm_now = clock32()
                               dm_s11 = dm_s11 + (dm_now - dm_tprev)
                               dm_tprev = dm_now
                           if const_expr(stage == 0 and "noilp" in self.dm_opts):
@@ -5281,14 +5458,14 @@ class DMBackwardSm100:
                                               if const_expr("esr" not in self.dm_opts):   # DM esr: arrived right after the S load instead
                                                   # DM dsq: S(t) read by this warp (wait::ld done before the pair barrier) -> the reduce warps may let
                                                   # dQ(t-1) overwrite the S tail; they install the dQ(t-1) SFs and commit pipeline_dS(t-1)
-                                                  dm_utils.tc_fence_before()
+                                                  tcgen05_fence_before()
                                                   cute.arch.sync_warp()
                                                   if cute.arch.lane_idx() == 0:
-                                                      dm_utils.mbar_arrive(dm_mbar + 8 * 10)
+                                                      mbar_arrive(dm_mbar + 8 * 10)
                                           else:
                                               self._dm_write_dq_sf(dm_t - 1, dm_sdm, dm_mbar, cta_rank_in_cluster)
                                               cute.arch.fence_view_async_tmem_store()
-                                              dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                                              fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                                               with cute.arch.elect_one():
                                                   pipeline_dS.producer_commit(producer_state_dS)
                                               producer_state_dS.advance()
@@ -5323,14 +5500,14 @@ class DMBackwardSm100:
                                       if const_expr("esr" not in self.dm_opts):   # DM esr: arrived right after the S load instead
                                           # DM dsq: S(t) read by this warp (wait::ld done before the pair barrier) -> the reduce warps may let
                                           # dQ(t-1) overwrite the S tail; they install the dQ(t-1) SFs and commit pipeline_dS(t-1)
-                                          dm_utils.tc_fence_before()
+                                          tcgen05_fence_before()
                                           cute.arch.sync_warp()
                                           if cute.arch.lane_idx() == 0:
-                                              dm_utils.mbar_arrive(dm_mbar + 8 * 10)
+                                              mbar_arrive(dm_mbar + 8 * 10)
                                   else:
                                       self._dm_write_dq_sf(dm_t - 1, dm_sdm, dm_mbar, cta_rank_in_cluster)
                                       cute.arch.fence_view_async_tmem_store()
-                                      dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                                      fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                                       with cute.arch.elect_one():
                                           pipeline_dS.producer_commit(producer_state_dS)
                                       producer_state_dS.advance()
@@ -5342,7 +5519,7 @@ class DMBackwardSm100:
                           )
 
                   if const_expr(dm_tr is not None):
-                      dm_now = dm_utils.clock32()
+                      dm_now = clock32()
                       dm_s4 = dm_s4 + (dm_now - dm_tprev)
                       dm_tprev = dm_now
                       self._tlev(dm_tr, iter_idx, 10, dm_tid == 0)
@@ -5350,10 +5527,10 @@ class DMBackwardSm100:
                   dm_lane = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) * 32
                   for stage in cutlass.range_constexpr(num_stages):
                       dm_k = dm_qoff[stage]
-                      dm_utils.tmem_st_x1((dm_lane << 16) + self.dm_sfa_dv_col + dm_k * 4 + dm_lane // 32,
-                                          dm_utils.bytes4_same(dm_sfa_dv[stage]))
+                      tmem_st_x1((dm_lane << 16) + self.dm_sfa_dv_col + dm_k * 4 + dm_lane // 32,
+                                          bytes4_same(dm_sfa_dv[stage]))
                   dm_one = Int32(0x7F7F7F7F)
-                  dm_utils.tmem_st_x4((dm_lane << 16) + self.dm_sfb_dv_col, dm_one, dm_one, dm_one, dm_one)
+                  tmem_st_x4((dm_lane << 16) + self.dm_sfb_dv_col, dm_one, dm_one, dm_one, dm_one)
                   if const_expr(not self.acc_m64):
                       cute.arch.fence_view_async_tmem_store()
                   cute.arch.fence_view_async_shared()
@@ -5365,13 +5542,13 @@ class DMBackwardSm100:
                   else:
                       self.compute_sync_barrier.arrive_and_wait()
                   if const_expr(self.split_P_dS):
-                      dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                      fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                       with cute.arch.elect_one():
                           pipeline_P.producer_commit(producer_state_P)
                       producer_state_P.advance()
                   elif const_expr(self.cta_schedule != CtaSchedule.TWO_CTA_SERIAL):
                       # Signal tmem store P completion with pipeline_S_P
-                      dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                      fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                       with cute.arch.elect_one():
                           pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                           # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
@@ -5393,7 +5570,7 @@ class DMBackwardSm100:
                           cute.autovec_copy(tSsdPsum_cur, dm_dps_all[stage])
                   pipeline_dP.consumer_wait(consumer_state_S_P_dP)
                   if const_expr(dm_tr is not None):
-                      dm_now = dm_utils.clock32()
+                      dm_now = clock32()
                       dm_s5 = dm_s5 + (dm_now - dm_tprev)
                       dm_tprev = dm_now
                       self._tlev(dm_tr, iter_idx, 11, dm_tid == 0)
@@ -5436,8 +5613,8 @@ class DMBackwardSm100:
                                   dm_rs = aux_data.tensors[4]
                                   dm_off = cute.crd2idx((batch_idx, head_idx, dm_qg, 0), dm_rs.layout)
                                   dm_ad = dm_rs.iterator.toint() + 8 * dm_off
-                                  dm_utils.red_add_f64_from_f32(dm_ad, dm_ds)
-                                  dm_utils.red_add_f64_from_f32(dm_ad + 8, dm_utils.absf(dm_pd))
+                                  red_add_f64_from_f32(dm_ad, dm_ds)
+                                  red_add_f64_from_f32(dm_ad + 8, absf(dm_pd))
                                   if const_expr("pdump" in self.dm_opts):
                                       dm_pb = aux_data.tensors[5]
                                       dm_kg = dm_idx0[None, stage, 0, 0][i_][0]
@@ -5456,7 +5633,7 @@ class DMBackwardSm100:
                           if const_expr(self.dm_dsq and "apub2" in self.dm_opts):
                               # DM apub2: 4 independent 3-input max chains (short dependency chain), merged below
                               dm_dsm[v % 4] = utils.fmax(
-                                  dm_dsm[v % 4], dm_utils.absf(tdPrdP_cur[2 * v]), dm_utils.absf(tdPrdP_cur[2 * v + 1]))
+                                  dm_dsm[v % 4], absf(tdPrdP_cur[2 * v]), absf(tdPrdP_cur[2 * v + 1]))
                           elif const_expr(self.dm_dsq and "apub" in self.dm_opts):
                               # DM apub: per-thread |dS| max of this warp's half tile (exact; published below)
                               ds_amax = cute.arch.fmax(
@@ -5466,14 +5643,14 @@ class DMBackwardSm100:
                               pass   # DM dsq: the reduce warps take the tile amax
                           elif const_expr("dsamax" not in self.dm_abl and "amaxt" in self.dm_opts):
                               dm_dsm[v % 4] = utils.fmax(
-                                  dm_dsm[v % 4], dm_utils.absf(tdPrdP_cur[2 * v]), dm_utils.absf(tdPrdP_cur[2 * v + 1]))
+                                  dm_dsm[v % 4], absf(tdPrdP_cur[2 * v]), absf(tdPrdP_cur[2 * v + 1]))
                           elif const_expr("dsamax" not in self.dm_abl and "amax3" not in self.dm_opts):
                               ds_amax = cute.arch.fmax(
                                   ds_amax, cute.arch.fmax(utils_abs(tdPrdP_cur[2 * v]), utils_abs(tdPrdP_cur[2 * v + 1]))
                               )
                           elif const_expr("dsamax" not in self.dm_abl):
                               ds_amax = utils.fmax(
-                                  ds_amax, dm_utils.absf(tdPrdP_cur[2 * v]), dm_utils.absf(tdPrdP_cur[2 * v + 1])
+                                  ds_amax, absf(tdPrdP_cur[2 * v]), absf(tdPrdP_cur[2 * v + 1])
                               )
                   if const_expr("spf" in self.dm_opts and not self.split_P_dS):
                       # P(t) (in tSrS) is dead now: wait for S(t+1) (issued after P(t) was stored) and start its TMEM load
@@ -5484,9 +5661,9 @@ class DMBackwardSm100:
                       if const_expr("dsamax" not in self.dm_abl and "amaxt" in self.dm_opts):
                           ds_amax = utils.fmax(utils.fmax(dm_dsm[0], dm_dsm[1]), dm_dsm[2], dm_dsm[3])
                       # scale per (32 keys = this warp's lanes) x (128-query tile = both warpgroups)
-                      ds_amax = dm_utils.redux_max_abs_f32(ds_amax)
+                      ds_amax = redux_max_abs_f32(ds_amax)
                       if const_expr(dm_tr is not None):
-                          dm_now = dm_utils.clock32()
+                          dm_now = clock32()
                           dm_s6 = dm_s6 + (dm_now - dm_tprev)
                           dm_tprev = dm_now
                       dm_cw = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) - self.compute_warp_ids[0])
@@ -5500,18 +5677,18 @@ class DMBackwardSm100:
                       else:
                           self.compute_sync_barrier.arrive_and_wait()
                       if const_expr(dm_tr is not None):
-                          dm_now = dm_utils.clock32()
+                          dm_now = clock32()
                           dm_s7 = dm_s7 + (dm_now - dm_tprev)
                           dm_tprev = dm_now
                       for dm_j in cutlass.range_constexpr(1, len(self.compute_warp_ids) // 4):
                           ds_amax = cute.arch.fmax(ds_amax, sDm[(dm_cw + 4 * dm_j) % len(self.compute_warp_ids)])
-                      ds_sb = dm_utils.pow2_sb(ds_amax)
-                      ds_inv = dm_utils.inv_pow2_from_sb(ds_sb)
-                      dm_sfa_dk = [dm_utils.add_sb_clamp(ds_sb, dm_qsb[st]) for st in range(num_stages)]
-                      dm_sfb_dq = dm_utils.add_sb_clamp(ds_sb, dm_ksb)
+                      ds_sb = pow2_sb(ds_amax)
+                      ds_inv = inv_pow2_from_sb(ds_sb)
+                      dm_sfa_dk = [add_sb_clamp(ds_sb, dm_qsb[st]) for st in range(num_stages)]
+                      dm_sfb_dq = add_sb_clamp(ds_sb, dm_ksb)
                       if dm_cw < 4:
                           if cute.arch.lane_idx() == 0:
-                              dm_utils.st_shared_b32(dm_sdm + 4 * (16 + dm_cw), dm_sfb_dq)
+                              st_shared_b32(dm_sdm + 4 * (16 + dm_cw), dm_sfb_dq)
                       if const_expr("ilp2" in self.dm_opts and not self.acc_m64 and not self.dm_cwg4
                                     and self.use_2cta_instrs):
                           # ilp2: quantize every stage, store dS to TMEM (no sdS dependency), then wait for the sdS slot
@@ -5544,12 +5721,12 @@ class DMBackwardSm100:
                           tdPrdS_cvt.store(tdPrdSq.load().to(self.ds_dtype))
                           if const_expr(stage == 0):
                               if const_expr(dm_tr is not None):
-                                  dm_now = dm_utils.clock32()
+                                  dm_now = clock32()
                                   dm_s8 = dm_s8 + (dm_now - dm_tprev)
                                   dm_tprev = dm_now
                               pipeline_dS.producer_acquire(producer_state_dS)
                               if const_expr(dm_tr is not None):
-                                  dm_now = dm_utils.clock32()
+                                  dm_now = clock32()
                                   dm_s12 = dm_s12 + (dm_now - dm_tprev)
                                   dm_tprev = dm_now
                               if const_expr(self.use_2cta_instrs and not self.acc_m64):
@@ -5587,14 +5764,14 @@ class DMBackwardSm100:
                           # DM: dK SFA (per key row, per 32-query k-step) and constant SFB
                           for stage in cutlass.range_constexpr(num_stages):
                               dm_k = dm_qoff[stage]
-                              dm_utils.tmem_st_x1((dm_lane << 16) + self.dm_sfa_dk_col + dm_k * 4 + dm_lane // 32,
-                                                  dm_utils.bytes4_same(dm_sfa_dk[stage]))
-                          dm_utils.tmem_st_x4((dm_lane << 16) + self.dm_sfb_dk_col, dm_one, dm_one, dm_one, dm_one)
+                              tmem_st_x1((dm_lane << 16) + self.dm_sfa_dk_col + dm_k * 4 + dm_lane // 32,
+                                                  bytes4_same(dm_sfa_dk[stage]))
+                          tmem_st_x4((dm_lane << 16) + self.dm_sfb_dk_col, dm_one, dm_one, dm_one, dm_one)
                           cute.arch.fence_view_async_tmem_store()
 
                       if const_expr(self.use_2cta_instrs):
                           # use pipeline_dP to signal the dS store (TMEM, or SMEM with acc_m64)
-                          dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                          fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                           with cute.arch.elect_one():
                               pipeline_dP.consumer_release(consumer_state_S_P_dP)
                       consumer_state_S_P_dP.advance()
@@ -5618,36 +5795,36 @@ class DMBackwardSm100:
                           cute.arch.sync_warp()
                       else:
                           if const_expr(dm_tr is not None):
-                              dm_now = dm_utils.clock32()
+                              dm_now = clock32()
                               dm_s8 = dm_s8 + (dm_now - dm_tprev)
                               dm_tprev = dm_now
                           self.compute_sync_barrier.arrive_and_wait()
                       if const_expr(dm_tr is not None):
-                          dm_now = dm_utils.clock32()
+                          dm_now = clock32()
                           dm_s13 = dm_s13 + (dm_now - dm_tprev)
                           dm_tprev = dm_now
                       # DM: this CTA's 4 key-block dQ scale bytes -> one word, to self and to the peer CTA
                       if dm_tid == 0:
                           dm_slot = dm_t & 1
-                          dm_word = dm_utils.pack_bytes4(
-                              dm_utils.ld_shared_b32(dm_sdm + 4 * 16), dm_utils.ld_shared_b32(dm_sdm + 4 * 17),
-                              dm_utils.ld_shared_b32(dm_sdm + 4 * 18), dm_utils.ld_shared_b32(dm_sdm + 4 * 19))
-                          dm_utils.st_shared_b32(dm_sdm + 4 * (24 + dm_slot), dm_word)
-                          dm_utils.st_async_peer_b32(dm_sdm + 4 * (32 + dm_slot), dm_mbar + 8 * dm_slot,
+                          dm_word = pack_bytes4(
+                              ld_shared_b32(dm_sdm + 4 * 16), ld_shared_b32(dm_sdm + 4 * 17),
+                              ld_shared_b32(dm_sdm + 4 * 18), ld_shared_b32(dm_sdm + 4 * 19))
+                          st_shared_b32(dm_sdm + 4 * (24 + dm_slot), dm_word)
+                          st_async_peer_b32(dm_sdm + 4 * (32 + dm_slot), dm_mbar + 8 * dm_slot,
                                                      peer_cta_rank_in_cluster, dm_word)
-                          dm_utils.mbar_arrive_expect_tx(dm_mbar + 8 * dm_slot, 4)
+                          mbar_arrive_expect_tx(dm_mbar + 8 * dm_slot, 4)
                       dm_t = dm_t + 1
                       # Normally we'd need syncwarp here since only 1 thread will signal in
                       # consumer_release, but we already have the barrier or sync_warp before this
                       pipeline_dPsum.consumer_release(consumer_state_dPsum)
                       if const_expr(dm_tr is not None):
-                          dm_now = dm_utils.clock32()
+                          dm_now = clock32()
                           dm_s9 = dm_s9 + (dm_now - dm_tprev)
                           dm_tprev = dm_now
                       consumer_state_dPsum.advance()
                       # pipelined 2CTA schedule: pipeline_dS also signals S tmem load completion so is deferred
                       if const_expr(self.cta_schedule != CtaSchedule.TWO_CTA_PIPELINED):
-                          dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                          fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                           with cute.arch.elect_one():
                               pipeline_dS.producer_commit(producer_state_dS)
                           producer_state_dS.advance()
@@ -5680,17 +5857,17 @@ class DMBackwardSm100:
                       if const_expr("apub" in self.dm_opts):
                           # DM apub: warp max over its 32 keys x 64 queries -> sDm[40 + compute warp]; the helper warp of this
                           # TMEM lane quadrant takes the max of the two halves instead of re-loading dS (same scale, exact max)
-                          ds_amax = dm_utils.redux_max_abs_f32(ds_amax)
+                          ds_amax = redux_max_abs_f32(ds_amax)
                           dm_cwp = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - self.compute_warp_ids[0]
                           if cute.arch.lane_idx() == 0:
-                              dm_utils.st_shared_b32(dm_sdm + 4 * (40 + dm_cwp), dm_utils.bitcast_f32_i32(ds_amax))
+                              st_shared_b32(dm_sdm + 4 * (40 + dm_cwp), bitcast_f32_i32(ds_amax))
                       for stage in cutlass.range_constexpr(num_stages):
                           cute.copy(dm_thr_copy_r2t_f32, tdPrdP_all[stage], dm_tdPtdP_r2t_f32[None, stage, None, None])
                       cute.arch.fence_view_async_tmem_store()
-                      dm_utils.tc_fence_before()
+                      tcgen05_fence_before()
                       cute.arch.sync_warp()
                       if cute.arch.lane_idx() == 0:
-                          dm_utils.mbar_arrive(dm_mbar + 8 * 9)
+                          mbar_arrive(dm_mbar + 8 * 9)
                       self._tlev(dm_tr, iter_idx, 12, dm_tid == 0)
                       self._tlev(dm_tr, iter_idx, 13, dm_tid == 128)
                       consumer_state_S_P_dP.advance()
@@ -5702,7 +5879,7 @@ class DMBackwardSm100:
                 if process_tile:
                     self._dm_write_dq_sf(dm_t - 1, dm_sdm, dm_mbar, cta_rank_in_cluster)
                     cute.arch.fence_view_async_tmem_store()
-                    dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                    fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                     with cute.arch.elect_one():
                         pipeline_dS.producer_commit(producer_state_dS)
                     producer_state_dS.advance()
@@ -5712,23 +5889,23 @@ class DMBackwardSm100:
                 if dm_tid == 0:
                     dm_bid = cute.arch.block_idx()[0]
                     dm_tb = dm_tr.iterator.toint() + 8 * (64 + (8 if const_expr("tl2" in self.dm_opts) else 4) * dm_bid)
-                    dm_utils.red_add_u64(dm_tb, dm_tl0)
-                    dm_utils.red_add_u64(dm_tb + 8, dm_utils.globaltimer())
-                    dm_utils.red_add_u64(dm_tb + 16, Int64(dm_utils.smid()))
-                    dm_utils.red_add_u64(dm_tb + 24, Int64(m_block_max - m_block_min))
+                    red_add_u64(dm_tb, dm_tl0)
+                    red_add_u64(dm_tb + 8, globaltimer())
+                    red_add_u64(dm_tb + 16, Int64(smid()))
+                    red_add_u64(dm_tb + 24, Int64(m_block_max - m_block_min))
             if const_expr(dm_tr is not None):
                 for wg_ in range(2 if const_expr("noflush" not in self.dm_opts) else 0):
                     if dm_tid == 128 * wg_:
                         dm_vals = (dm_s0, dm_s1, dm_s2, dm_s3, dm_s4, dm_s5, dm_s6, dm_s7, dm_s8, dm_s9)
                         if wg_ == 0:
-                            dm_utils.red_add_u64(dm_tr.iterator.toint() + 8 * 40, Int64(dm_s10))
-                            dm_utils.red_add_u64(dm_tr.iterator.toint() + 8 * 41, Int64(dm_s11))
-                            dm_utils.red_add_u64(dm_tr.iterator.toint() + 8 * 42, Int64(dm_s12))
-                            dm_utils.red_add_u64(dm_tr.iterator.toint() + 8 * 43, Int64(dm_s13))
+                            red_add_u64(dm_tr.iterator.toint() + 8 * 40, Int64(dm_s10))
+                            red_add_u64(dm_tr.iterator.toint() + 8 * 41, Int64(dm_s11))
+                            red_add_u64(dm_tr.iterator.toint() + 8 * 42, Int64(dm_s12))
+                            red_add_u64(dm_tr.iterator.toint() + 8 * 43, Int64(dm_s13))
                         if const_expr("flushconst" in self.dm_opts):
                             dm_vals = tuple(Int64(1) for _ in range(10))
                         for k_, a_ in enumerate(dm_vals):
-                            dm_utils.red_add_u64(dm_tr.iterator.toint() + 8 * (16 + 10 * wg_ + k_), Int64(a_))
+                            red_add_u64(dm_tr.iterator.toint() + 8 * (16 + 10 * wg_ + k_), Int64(a_))
                 dm_s0, dm_s1, dm_s2, dm_s3, dm_s4 = Int32(0), Int32(0), Int32(0), Int32(0), Int32(0)
                 dm_s5, dm_s6, dm_s7, dm_s8, dm_s9 = Int32(0), Int32(0), Int32(0), Int32(0), Int32(0)
                 dm_s10, dm_s11, dm_s12, dm_s13 = Int32(0), Int32(0), Int32(0), Int32(0)
@@ -5810,8 +5987,8 @@ class DMBackwardSm100:
                     )
             if const_expr(dm_tr is not None and "tl2" in self.dm_opts):
                 if dm_tid == 0:
-                    dm_utils.red_add_u64(dm_tr.iterator.toint() + 8 * (64 + 8 * cute.arch.block_idx()[0] + 5),
-                                         dm_utils.globaltimer())
+                    red_add_u64(dm_tr.iterator.toint() + 8 * (64 + 8 * cute.arch.block_idx()[0] + 5),
+                                         globaltimer())
             if const_expr(self.dm_pers > 0 and not self.dm_dkvdir):
                 # DM pers: every compute thread's bulk stores have finished READING sdK/sdV (= sK/sV), then one
                 # arrival per tile lets the load warp bring in the next tile's K/V
@@ -5985,22 +6162,22 @@ class DMBackwardSm100:
         """DM dsq: quantize dS of one m_block (the reduce warps' share of compute_loop's dS phase, same values)."""
         lane_base = q * 32
         # fp32 dS of this tile stored by every compute warp
-        dm_utils.mbar_wait_parity(dm_mbar + 8 * 9, dsq_j & 1)
-        dm_utils.tc_fence_after()
+        mbar_wait_parity(dm_mbar + 8 * 9, dsq_j & 1)
+        tcgen05_fence_after()
         if const_expr(dm_tr is not None):
             self._tlev(dm_tr, dsq_j, 16, tidx == 0)
         # scales: query blocks of the 4 (half, stage) chunks, key block of this warp (hoisted per tile like compute)
         dm_idx = [dsq[h][0].partition_D(self._cluster_S_coords(thr_mma_S, work_n, 0)) for h in range(2)]
         dm_kv_blk = dm_idx[0][0][0] // 32
         dm_kv_blk = cutlass.min(dm_kv_blk, (seqlen.seqlen_k + 31) // 32 - 1)
-        dm_ksb = dm_utils.pow2_exponent_byte(Float32(aux_data.tensors[1][batch_idx, kv_head, dm_kv_blk]))
+        dm_ksb = pow2_exponent_byte(Float32(aux_data.tensors[1][batch_idx, kv_head, dm_kv_blk]))
         nst = cute.size(dsq[0][2], mode=[1])
         # pass 1: tile amax over this warp's 32 keys x all 128 queries (max is exact: same scale byte as the 2-warp exchange)
         ds_amax = Float32(0.0)
         if const_expr("apub" in self.dm_opts):
             # DM apub: the two compute warps of this lane quadrant published their half-tile maxima (ordered by mbar 9)
-            ds_amax = cute.arch.fmax(dm_utils.bitcast_i32_f32(dm_utils.ld_shared_b32(dm_sdm + 4 * (40 + q))),
-                                     dm_utils.bitcast_i32_f32(dm_utils.ld_shared_b32(dm_sdm + 4 * (44 + q))))
+            ds_amax = cute.arch.fmax(bitcast_i32_f32(ld_shared_b32(dm_sdm + 4 * (40 + q))),
+                                     bitcast_i32_f32(ld_shared_b32(dm_sdm + 4 * (44 + q))))
         for h in cutlass.range_constexpr(0 if const_expr("apub" in self.dm_opts) else 2):
             for st in cutlass.range_constexpr(nst):
                 frag = cute.make_rmem_tensor(dsq[h][2][None, 0, None, None].shape, Float32)
@@ -6010,12 +6187,12 @@ class DMBackwardSm100:
                 for v in cutlass.range_constexpr(cute.size(fv) // 2):
                     ds_amax = cute.arch.fmax(ds_amax, cute.arch.fmax(utils_abs(fv[2 * v]), utils_abs(fv[2 * v + 1])))
         if const_expr("apub" not in self.dm_opts):
-            ds_amax = dm_utils.redux_max_abs_f32(ds_amax)
-        ds_sb = dm_utils.pow2_sb(ds_amax)
-        ds_inv = dm_utils.inv_pow2_from_sb(ds_sb)
-        dm_sfb_dq = dm_utils.add_sb_clamp(ds_sb, dm_ksb)
+            ds_amax = redux_max_abs_f32(ds_amax)
+        ds_sb = pow2_sb(ds_amax)
+        ds_inv = inv_pow2_from_sb(ds_sb)
+        dm_sfb_dq = add_sb_clamp(ds_sb, dm_ksb)
         if cute.arch.lane_idx() == 0:
-            dm_utils.st_shared_b32(dm_sdm + 4 * (16 + q), dm_sfb_dq)
+            st_shared_b32(dm_sdm + 4 * (16 + q), dm_sfb_dq)
         # pass 2: re-load, scale, e4m3 (codes kept in registers until every fp32 read of the dP region is done)
         codes = [[None] * nst, [None] * nst]
         for h in cutlass.range_constexpr(2):
@@ -6039,14 +6216,14 @@ class DMBackwardSm100:
         for h in cutlass.range_constexpr(2):
             for st in cutlass.range_constexpr(nst):
                 qoff = dm_idx[h][None, st, 0, 0][0][1] // 32
-                qsb = dm_utils.pow2_exponent_byte(
+                qsb = pow2_exponent_byte(
                     Float32(aux_data.tensors[0][batch_idx, head_idx, m_block * (self.tile_m // 32) + qoff]))
-                dm_utils.tmem_st_x1((lane_base << 16) + self.dm_sfa_dk_col + qoff * 4 + q,
-                                    dm_utils.bytes4_same(dm_utils.add_sb_clamp(ds_sb, qsb)))
+                tmem_st_x1((lane_base << 16) + self.dm_sfa_dk_col + qoff * 4 + q,
+                                    bytes4_same(add_sb_clamp(ds_sb, qsb)))
         dm_one = Int32(0x7F7F7F7F)
-        dm_utils.tmem_st_x4((lane_base << 16) + self.dm_sfb_dk_col, dm_one, dm_one, dm_one, dm_one)
+        tmem_st_x4((lane_base << 16) + self.dm_sfb_dk_col, dm_one, dm_one, dm_one, dm_one)
         cute.arch.fence_view_async_tmem_store()
-        dm_utils.tc_fence_before()
+        tcgen05_fence_before()
         cute.arch.sync_warp()
         with cute.arch.elect_one():
             pipeline_dP.consumer_release(dsq_dP_state)
@@ -6071,12 +6248,12 @@ class DMBackwardSm100:
         peer = cta_rank ^ 1
         if tidx == 0:
             slot = dsq_j & 1
-            word = dm_utils.pack_bytes4(
-                dm_utils.ld_shared_b32(dm_sdm + 4 * 16), dm_utils.ld_shared_b32(dm_sdm + 4 * 17),
-                dm_utils.ld_shared_b32(dm_sdm + 4 * 18), dm_utils.ld_shared_b32(dm_sdm + 4 * 19))
-            dm_utils.st_shared_b32(dm_sdm + 4 * (24 + slot), word)
-            dm_utils.st_async_peer_b32(dm_sdm + 4 * (32 + slot), dm_mbar + 8 * slot, peer, word)
-            dm_utils.mbar_arrive_expect_tx(dm_mbar + 8 * slot, 4)
+            word = pack_bytes4(
+                ld_shared_b32(dm_sdm + 4 * 16), ld_shared_b32(dm_sdm + 4 * 17),
+                ld_shared_b32(dm_sdm + 4 * 18), ld_shared_b32(dm_sdm + 4 * 19))
+            st_shared_b32(dm_sdm + 4 * (24 + slot), word)
+            st_async_peer_b32(dm_sdm + 4 * (32 + slot), dm_mbar + 8 * slot, peer, word)
+            mbar_arrive_expect_tx(dm_mbar + 8 * slot, 4)
             stage_copy_bytes = const_expr(self.tma_copy_bytes["dS"] // 2)
             stage_copy_elems = const_expr(stage_copy_bytes // (self.ds_dtype.width // 8))
             cute.arch.mbarrier_arrive_and_expect_tx(
@@ -6088,13 +6265,13 @@ class DMBackwardSm100:
             self._tlev(dm_tr, dsq_j, 20, tidx == 0)
         # pipeline_dS(t): dQ(t) overwrites the S tail -> every compute warp must have loaded S(t+1) first
         if not dsq_last:
-            dm_utils.mbar_wait_parity(dm_mbar + 8 * 10, dsq_sr & 1)
-            dm_utils.tc_fence_after()
+            mbar_wait_parity(dm_mbar + 8 * 10, dsq_sr & 1)
+            tcgen05_fence_after()
         if const_expr(dm_tr is not None):
             self._tlev(dm_tr, dsq_j, 21, tidx == 0)
         self._dm_write_dq_sf(dsq_j, dm_sdm, dm_mbar, cta_rank)
         cute.arch.fence_view_async_tmem_store()
-        dm_utils.tc_fence_before()
+        tcgen05_fence_before()
         cute.arch.sync_warp()
         with cute.arch.elect_one():
             pipeline_dS.producer_commit(dsq_dS_state)
@@ -6106,7 +6283,7 @@ class DMBackwardSm100:
         """DM tlev: record clock64 of event e of tile j (j < 64) for CTA self.dm_tlev (one thread: pred and lane 0)."""
         if const_expr(dm_tr is not None and self.dm_tlev >= 0):
             if pred and cute.arch.lane_idx() == 0 and cute.arch.block_idx()[0] == self.dm_tlev and cute.arch.block_idx()[1] == 0 and cute.arch.block_idx()[2] == 0 and j < 64:
-                dm_utils.red_add_u64(dm_tr.iterator.toint() + 8 * (40000 + 32 * j + e), dm_utils.clock64())
+                red_add_u64(dm_tr.iterator.toint() + 8 * (40000 + 32 * j + e), clock64())
 
     def _dm_setmaxreg_dec(self, n: int):
         if not self.dm_noreg:   # trace-time python
@@ -6199,9 +6376,9 @@ class DMBackwardSm100:
                             if lock == nmax - 1:
                                 srow = mdQ_semaphore.iterator.toint() + Int64(4) * Int64(((batch_idx * nh + hq) * mt + m) * ns)
                                 for r in cutlass.range_constexpr(2):
-                                    dm_utils.poll_acquire_ge_or_trap(srow + Int64(4 * r), nmax, Int32(1 << 26))
-                                pos = dm_utils.atom_add_relaxed_gpu_s32(base, Int32(1))
-                                dm_utils.st_relaxed_gpu_s32(base + Int64(4) * Int64(1 + pos), (batch_idx * nh + hq) * mt + m + 1)
+                                    poll_acquire_ge_or_trap(srow + Int64(4 * r), nmax, Int32(1 << 26))
+                                pos = atom_add_relaxed_gpu_s32(base, Int32(1))
+                                st_relaxed_gpu_s32(base + Int64(4) * Int64(1 + pos), (batch_idx * nh + hq) * mt + m + 1)
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
 
@@ -6449,7 +6626,7 @@ class DMBackwardSm100:
                             )
                             if const_expr("dqearly" not in self.dm_opts and "dqnone" not in self.dm_abl and "nodqw" not in self.dm_abl):
                                 if const_expr(dm_trw is not None):
-                                    dm_w0 = dm_utils.globaltimer()
+                                    dm_w0 = globaltimer()
                                 if const_expr(dm_tlv is not None):
                                     self._tlev(dm_tlv, iter_idx, 24, tidx == 0)
                                 barrier.wait_eq(
@@ -6463,8 +6640,8 @@ class DMBackwardSm100:
                                 if const_expr(dm_trw is not None):
                                     # DM semw (instrumentation): dQ semaphore wait ns / count -> trace header [44], [45]
                                     if tidx == 0:
-                                        dm_utils.red_add_u64(dm_trw, dm_utils.globaltimer() - dm_w0)
-                                        dm_utils.red_add_u64(dm_trw + 8, Int64(1))
+                                        red_add_u64(dm_trw, globaltimer() - dm_w0)
+                                        red_add_u64(dm_trw + 8, Int64(1))
                             if const_expr(self.dm_fws):
                                 # DM fws: the first writer in the deterministic order stores instead of adding, so
                                 # dq_accum needs no zero-fill (dense causal / non-causal: lock 0 always exists per m_block)
@@ -6482,7 +6659,7 @@ class DMBackwardSm100:
                         cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
                         cute.arch.fence_view_async_tmem_load()
                         cute.arch.sync_warp()
-                        dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                        fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                         with cute.arch.elect_one():
                             pipeline_dQ.consumer_release(dQ_consumer_state)
                         dQ_consumer_state.advance()
@@ -6522,15 +6699,15 @@ class DMBackwardSm100:
                                     dm_c = tdQrdQ[4 * dm_k + 2, dm_st]
                                     dm_d = tdQrdQ[4 * dm_k + 3, dm_st]
                                     if dm_first:
-                                        dm_utils.st_v4_f32(dm_ptr, dm_a, dm_b, dm_c, dm_d)
+                                        st_v4_f32(dm_ptr, dm_a, dm_b, dm_c, dm_d)
                                     else:
-                                        dm_utils.red_add_v4_f32(dm_ptr, dm_a, dm_b, dm_c, dm_d)
-                        dm_utils.fence_acq_rel_gpu()
+                                        red_add_v4_f32(dm_ptr, dm_a, dm_b, dm_c, dm_d)
+                        fence_acq_rel_gpu()
                         self.reduce_sync_barrier.arrive_and_wait()
                         if const_expr(self.deterministic and delay_semaphore_release):
                             if not release_now and m_block > m_block_min:
                                 if const_expr(self.dm_tcfence):
-                                    dm_utils.fence_proxy_async_global()
+                                    fence_proxy_async_global()
                                 barrier.arrive_inc_async(
                                     mdQ_semaphore_cur[(m_block - 1, None)].iterator,
                                     tidx,
@@ -6548,7 +6725,7 @@ class DMBackwardSm100:
                             cute.arch.fence_view_async_tmem_load()
                             if const_expr(dm_ts == cute.size(tdQrdQ_t2r_shape, mode=[1]) - 1):
                                 cute.arch.sync_warp()
-                                dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+                                fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
                                 with cute.arch.elect_one():
                                     pipeline_dQ.consumer_release(dQ_consumer_state)
                                 dQ_consumer_state.advance()
@@ -6576,7 +6753,7 @@ class DMBackwardSm100:
                         if is_tma_warp and not m_block_oob_upper and not dm_last and const_expr("dqtma" not in self.dm_abl):
                             with cute.arch.elect_one():
                                 if dm_first:
-                                    dm_utils.cpasync_bulk_store_s2g(
+                                    cpasync_bulk_store_s2g(
                                         sdQaccum[None, smem_idx].iterator,
                                         gdQaccum_cur[None, stage + stage_offset].iterator,
                                         self.tma_copy_bytes["dQ"] // 1,
@@ -6606,7 +6783,7 @@ class DMBackwardSm100:
                         if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
                             if not release_now and m_block > m_block_min:
                                 if const_expr(self.dm_tcfence):
-                                    dm_utils.fence_proxy_async_global()
+                                    fence_proxy_async_global()
                                 barrier.arrive_inc_async(
                                     mdQ_semaphore_cur[(m_block - 1, None)].iterator,
                                     tidx,
@@ -6637,7 +6814,7 @@ class DMBackwardSm100:
                     if const_expr(self.deterministic):
                         if release_now and not m_block_oob_upper:
                             if const_expr(self.dm_tcfence):
-                                dm_utils.fence_proxy_async_global()
+                                fence_proxy_async_global()
                             barrier.arrive_inc_async(
                                 mdQ_semaphore_cur[m_block, None].iterator,
                                 tidx,
@@ -6653,7 +6830,7 @@ class DMBackwardSm100:
                     if const_expr(self.deterministic and delay_semaphore_release):
                         if not release_now:
                             if const_expr(self.dm_tcfence):
-                                dm_utils.fence_proxy_async_global()
+                                fence_proxy_async_global()
                             barrier.arrive_inc_async(
                                 mdQ_semaphore_cur[(m_block_max - 1, None)].iterator,
                                 tidx,
@@ -6670,7 +6847,7 @@ class DMBackwardSm100:
                     m_block_global_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
                     for m_block in cutlass.range(m_block_max, m_block_global_max, unroll=1):
                         if const_expr(self.dm_tcfence):
-                            dm_utils.fence_proxy_async_global()
+                            fence_proxy_async_global()
                         barrier.arrive_inc(
                             mdQ_semaphore_cur[(m_block, None)].iterator, tidx, cta_rank_in_cluster, 1
                         )
@@ -6790,7 +6967,7 @@ class DMBackwardSm100:
             cute.copy(tiled_gmem_store_dV, tdVrdV_r2s, tdVgdV_r2g, pred=tdVpdV)
 
         cute.arch.sync_warp()
-        dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+        fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
         with cute.arch.elect_one():
             pipeline_dKV.consumer_release(consumer_state_dKV)
         consumer_state_dKV.advance()
@@ -6849,7 +7026,7 @@ class DMBackwardSm100:
             cute.copy(tiled_gmem_store_dK, tdKrdK_r2s, tdKgdK_r2g, pred=tdKpdK)
 
         cute.arch.sync_warp()
-        dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+        fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
         with cute.arch.elect_one():
             pipeline_dKV.consumer_release(consumer_state_dKV)
         consumer_state_dKV.advance()   # DM: needed once a CTA runs >1 tile (pers); no-op for a single tile
@@ -7053,11 +7230,11 @@ class DMBackwardSm100:
                 self.compute_sync_barrier.arrive_and_wait()
             if const_expr(deterministic_KV):
                 if const_expr(self.dm_tcfence):
-                    dm_utils.fence_proxy_async_global()
+                    fence_proxy_async_global()
                 barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx_cta, 0, 1)
 
         cute.arch.sync_warp()
-        dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+        fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
         with cute.arch.elect_one():
             pipeline_dKV.consumer_release(consumer_state_dKV)
         consumer_state_dKV.advance()
@@ -7188,7 +7365,7 @@ class DMBackwardSm100:
         pipeline_dKV.consumer_wait(consumer_state_dKV)
         if const_expr(dm_tlp is not None):
             if tidx == 0:
-                dm_utils.red_add_u64(dm_tlp, dm_utils.globaltimer())
+                red_add_u64(dm_tlp, globaltimer())
 
         # semaphore acquire
         dm_kv_first = cutlass.Boolean(False)
@@ -7196,7 +7373,7 @@ class DMBackwardSm100:
             dm_kv_pos = bwd_kv_group_pos(head_idx, qhead_per_kvhead=self.qhead_per_kvhead)
             if const_expr("nodkvw" not in self.dm_abl):
                 if const_expr(dm_tsw is not None):
-                    dm_w0 = dm_utils.globaltimer()
+                    dm_w0 = globaltimer()
                 barrier.wait_eq(
                     mdKV_semaphore_cur.iterator,
                     tidx,
@@ -7206,12 +7383,12 @@ class DMBackwardSm100:
                 if const_expr(dm_tsw is not None):
                     # DM semw (instrumentation): dK/dV semaphore wait ns / count (per WG) -> trace header [46], [47]
                     if tidx == 0:
-                        dm_utils.red_add_u64(dm_tsw, dm_utils.globaltimer() - dm_w0)
-                        dm_utils.red_add_u64(dm_tsw + 8, Int64(1))
+                        red_add_u64(dm_tsw, globaltimer() - dm_w0)
+                        red_add_u64(dm_tsw + 8, Int64(1))
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
             if const_expr(dm_tlp is not None):
                 if tidx == 0:
-                    dm_utils.red_add_u64(dm_tlp + 8, dm_utils.globaltimer())
+                    red_add_u64(dm_tlp + 8, globaltimer())
             if const_expr(self.dm_fws):
                 dm_kv_first = dm_kv_pos == 0   # DM fws: first q head of the group stores (no dK/dV accum zero-fill)
 
@@ -7262,7 +7439,7 @@ class DMBackwardSm100:
                 else:
                     with cute.arch.elect_one():
                         if dm_kv_first:
-                            dm_utils.cpasync_bulk_store_s2g(
+                            cpasync_bulk_store_s2g(
                                 sdKV.iterator,
                                 gdKV_epi[None, epi_stage].iterator,
                                 self.tma_copy_bytes["dKacc"],
@@ -7297,11 +7474,11 @@ class DMBackwardSm100:
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
             if const_expr(self.dm_tcfence):
-                dm_utils.fence_proxy_async_global()
+                fence_proxy_async_global()
             barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
 
         cute.arch.sync_warp()
-        dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+        fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
         with cute.arch.elect_one():
             pipeline_dKV.consumer_release(consumer_state_dKV)
         consumer_state_dKV.advance()

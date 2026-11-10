@@ -10,9 +10,10 @@ import flash_attn.cute.interface as fi
 from flash_attn.cute import cache_utils
 
 from .dm_bwd_sm100 import DMBackwardSm100
-from .fwd import _fingerprint, compile_env
-from . import fastpath
-_env = fastpath.env
+from .compile_cache_sm100 import compile_env, fingerprint
+from . import launch_cache_sm100
+from delta_matching.sm100.attention_math_sm100 import b6_m
+_env = launch_cache_sm100.env
 
 LOG2E = math.log2(math.e)
 
@@ -28,10 +29,10 @@ def _dm_bwd_cache():
     if mk not in _CACHES:
         if cache_utils.CUTE_DSL_CACHE_ENABLED:
             _CACHES[mk] = cache_utils.JITPersistentCache(
-                cache_utils.get_cache_path() / "dm_sm100" / _fingerprint(opts) / "bwd")
+                cache_utils.get_cache_path() / "dm_sm100" / fingerprint(opts) / "bwd")
         else:
             _CACHES[mk] = cache_utils.JITCache()
-        _CACHES[mk] = fastpath.RecCache(_CACHES[mk])
+        _CACHES[mk] = launch_cache_sm100.RecCache(_CACHES[mk])
     return _CACHES[mk]
 
 
@@ -94,9 +95,8 @@ def _auto_opts_impl(q8, k8, causal=False):
     in TMEM, stored once). Long causal sequences lose (4x longer tiles -> tail), so only N <= gloopN (default 4096).
     'nogloop' disables, 'gloop' forces."""
     ol = [o for o in _env("DM_BWD_OPTS", "").split(",") if o]
-    from . import dm_common
-    if dm_common.b6_m() > 0 and not any(o.startswith("b6=") for o in ol):
-        ol = ol + [f"b6={dm_common.b6_m()}"]   # same DM_B6 as pass 0 (bitwise-identical P)
+    if b6_m() > 0 and not any(o.startswith("b6=") for o in ol):
+        ol = ol + [f"b6={b6_m()}"]   # same DM_B6 as pass 0 (bitwise-identical P)
     # DM dsqw: dS tile amax / scale / e4m3 / stores / exchange on a dedicated warpgroup (bitwise);
     # 'nodsqw' disables. Not combined with the layouts it does not support.
     if "nodsqw" not in ol and not any(o in ol for o in ("dsq", "dsqw", "cwg4", "ilp2", "early_dq")):
@@ -154,7 +154,7 @@ def dm_bwd_prestage(q8, k8, lse, causal: bool, deterministic=True):
     if rec is None or _env("DM_E2E", "1") == "0":
         return False
     dev = q8.device.index
-    if fastpath.ENABLED:
+    if launch_cache_sm100.ENABLED:
         f = _PFAST.get((key, torch._C._cuda_getCurrentRawStream(dev)))
         if f is not None:
             f(lse)
@@ -179,7 +179,7 @@ def dm_bwd_prestage(q8, k8, lse, causal: bool, deterministic=True):
     for t in pool:
         t.record_stream(main)
     _CTX["staged"] = (key, pool, ev, main)
-    if fastpath.ENABLED:
+    if launch_cache_sm100.ENABLED:
         _PFAST[(key, main.cuda_stream)] = _reuse_fn(key, rec, pool, main, side, N, deterministic)
     return True
 
@@ -375,7 +375,7 @@ def dm_bwd_main(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal: bool, sm: 
     key = _key(q8, k8, causal, deterministic)
     st = _CTX.pop("staged", None)
     lse_c = lse.contiguous()
-    if (st is not None and st[0] == key and trace is None and fastpath.ENABLED and "lwc" not in _ao.split(",")
+    if (st is not None and st[0] == key and trace is None and launch_cache_sm100.ENABLED and "lwc" not in _ao.split(",")
             and "pdyn" not in _ao.split(",")):
         pool, ev, mst = st[1], st[2], st[3]
         N = lse.shape[-1]
@@ -392,12 +392,12 @@ def dm_bwd_main(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal: bool, sm: 
             opts0_ = _env("DM_BWD_OPTS", "")
             os.environ["DM_BWD_OPTS"] = _ao
             pc = fi._bwd_postprocess_convert.compile_cache
-            fi._bwd_postprocess_convert.compile_cache = fastpath.RecCache(pc)
+            fi._bwd_postprocess_convert.compile_cache = launch_cache_sm100.RecCache(pc)
             from . import tailconv as _tc       # rw8k tconv: record the converter launches too
             if _tc._CACHE is None:
                 _tc._CACHE = _tc._cache()
             tcc = _tc._CACHE
-            _tc._CACHE = fastpath.RecCache(tcc)
+            _tc._CACHE = launch_cache_sm100.RecCache(tcc)
             try:
                 r = _dm_flash_attn_bwd(q8, k8, v8, do8, do8, lse_c, softmax_scale=sm, causal=causal,
                                        deterministic=deterministic, aux_tensors=aux)[:3]
@@ -414,7 +414,7 @@ def dm_bwd_main(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal: bool, sm: 
             s2 = _CTX.pop("staged")
             mst.wait_event(s2[2])
 
-        return fastpath.call("bwd", inp, (key, _ao, float(sm), bool(deterministic), compile_env()), slow, pre=pre, reset=reset,
+        return launch_cache_sm100.call("bwd", inp, (key, _ao, float(sm), bool(deterministic), compile_env()), slow, pre=pre, reset=reset,
                              loose=() if deterministic else ((0, 1, 2) if q8.shape[2] > k8.shape[2] else (0,)))   # nd: dQ unordered; dK/dV only for GQA (MHA nd dK/dV stay bitwise)
     opts0 = _env("DM_BWD_OPTS", "")
     os.environ["DM_BWD_OPTS"] = _ao     # kernel knobs + compile cache follow the effective opts

@@ -37,7 +37,10 @@ from flash_attn.cute.paged_kv import PagedKVManager, resolve_paged_token
 from flash_attn.cute.tensormap_utils import acquire_tensormap, bound_rows, cta_tensormap_slot
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
-from delta_matching.sm100 import dm_utils, dm_common
+from delta_matching.sm100.attention_math_sm100 import LOG2E, P_PAIR_VARIANTS, dm_bwd_c, dm_bwd_dp_scale, dm_bwd_p_pair, dm_bwd_p_pair_mix, dm_bwd_p_pair_poly, dm_bwd_p_pair_poly5, dm_bwd_p_pair_poly6, is_static_mix, p5_uses_poly
+from delta_matching.sm100.cute_ptx_sm100 import bitcast_i32_f32, ceil_f32, clock32, f32_is_subnormal, f32_to_f64_exact, f32_to_f64_fastpath, floor_f32, red_add_u64, tmem_ld_16x64b_x16, tmem_ld_16x64b_x32
+from delta_matching.sm100.fp8_e8m0_scale_sm100 import exp2i_f32, pack_bytes4, pow2_exponent_byte, ue8m0_byte
+from delta_matching.sm100.tcgen05_fence_sm100 import FenceSkipSite, begin_kernel_fences, end_kernel_fences, fence_warp_relay, mark_fenced
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
@@ -279,7 +282,7 @@ class DMPass0Sm100:
         self.dm_f64 = "f64" in _fl0 or "f64x" in _fl0 or "f64y" in _fl0 or any(f.startswith("f64k") for f in _fl0)
         # +f64k<K>: flush the fp32 partials into the fp64 sums only every K tiles (and on the last tile)
         self.dm_f64k = next((int(f[4:]) for f in _fl0 if f.startswith("f64k")), 1)
-        # +f64x: exact fp32->fp64 conversion on the ALU/FP64 pipes (dm_utils.f32_to_f64_exact) instead of F2F, which
+        # +f64x: exact fp32->fp64 conversion on the ALU/FP64 pipes (f32_to_f64_exact) instead of F2F, which
         # issues on the XU pipe shared with MUFU ex2 (pass 0 is MUFU-bound): bitwise the same values as Float64(x)
         self.dm_f64x = "f64x" in _fl0
         self.dm_f64y = "f64y" in _fl0   # ALU bit path + rare F2F branch for subnormals (bitwise = Float64(x))
@@ -1000,7 +1003,7 @@ class DMPass0Sm100:
         using tensor memory access (TMA) for efficient data loading, warp specialization for different
         computation phases, and optional attention masking.
         """
-        dm_utils.tcf_begin(0 if "ntcf" in self.dm_exp_variant.split("+")[1:] else 2 if "tcfb" in self.dm_exp_variant.split("+")[1:] else 1)   # tcgen05 thread-sync fences (dm_utils.TCF)
+        begin_kernel_fences(0 if "ntcf" in self.dm_exp_variant.split("+")[1:] else 2 if "tcfb" in self.dm_exp_variant.split("+")[1:] else 1)   # tcgen05 thread-sync fences (FENCE_MODE)
 
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1196,10 +1199,10 @@ class DMPass0Sm100:
             )
 
 
-        # mark the tcgen05 hand-off pipelines / barriers (dm_utils.tcf_mark)
-        dm_utils.tcf_mark("ua", pipeline_s_p_o, pipeline_o_acc)
-        dm_utils.tcf_mark("au", pipeline_p_lastsplit)
-        dm_utils.tcf_mark("bar", sm_stats_barrier, tmem_alloc_barrier)
+        # mark the tcgen05 hand-off pipelines / barriers (mark_fenced)
+        mark_fenced("ua", pipeline_s_p_o, pipeline_o_acc)
+        mark_fenced("au", pipeline_p_lastsplit)
+        mark_fenced("bar", sm_stats_barrier, tmem_alloc_barrier)
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
 
@@ -1569,7 +1572,7 @@ class DMPass0Sm100:
             )
             tmem_alloc_barrier.arrive_unaligned()
 
-        dm_utils.tcf_end()
+        end_kernel_fences()
         return
 
     @cute.jit
@@ -2239,10 +2242,10 @@ class DMPass0Sm100:
             rowc = cutlass.min(row, seqlen.seqlen_q - 1)
             qsv = Float32(aux[0][batch_idx, head_idx, rowc // 32])
             dosv = Float32(aux[3][batch_idx, head_idx, rowc // 32])
-            l2 = Float32(aux[5][batch_idx, head_idx, rowc]) * Float32(dm_common.LOG2E)
+            l2 = Float32(aux[5][batch_idx, head_idx, rowc]) * Float32(LOG2E)
             if const_expr(self.dm_tr):
                 tr_s = [Int32(0) for _ in range(6)]
-                tr_prev = dm_utils.clock32()
+                tr_prev = clock32()
             num = (Float32(0.0), Float32(0.0))
             den = (Float32(0.0), Float32(0.0))
             den1 = (Float32(0.0), Float32(0.0))
@@ -2278,23 +2281,23 @@ class DMPass0Sm100:
                     if const_expr(self.dm_pf):
                         # +pf: this tile's raw scales were loaded one iteration ago; issue the next tile's now
                         for j in cutlass.range_constexpr(nc):
-                            cs[j] = dm_common.dm_bwd_c(pks[j], qsv)
-                            as_[j] = dm_common.dm_bwd_dp_scale(pvs[j], dosv)
+                            cs[j] = dm_bwd_c(pks[j], qsv)
+                            as_[j] = dm_bwd_dp_scale(pvs[j], dosv)
                         nbn = cutlass.max(n_block - 1, n_block_min) * (self.n_block_size // 32)
                         pks = tuple(Float32(aux[1][batch_idx, kv_head_idx, nbn + j]) for j in range(4))
                         pvs = tuple(Float32(aux[2][batch_idx, kv_head_idx, nbn + j]) for j in range(4))
                     else:
                         for j in cutlass.range_constexpr(nc):
                             kb = n_block * (self.n_block_size // 32) + ((j + rot) % n_chunks if const_expr(_r3m(self.dm_exp_variant) > 0) else j)
-                            cs[j] = dm_common.dm_bwd_c(Float32(aux[1][batch_idx, kv_head_idx, kb]), qsv)
-                            as_[j] = dm_common.dm_bwd_dp_scale(Float32(aux[2][batch_idx, kv_head_idx, kb]), dosv)
+                            cs[j] = dm_bwd_c(Float32(aux[1][batch_idx, kv_head_idx, kb]), qsv)
+                            as_[j] = dm_bwd_dp_scale(Float32(aux[2][batch_idx, kv_head_idx, kb]), dosv)
                     if const_expr(self.dm_tr):
-                        tr_now = dm_utils.clock32()
+                        tr_now = clock32()
                         tr_s[0] = tr_s[0] + (tr_now - tr_prev)
                         tr_prev = tr_now
                     pipeline_s_p_o.consumer_wait_w_index_phase(stage, s_full_phase)
                     if const_expr(self.dm_tr):
-                        tr_now = dm_utils.clock32()
+                        tr_now = clock32()
                         tr_s[1] = tr_s[1] + (tr_now - tr_prev)
                         tr_prev = tr_now
                     tSrS = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
@@ -2310,7 +2313,7 @@ class DMPass0Sm100:
                                 cute.copy(thr_tmem_load, tStS_t2r[None, None, j], tSrS[None, None, j])
                             if const_expr(h == 1):
                                 cute.arch.fence_view_async_tmem_load()
-                                with dm_utils.tcf_site("r0"):
+                                with FenceSkipSite("r0"):
                                     pipeline_s_p_o.consumer_release_w_index(stage)
                             if const_expr(self.is_causal):
                                 if diag:
@@ -2323,19 +2326,19 @@ class DMPass0Sm100:
                                     if ((row >> 5) + n_block * (self.n_block_size // 32) + j) % self.dm_b6 == 0:
                                         for v in cutlass.range_constexpr(16):
                                             i0 = 32 * j + 2 * v
-                                            tSrS[i0], tSrS[i0 + 1] = dm_common.dm_bwd_p_pair_poly6(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            tSrS[i0], tSrS[i0 + 1] = dm_bwd_p_pair_poly6(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     else:
                                         for v in cutlass.range_constexpr(16):
                                             i0 = 32 * j + 2 * v
-                                            tSrS[i0], tSrS[i0 + 1] = dm_common.dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            tSrS[i0], tSrS[i0 + 1] = dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                 for v in cutlass.range_constexpr(16):
                                     i0 = 32 * j + 2 * v
                                     if const_expr(self.dm_b6 > 0):
                                         p = (tSrS[i0], tSrS[i0 + 1])
-                                    elif const_expr(dm_common.p5_uses_poly(self.dm_exp_variant.split("+")[0], v)):
-                                        p = dm_common.dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                    elif const_expr(p5_uses_poly(self.dm_exp_variant.split("+")[0], v)):
+                                        p = dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     else:
-                                        p = dm_common.dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                        p = dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     tSrS[i0], tSrS[i0 + 1] = p
                                     if const_expr("pd" in self.dm_exp_variant.split("+")[1:]):
                                         # DEBUG: P dump, h2 (production) path
@@ -2361,7 +2364,7 @@ class DMPass0Sm100:
                                 cute.copy(thr_tmem_load, tdPt_t2r[None, None, j], tdPr)
                                 if const_expr(j == 3):
                                     cute.arch.fence_view_async_tmem_load()
-                                    with dm_utils.tcf_site("r1"):
+                                    with FenceSkipSite("r1"):
                                         pipeline_dp.consumer_release_w_index(stage)
                                 if const_expr("pd" in self.dm_exp_variant.split("+")[1:]):
                                     # DEBUG: raw dP accumulator dump, h2 (production) path
@@ -2387,7 +2390,7 @@ class DMPass0Sm100:
                         else:
                             cute.copy(thr_tmem_load, tStS_t2r, tSrS)
                         cute.arch.fence_view_async_tmem_load()
-                        with dm_utils.tcf_site("r2"):
+                        with FenceSkipSite("r2"):
                             pipeline_s_p_o.consumer_release_w_index(stage)  # next S can be issued now
                         if const_expr(self.is_causal):
                             # keys past this row: S = -inf -> P = 0 (same as the main backward's mask)
@@ -2410,7 +2413,7 @@ class DMPass0Sm100:
                                 cute.copy(thr_tmem_load, tdPt_t2r[None, None, j], tdPr)
                                 if const_expr(j == n_chunks - 1):
                                     cute.arch.fence_view_async_tmem_load()
-                                    with dm_utils.tcf_site("r3"):
+                                    with FenceSkipSite("r3"):
                                         pipeline_dp.consumer_release_w_index(stage)
                                 acc0 = (Float32(0.0), Float32(0.0))
                                 acc1 = (Float32(0.0), Float32(0.0))
@@ -2423,27 +2426,27 @@ class DMPass0Sm100:
                                     if ((row >> 5) + kb32) % b3_m == 0:
                                         for v in cutlass.range_constexpr(16):
                                             i0 = 32 * j + 2 * v
-                                            tSrS[i0], tSrS[i0 + 1] = dm_common.dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            tSrS[i0], tSrS[i0 + 1] = dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     else:
                                         for v in cutlass.range_constexpr(16):
                                             i0 = 32 * j + 2 * v
-                                            tSrS[i0], tSrS[i0 + 1] = dm_common.dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            tSrS[i0], tSrS[i0 + 1] = dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                 for v in cutlass.range_constexpr(16):
                                     i0 = 32 * j + 2 * v
                                     if const_expr(self.dm_exp_variant.split("+")[0].startswith("b3_")):
                                         p = (tSrS[i0], tSrS[i0 + 1])
                                     elif const_expr(self.dm_exp_variant.split("+")[0] == "mix"):
-                                        p = dm_common.dm_bwd_p_pair_mix(tSrS[i0], tSrS[i0 + 1], cs[j], l2, row_odd)
-                                    elif const_expr(dm_common.is_static_mix(self.dm_exp_variant.split("+")[0])):
-                                        if const_expr(dm_common.p5_uses_poly(self.dm_exp_variant.split("+")[0], v)):
+                                        p = dm_bwd_p_pair_mix(tSrS[i0], tSrS[i0 + 1], cs[j], l2, row_odd)
+                                    elif const_expr(is_static_mix(self.dm_exp_variant.split("+")[0])):
+                                        if const_expr(p5_uses_poly(self.dm_exp_variant.split("+")[0], v)):
                                             if const_expr(self.dm_exp_variant.startswith("p5_")):
-                                                p = dm_common.dm_bwd_p_pair_poly5(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                                p = dm_bwd_p_pair_poly5(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                             else:
-                                                p = dm_common.dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                                p = dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                         else:
-                                            p = dm_common.dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            p = dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     else:
-                                        p = dm_common.P_PAIR_VARIANTS[self.dm_exp_variant.split("+")[0]](tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                        p = P_PAIR_VARIANTS[self.dm_exp_variant.split("+")[0]](tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     if const_expr(v % 2 == 0):
                                         den = cute.arch.add_packed_f32x2(den, p)
                                         acc0 = cute.arch.fma_packed_f32x2(p, (tdPr[2 * v], tdPr[2 * v + 1]), acc0)
@@ -2463,32 +2466,32 @@ class DMPass0Sm100:
                                     if ((row >> 5) + kb32) % b3_m == 0:
                                         for v in cutlass.range_constexpr(16):
                                             i0 = 32 * j + 2 * v
-                                            tSrS[i0], tSrS[i0 + 1] = dm_common.dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            tSrS[i0], tSrS[i0 + 1] = dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     else:
                                         for v in cutlass.range_constexpr(16):
                                             i0 = 32 * j + 2 * v
-                                            tSrS[i0], tSrS[i0 + 1] = dm_common.dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            tSrS[i0], tSrS[i0 + 1] = dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     for v in cutlass.range_constexpr(16):
                                         den = cute.arch.add_packed_f32x2(den, (tSrS[32 * j + 2 * v], tSrS[32 * j + 2 * v + 1]))
                                 for v in cutlass.range_constexpr(16 if const_expr(not self.dm_exp_variant.split("+")[0].startswith("b3_")) else 0):
                                     i0 = 32 * j + 2 * v
                                     if const_expr(_r3m(self.dm_exp_variant) > 0):
                                         if const_expr(j % _r3m(self.dm_exp_variant) == 0):
-                                            p = dm_common.dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            p = dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                         else:
-                                            p = dm_common.dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            p = dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     elif const_expr(self.dm_exp_variant.split("+")[0] == "mix"):
-                                        p = dm_common.dm_bwd_p_pair_mix(tSrS[i0], tSrS[i0 + 1], cs[j], l2, row_odd)
-                                    elif const_expr(dm_common.is_static_mix(self.dm_exp_variant.split("+")[0])):
-                                        if const_expr(dm_common.p5_uses_poly(self.dm_exp_variant.split("+")[0], v)):
+                                        p = dm_bwd_p_pair_mix(tSrS[i0], tSrS[i0 + 1], cs[j], l2, row_odd)
+                                    elif const_expr(is_static_mix(self.dm_exp_variant.split("+")[0])):
+                                        if const_expr(p5_uses_poly(self.dm_exp_variant.split("+")[0], v)):
                                             if const_expr(self.dm_exp_variant.startswith("p5_")):
-                                                p = dm_common.dm_bwd_p_pair_poly5(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                                p = dm_bwd_p_pair_poly5(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                             else:
-                                                p = dm_common.dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                                p = dm_bwd_p_pair_poly(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                         else:
-                                            p = dm_common.dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                            p = dm_bwd_p_pair(tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     else:
-                                        p = dm_common.P_PAIR_VARIANTS[self.dm_exp_variant.split("+")[0]](tSrS[i0], tSrS[i0 + 1], cs[j], l2)
+                                        p = P_PAIR_VARIANTS[self.dm_exp_variant.split("+")[0]](tSrS[i0], tSrS[i0 + 1], cs[j], l2)
                                     tSrS[i0], tSrS[i0 + 1] = p
                                     if const_expr("pd" in self.dm_exp_variant.split("+")[1:]):
                                         # DEBUG: dump this kernel's P for bitwise comparison
@@ -2512,13 +2515,13 @@ class DMPass0Sm100:
                                 pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
                                 s0s1_phase ^= 1
                             if const_expr(self.dm_tr):
-                                tr_now = dm_utils.clock32()
+                                tr_now = clock32()
                                 tr_s[2] = tr_s[2] + (tr_now - tr_prev)
                                 tr_prev = tr_now
                             # dP streamed in 32-column chunks; the slot is released after the last load
                             pipeline_dp.consumer_wait_w_index_phase(stage, s_full_phase)
                             if const_expr(self.dm_tr):
-                                tr_now = dm_utils.clock32()
+                                tr_now = clock32()
                                 tr_s[3] = tr_s[3] + (tr_now - tr_prev)
                                 tr_prev = tr_now
                             for j in cutlass.range_constexpr(nc):
@@ -2526,7 +2529,7 @@ class DMPass0Sm100:
                                 cute.copy(thr_tmem_load, tdPt_t2r[None, None, (j + rot) % n_chunks if const_expr(_r3m(self.dm_exp_variant) > 0) else j], tdPr)
                                 if const_expr(j == nc - 1):
                                     cute.arch.fence_view_async_tmem_load()
-                                    with dm_utils.tcf_site("r4"):
+                                    with FenceSkipSite("r4"):
                                         pipeline_dp.consumer_release_w_index(stage)
                                 if const_expr(self.dm_ma):
                                     # 4 independent sum P*dP_acc chains per 32-column chunk, then num += a * acc
@@ -2555,7 +2558,7 @@ class DMPass0Sm100:
                                                                       n_block * self.n_block_size + tScS_t2r[32 * j + 2 * v + e_][1]] = tdPr[2 * v + e_]
                                         num = cute.arch.fma_packed_f32x2((tSrS[32 * j + 2 * v], tSrS[32 * j + 2 * v + 1]), dpv, num)
                     if const_expr(self.dm_tr):
-                        tr_now = dm_utils.clock32()
+                        tr_now = clock32()
                         tr_s[4] = tr_s[4] + (tr_now - tr_prev)
                         tr_prev = tr_now
                     if const_expr(self.dm_tr):
@@ -2591,12 +2594,12 @@ class DMPass0Sm100:
                         dent = cute.arch.add_packed_f32x2(cute.arch.add_packed_f32x2(den, den1), cute.arch.add_packed_f32x2(den2, den3))
                         if const_expr(self.dm_f64y):
                             # ALU bit assembly; nonzero subnormal partials (practically never) take F2F in a divergent branch
-                            c0 = dm_utils.f32_to_f64_fastpath(num[0])
-                            c1 = dm_utils.f32_to_f64_fastpath(num[1])
-                            c2 = dm_utils.f32_to_f64_fastpath(dent[0])
-                            c3 = dm_utils.f32_to_f64_fastpath(dent[1])
-                            if (dm_utils.f32_is_subnormal(num[0]) | dm_utils.f32_is_subnormal(num[1])
-                                    | dm_utils.f32_is_subnormal(dent[0]) | dm_utils.f32_is_subnormal(dent[1])) != Int32(0):
+                            c0 = f32_to_f64_fastpath(num[0])
+                            c1 = f32_to_f64_fastpath(num[1])
+                            c2 = f32_to_f64_fastpath(dent[0])
+                            c3 = f32_to_f64_fastpath(dent[1])
+                            if (f32_is_subnormal(num[0]) | f32_is_subnormal(num[1])
+                                    | f32_is_subnormal(dent[0]) | f32_is_subnormal(dent[1])) != Int32(0):
                                 c0 = Float64(num[0])
                                 c1 = Float64(num[1])
                                 c2 = Float64(dent[0])
@@ -2604,8 +2607,8 @@ class DMPass0Sm100:
                             num64 = num64 + (c0 + c1)
                             den64 = den64 + (c2 + c3)
                         elif const_expr(self.dm_f64x):
-                            num64 = num64 + (dm_utils.f32_to_f64_exact(num[0]) + dm_utils.f32_to_f64_exact(num[1]))
-                            den64 = den64 + (dm_utils.f32_to_f64_exact(dent[0]) + dm_utils.f32_to_f64_exact(dent[1]))
+                            num64 = num64 + (f32_to_f64_exact(num[0]) + f32_to_f64_exact(num[1]))
+                            den64 = den64 + (f32_to_f64_exact(dent[0]) + f32_to_f64_exact(dent[1]))
                         else:
                             num64 = num64 + (Float64(num[0]) + Float64(num[1]))
                             den64 = den64 + (Float64(dent[0]) + Float64(dent[1]))
@@ -2624,7 +2627,7 @@ class DMPass0Sm100:
             if const_expr(self.dm_tr):
                 if tidx == 0:
                     for k_ in cutlass.range_constexpr(6):
-                        dm_utils.red_add_u64(aux[6].iterator.toint() + 8 * (8 * stage + k_), Int64(tr_s[k_]))
+                        red_add_u64(aux[6].iterator.toint() + 8 * (8 * stage + k_), Int64(tr_s[k_]))
             num_t = num[0] + num[1]
             den_t = den[0] + den[1]
             if const_expr(self.dm_c3):
@@ -2683,7 +2686,7 @@ class DMPass0Sm100:
             rowc = cutlass.min(row, seqlen.seqlen_q - 1)
             qsv = Float32(aux[0][batch_idx, head_idx, rowc // 32])
             dosv = Float32(aux[3][batch_idx, head_idx, rowc // 32])
-            l2 = Float32(aux[5][batch_idx, head_idx, rowc]) * Float32(dm_common.LOG2E)
+            l2 = Float32(aux[5][batch_idx, head_idx, rowc]) * Float32(LOG2E)
             # this lane's component of the h2 path's TwoSum pairs, packed as (num, den)
             ts_s = (Float32(0.0), Float32(0.0))
             ts_e = (Float32(0.0), Float32(0.0))
@@ -2698,16 +2701,16 @@ class DMPass0Sm100:
                     as_ = [None] * 4
                     if const_expr(self.dm_pf):
                         for j in cutlass.range_constexpr(4):
-                            cs[j] = dm_common.dm_bwd_c(pks[j], qsv)
-                            as_[j] = dm_common.dm_bwd_dp_scale(pvs[j], dosv)
+                            cs[j] = dm_bwd_c(pks[j], qsv)
+                            as_[j] = dm_bwd_dp_scale(pvs[j], dosv)
                         nbn = cutlass.max(n_block - 1, n_block_min) * (self.n_block_size // 32)
                         pks = tuple(Float32(aux[1][batch_idx, kv_head_idx, nbn + j]) for j in range(4))
                         pvs = tuple(Float32(aux[2][batch_idx, kv_head_idx, nbn + j]) for j in range(4))
                     else:
                         for j in cutlass.range_constexpr(4):
                             kb = n_block * (self.n_block_size // 32) + j
-                            cs[j] = dm_common.dm_bwd_c(Float32(aux[1][batch_idx, kv_head_idx, kb]), qsv)
-                            as_[j] = dm_common.dm_bwd_dp_scale(Float32(aux[2][batch_idx, kv_head_idx, kb]), dosv)
+                            cs[j] = dm_bwd_c(Float32(aux[1][batch_idx, kv_head_idx, kb]), qsv)
+                            as_[j] = dm_bwd_dp_scale(Float32(aux[2][batch_idx, kv_head_idx, kb]), dosv)
                     # den chains of this lane's component: d01 = (c0, c1), d23 = (c2, c3) (h2: den[v % 4], v = pair)
                     d01 = (Float32(0.0), Float32(0.0))
                     d23 = (Float32(0.0), Float32(0.0))
@@ -2719,12 +2722,12 @@ class DMPass0Sm100:
                     kbase = n_block * self.n_block_size
                     r = cute.make_rmem_tensor(cute.make_layout(64), self.qk_acc_dtype)
                     for h in cutlass.range_constexpr(2):
-                        vals = dm_utils.tmem_ld_16x64b_x32(s_addr + Int32(64 * h))
+                        vals = tmem_ld_16x64b_x32(s_addr + Int32(64 * h))
                         for i in cutlass.range_constexpr(32):
                             r[32 * h + i] = vals[i]
                         if const_expr(h == 1):
                             cute.arch.fence_view_async_tmem_load()
-                            with dm_utils.tcf_site("r0"):
+                            with FenceSkipSite("r0"):
                                 pipeline_s_p_o.consumer_release_w_index(stage)
                         else:
                             cute.arch.fence_view_async_tmem_load()
@@ -2735,7 +2738,7 @@ class DMPass0Sm100:
                         for j in cutlass.range_constexpr(2 * h, 2 * h + 2):
                             for v in cutlass.range_constexpr(0, 16, 2):
                                 i0 = 16 * j + v
-                                p = dm_common.dm_bwd_p_pair(r[i0], r[i0 + 1], cs[j], l2)
+                                p = dm_bwd_p_pair(r[i0], r[i0 + 1], cs[j], l2)
                                 r[i0], r[i0 + 1] = p
                                 if const_expr(v % 4 == 0):
                                     d01 = cute.arch.add_packed_f32x2(d01, p)
@@ -2744,10 +2747,10 @@ class DMPass0Sm100:
                         if const_expr(h == 0):
                             pipeline_dp.consumer_wait_w_index_phase(stage, s_full_phase)
                         for j in cutlass.range_constexpr(2 * h, 2 * h + 2):
-                            dpv = dm_utils.tmem_ld_16x64b_x16(d_addr + Int32(32 * j))
+                            dpv = tmem_ld_16x64b_x16(d_addr + Int32(32 * j))
                             cute.arch.fence_view_async_tmem_load()
                             if const_expr(j == 3):
-                                with dm_utils.tcf_site("r1"):
+                                with FenceSkipSite("r1"):
                                     pipeline_dp.consumer_release_w_index(stage)
                             a01 = (Float32(0.0), Float32(0.0))
                             a23 = (Float32(0.0), Float32(0.0))
@@ -2828,7 +2831,7 @@ class DMPass0Sm100:
                 rowc = cutlass.min(rows[st], seqlen.seqlen_q - 1)
                 qsv[st] = Float32(aux[0][batch_idx, head_idx, rowc // 32])
                 dosv[st] = Float32(aux[3][batch_idx, head_idx, rowc // 32])
-                l2[st] = Float32(aux[5][batch_idx, head_idx, rowc]) * Float32(dm_common.LOG2E)
+                l2[st] = Float32(aux[5][batch_idx, head_idx, rowc]) * Float32(LOG2E)
                 num[st] = (Float32(0.0), Float32(0.0))
                 den[st] = (Float32(0.0), Float32(0.0))
                 denb[st] = (Float32(0.0), Float32(0.0))
@@ -2844,28 +2847,28 @@ class DMPass0Sm100:
                         tSrS[st] = cute.make_rmem_tensor(tScS_t2r[None, None, J].shape, self.qk_acc_dtype)
                         cute.copy(thr_tmem_load, tS[st][None, None, J], tSrS[st])
                         cute.arch.fence_view_async_tmem_load()
-                        with dm_utils.tcf_site("r5"):
+                        with FenceSkipSite("r5"):
                             pipeline_s_p_o.consumer_release_w_index(st)
                     variant = self.dm_exp_variant.split("+")[0]
                     for st in cutlass.range_constexpr(self.q_stage):
-                        c = dm_common.dm_bwd_c(ksv, qsv[st])
-                        a = dm_common.dm_bwd_dp_scale(vsv, dosv[st])
+                        c = dm_bwd_c(ksv, qsv[st])
+                        a = dm_bwd_dp_scale(vsv, dosv[st])
                         if const_expr(self.is_causal):
                             if (n_block + 1) * self.n_block_size > self._q_block(work_m, st) * self.m_block_size:
                                 kbase = n_block * self.n_block_size + 32 * J
                                 for i in cutlass.range_constexpr(32):
                                     tSrS[st][i] = -Float32.inf if kbase + i > rows[st] else tSrS[st][i]
                         for v in cutlass.range_constexpr(16):
-                            if const_expr(dm_common.is_static_mix(variant)):
-                                if const_expr(dm_common.p5_uses_poly(variant, v)):
+                            if const_expr(is_static_mix(variant)):
+                                if const_expr(p5_uses_poly(variant, v)):
                                     if const_expr(variant.startswith("p5_")):
-                                        p = dm_common.dm_bwd_p_pair_poly5(tSrS[st][2 * v], tSrS[st][2 * v + 1], c, l2[st])
+                                        p = dm_bwd_p_pair_poly5(tSrS[st][2 * v], tSrS[st][2 * v + 1], c, l2[st])
                                     else:
-                                        p = dm_common.dm_bwd_p_pair_poly(tSrS[st][2 * v], tSrS[st][2 * v + 1], c, l2[st])
+                                        p = dm_bwd_p_pair_poly(tSrS[st][2 * v], tSrS[st][2 * v + 1], c, l2[st])
                                 else:
-                                    p = dm_common.dm_bwd_p_pair(tSrS[st][2 * v], tSrS[st][2 * v + 1], c, l2[st])
+                                    p = dm_bwd_p_pair(tSrS[st][2 * v], tSrS[st][2 * v + 1], c, l2[st])
                             else:
-                                p = dm_common.P_PAIR_VARIANTS[variant](tSrS[st][2 * v], tSrS[st][2 * v + 1], c, l2[st])
+                                p = P_PAIR_VARIANTS[variant](tSrS[st][2 * v], tSrS[st][2 * v + 1], c, l2[st])
                             tSrS[st][2 * v], tSrS[st][2 * v + 1] = p
                             if const_expr(self.dm_ma and v % 2 == 1):
                                 denb[st] = cute.arch.add_packed_f32x2(denb[st], p)
@@ -2875,7 +2878,7 @@ class DMPass0Sm100:
                         tdPr = cute.make_rmem_tensor(tScS_t2r[None, None, J].shape, self.qk_acc_dtype)
                         cute.copy(thr_tmem_load, tdP[st][None, None, J], tdPr)
                         cute.arch.fence_view_async_tmem_load()
-                        with dm_utils.tcf_site("r6"):
+                        with FenceSkipSite("r6"):
                             pipeline_dp.consumer_release_w_index(st)
                         if const_expr(self.dm_ma):
                             acc = [(Float32(0.0), Float32(0.0)) for _ in range(4)]
@@ -3014,7 +3017,7 @@ class DMPass0Sm100:
                 v = cute.arch.fmax(v, tSrS_t2r[32 * j + i])
             dm_bmax[j] = v * dm_c[j]
         dm_xmax = cute.arch.fmax(cute.arch.fmax(dm_bmax[0], dm_bmax[1]), cute.arch.fmax(dm_bmax[2], dm_bmax[3]))
-        dm_mcand = dm_utils.ceil_f32(dm_xmax)
+        dm_mcand = ceil_f32(dm_xmax)
         acc_scale = Float32(1.0)
         row_max = dm_mcand
         if const_expr(is_first):
@@ -3025,7 +3028,7 @@ class DMPass0Sm100:
             row_max = m_old
             if dm_mcand > m_old + Float32(self.dm_rescale_T):
                 row_max = dm_mcand
-                acc_scale = dm_utils.exp2i_f32(m_old - dm_mcand)
+                acc_scale = exp2i_f32(m_old - dm_mcand)
         softmax.row_max[0] = row_max
         m_safe = row_max if row_max != -Float32.inf else Float32(0.0)
         # fully masked blocks: kb clamps to -1e30 -> weight 0, SF byte 0, finite bias (x stays -inf -> p 0)
@@ -3033,14 +3036,14 @@ class DMPass0Sm100:
         dm_w = [None] * 4
         dm_sfa = [None] * 4
         for j in cutlass.range_constexpr(4):
-            kb = cute.arch.fmax(dm_utils.floor_f32(dm_bmax[j]), Float32(-1e30))
+            kb = cute.arch.fmax(floor_f32(dm_bmax[j]), Float32(-1e30))
             e = kb - Float32(7.0) - m_safe
             dm_bias[j] = Float32(7.0) - kb
-            dm_w[j] = dm_utils.exp2i_f32(e)
-            dm_sfa[j] = dm_utils.ue8m0_byte(e)
-        sfa_word = dm_utils.bitcast_i32_f32(dm_utils.pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3]))
-        sfb_word = dm_utils.bitcast_i32_f32(dm_utils.pack_bytes4(
-            *[dm_utils.pow2_exponent_byte(Float32(dm_scales.v_descale[batch_idx, kv_head_idx, nb4 + j])) for j in range(4)]))
+            dm_w[j] = exp2i_f32(e)
+            dm_sfa[j] = ue8m0_byte(e)
+        sfa_word = bitcast_i32_f32(pack_bytes4(dm_sfa[0], dm_sfa[1], dm_sfa[2], dm_sfa[3]))
+        sfb_word = bitcast_i32_f32(pack_bytes4(
+            *[pow2_exponent_byte(Float32(dm_scales.v_descale[batch_idx, kv_head_idx, nb4 + j])) for j in range(4)]))
         tSrSF = cute.make_rmem_tensor(thr_tmem_store_sf.partition_S(cute.make_identity_tensor((self.m_block_size, 8))).shape, Float32)
         for j in cutlass.range_constexpr(4):
             tSrSF[j] = sfa_word
@@ -3087,16 +3090,16 @@ class DMPass0Sm100:
                 split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.n_block_size
                 if const_expr(i + 1 == split_P_arrive_idx):
                     cute.arch.fence_view_async_tmem_store()
-                    with dm_utils.tcf_site("r7"):
+                    with FenceSkipSite("r7"):
                         pipeline_s_p_o.consumer_release_w_index(s_p_o_index)
         cute.arch.fence_view_async_tmem_store()
         if const_expr(self.split_P_arrive > 0):
             cute.arch.sync_warp()
-            dm_utils.tcf_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
+            fence_warp_relay()   # fwdfence: all lanes fence + warp sync before the leader's arrive
             with cute.arch.elect_one():
                 pipeline_p_lastsplit.producer_commit_w_index(s_p_o_index)
         else:
-            with dm_utils.tcf_site("r8"):
+            with FenceSkipSite("r8"):
                 pipeline_s_p_o.consumer_release_w_index(s_p_o_index)
         if const_expr(self.use_s_ping_pong):
             pipeline_sm_stats.producer_acquire_w_index_phase(
