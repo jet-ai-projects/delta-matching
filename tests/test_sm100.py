@@ -83,7 +83,8 @@ def test_matches_emulation(B, N, H, Hk, causal, mode):
     got = run(q, k, v, do, causal, mode)
     for nm in NAMES:
         assert torch.isfinite(got[nm]).all(), nm
-    kmean = _api().quant_qkv2(q, k, v, D ** -0.5)[7]
+    from delta_matching.sm100.quant import quant_qkv2
+    kmean = quant_qkv2(q, k, v, D ** -0.5)[7]
     em = R.dm_reference(q, k, v, do, causal, mode, "sm100-mx", k_mean=kmean,
                         o_for_stale=got["O"] if mode == "stale" else None)
     ex = R.attention_fp32(q, k, v, do, causal)
