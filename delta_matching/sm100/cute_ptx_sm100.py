@@ -10,7 +10,7 @@ from cutlass import Float32, Float64, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-__all__ = ["f32_unary", "inline_asm", "floor_f32", "ceil_f32", "bitcast_i32_f32", "redux_max_abs_f32", "tmem_st_x1", "tmem_st_x4", "mbar_arrive_expect_tx", "mbar_wait_parity_nh", "mbar_wait_parity", "ld_shared_b32", "st_shared_b32", "clock64", "red_add_u64", "poll_acquire_ge_or_trap", "fence_proxy_async_global", "clock32", "globaltimer", "smid", "mbar_arrive_rank", "mbar_arrive_local", "mbar_wait_parity_cluster", "f32_to_f64_exact", "f32_to_f64_fastpath", "f32_is_subnormal", "mbar_init", "mbar_arrive", "tc_commit", "st_shared_v4_b32", "bitcast_f32_i32", "nanosleep_1us", "tmem_ld_16x64b_x32", "tmem_ld_16x64b_x16", "tmem_ld32", "mul_f32", "add_f32", "abs_f32", "max_f32", "e4m3x4", "bf16x2", "st_shared_f32", "ld_shared_f32", "ld_shared_v4", "st_global_v4", "st_global_v4f", "st_global_f32", "global_address"]
+__all__ = ["f32_unary", "inline_asm", "floor_f32", "ceil_f32", "bitcast_i32_f32", "redux_max_abs_f32", "tmem_st_x1", "tmem_st_x4", "mbar_arrive_expect_tx", "mbar_wait_parity_nh", "mbar_wait_parity", "ld_shared_b32", "st_shared_b32", "clock64", "red_add_u64", "poll_acquire_ge_or_trap", "fence_proxy_async_global", "clock32", "globaltimer", "smid", "mbar_arrive_rank", "mbar_arrive_local", "mbar_wait_parity_cluster", "f32_to_f64_exact", "f32_to_f64_fastpath", "f32_is_subnormal", "mbar_init", "mbar_arrive", "tc_commit", "st_shared_v4_b32", "bitcast_f32_i32", "nanosleep_1us", "tmem_ld_16x64b_x32", "tmem_ld_16x64b_x16", "tmem_ld32", "mul_f32", "add_f32", "abs_f32", "max_f32", "e4m3x4", "bf16x2", "st_shared_f32", "ld_shared_f32", "ld_shared_v4", "st_global_v4", "st_global_v4f", "st_global_f32", "global_address", "ld_shared_v4f", "tmem_st32", "st_global_u8", "red_add_f64", "bfly_sum_f64", "sel_eq_f64"]
 
 
 def f32_unary(asm, x, loc=None, ip=None):
@@ -467,3 +467,54 @@ def st_global_f32(addr: Int64, v: Float32, *, loc=None, ip=None):
 
 def global_address(t: cute.Tensor) -> Int64:
     return Int64(t.iterator.toint())
+
+
+@dsl_user_op
+def ld_shared_v4f(addr: Int32, *, loc=None, ip=None):
+    res = inline_asm(llvm.StructType.get_literal([T.f32()] * 4), [Int32(addr).ir_value(loc=loc, ip=ip)],
+               "ld.shared.v4.f32 {$0, $1, $2, $3}, [$4];", "=f,=f,=f,=f,r", True, loc, ip)
+    return [Float32(llvm.extractvalue(T.f32(), res, [i], loc=loc, ip=ip)) for i in range(4)]
+
+
+@dsl_user_op
+def tmem_st32(addr: Int32, v, *, loc=None, ip=None):
+    """
+    tcgen05.st.32x32b.x32: this thread's lane, 32 fp32 columns at addr.
+    """
+    regs = ",".join(f"${i + 1}" for i in range(32))
+    inline_asm(None, [Int32(addr).ir_value(loc=loc, ip=ip)] + [Float32(x).ir_value(loc=loc, ip=ip) for x in v],
+         "tcgen05.st.sync.aligned.32x32b.x32.b32 [$0], {" + regs + "};", ",".join(["r"] + ["f"] * 32), True, loc, ip)
+
+
+@dsl_user_op
+def st_global_u8(addr: Int64, v: Int32, *, loc=None, ip=None):
+    inline_asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Int32(v).ir_value(loc=loc, ip=ip)],
+         "st.global.u8 [$0], $1;", "l,r", True, loc, ip)
+
+
+@dsl_user_op
+def red_add_f64(addr: Int64, v: Float64, *, loc=None, ip=None):
+    inline_asm(None, [Int64(addr).ir_value(loc=loc, ip=ip), Float64(v).ir_value(loc=loc, ip=ip)],
+         "red.global.add.f64 [$0], $1;", "l,d", True, loc, ip)
+
+
+@dsl_user_op
+def bfly_sum_f64(x: Float64, *, loc=None, ip=None) -> Float64:
+    """
+    warp butterfly fp64 sum (fixed order per lane; dbg only).
+    """
+    body = "{\n\t.reg .b32 lo, hi, olo, ohi;\n\t.reg .f64 a, o;\n\tmov.f64 a, $1;\n\t"
+    for m in (16, 8, 4, 2, 1):
+        body += ("mov.b64 {lo, hi}, a;\n\t"
+                 f"shfl.sync.bfly.b32 olo, lo, {m}, 31, 0xffffffff;\n\tshfl.sync.bfly.b32 ohi, hi, {m}, 31, 0xffffffff;\n\t"
+                 "mov.b64 o, {olo, ohi};\n\tadd.rn.f64 a, a, o;\n\t")
+    body += "mov.f64 $0, a;\n\t}"
+    return Float64(inline_asm(T.f64(), [Float64(x).ir_value(loc=loc, ip=ip)], body, "=d,d", True, loc, ip))
+
+
+@dsl_user_op
+def sel_eq_f64(x: Int32, y: Int32, a: Float64, b: Float64, *, loc=None, ip=None) -> Float64:
+    return Float64(inline_asm(T.f64(), [Int32(x).ir_value(loc=loc, ip=ip), Int32(y).ir_value(loc=loc, ip=ip),
+                                  Float64(a).ir_value(loc=loc, ip=ip), Float64(b).ir_value(loc=loc, ip=ip)],
+                        "{\n\t.reg .pred p;\n\tsetp.eq.s32 p, $1, $2;\n\tselp.f64 $0, $3, $4, p;\n\t}", "=d,r,r,d,d",
+                        False, loc, ip))

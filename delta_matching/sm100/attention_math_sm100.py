@@ -11,11 +11,13 @@ import math
 
 import cutlass  # noqa: F401  (the CuTe DSL preprocessor rewrites helper code into references to the cutlass module)
 import cutlass.cute as cute
-from cutlass import Float32
+from cutlass import Float32, Float64, Int32, Int64
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-__all__ = ["LOG2E", "dm_bwd_c", "dm_bwd_dp_scale", "dm_bwd_p_pair", "ex2_f16x2", "dm_bwd_p_pair_f16x2", "dm_bwd_p_pair_poly", "P_PAIR_VARIANTS", "dm_bwd_p_pair_mix", "dm_bwd_p_pair_poly5", "dm_bwd_p_pair_poly6", "b6_m", "p5_uses_poly", "is_static_mix", "POLY5_EX2", "ex2_poly5_2", "POLY6_EX2", "ex2_poly6_2", "dm_mx256_c", "dm_mx256_l2", "dm_mx256_dp_scale", "dm_mx256_p_pair", "dm_mx256_p_pair2"]
+from delta_matching.sm100.cute_ptx_sm100 import bfly_sum_f64, red_add_f64, sel_eq_f64
+
+__all__ = ["LOG2E", "dm_bwd_c", "dm_bwd_dp_scale", "dm_bwd_p_pair", "ex2_f16x2", "dm_bwd_p_pair_f16x2", "dm_bwd_p_pair_poly", "P_PAIR_VARIANTS", "dm_bwd_p_pair_mix", "dm_bwd_p_pair_poly5", "dm_bwd_p_pair_poly6", "b6_m", "p5_uses_poly", "is_static_mix", "POLY5_EX2", "ex2_poly5_2", "POLY6_EX2", "ex2_poly6_2", "dm_mx256_c", "dm_mx256_l2", "dm_mx256_dp_scale", "dm_mx256_p_pair", "dm_mx256_p_pair2", "accumulate_column_sums_f64"]
 
 
 LOG2E = math.log2(math.e)
@@ -231,3 +233,15 @@ def dm_mx256_p_pair2(s0: Float32, s1: Float32, c: Float32, l20: Float32, l21: Fl
     """
     x0, x1 = cute.arch.fma_packed_f32x2((s0, s1), (c, c), (-l20, -l21))
     return cute.math.exp2(x0, fastmath=True), cute.math.exp2(x1, fastmath=True)
+
+
+def accumulate_column_sums_f64(vals32, lane, addr0):
+    """
+    Identity build, keys on rows: per column i of a 32-column chunk, the fp64 sum over the warp's 32
+    lanes, added at addr0 + 32 i by lane i (red.add, order-free across warps).
+    """
+    column_sum = Float64(0.0)
+    for i in range(32):
+        warp_sum = bfly_sum_f64(Float64(vals32[i]))
+        column_sum = sel_eq_f64(lane, Int32(i), warp_sum, column_sum)
+    red_add_f64(addr0 + Int64(lane) * 32, column_sum)

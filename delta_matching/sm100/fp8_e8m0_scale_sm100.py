@@ -7,9 +7,9 @@ from cutlass import Float32, Int32
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import llvm
 
-from delta_matching.sm100.cute_ptx_sm100 import f32_unary
+from delta_matching.sm100.cute_ptx_sm100 import f32_unary, inline_asm
 
-__all__ = ["exp2i_f32", "ue8m0_byte", "byte_shl23_f32", "pow2_exponent_byte", "pack_bytes4", "pow2_sb", "inv_pow2_from_sb", "add_sb_clamp", "byte_pow2_f32"]
+__all__ = ["exp2i_f32", "ue8m0_byte", "byte_shl23_f32", "pow2_exponent_byte", "pack_bytes4", "pow2_sb", "inv_pow2_from_sb", "add_sb_clamp", "byte_pow2_f32", "exponent_byte_of_pow2", "pack_bytes4_shift"]
 
 
 @dsl_user_op
@@ -131,3 +131,23 @@ def byte_pow2_f32(word: Int32, j: int, *, loc=None, ip=None) -> Float32:
         T.f32(), [Int32(word).ir_value(loc=loc, ip=ip)],
         "{\n\t.reg .b32 t;\n\t" f"bfe.u32 t, $1, {8 * j}, 8;\n\t" "shl.b32 $0, t, 23;\n\t}",
         "=f,r", has_side_effects=False, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip))
+
+
+@dsl_user_op
+def exponent_byte_of_pow2(x: Float32, *, loc=None, ip=None) -> Int32:
+    """
+    Biased exponent byte of an fp32 power of two (its UE8M0 code): pow2_exponent_byte with another
+    temporary register name in its PTX, kept apart so that its users keep their PTX.
+    """
+    return Int32(inline_asm(T.i32(), [Float32(x).ir_value(loc=loc, ip=ip)],
+                      "{\n\t.reg .b32 t;\n\tmov.b32 t, $1;\n\tbfe.u32 $0, t, 23, 8;\n\t}", "=r,f", False, loc, ip))
+
+
+@dsl_user_op
+def pack_bytes4_shift(b0: Int32, b1: Int32, b2: Int32, b3: Int32, *, loc=None, ip=None) -> Int32:
+    """
+    Bytes [b0, b1, b2, b3] little-endian (each < 256), by shifts and ors (pack_bytes4 uses prmt).
+    """
+    return Int32(inline_asm(T.i32(), [Int32(x).ir_value(loc=loc, ip=ip) for x in (b0, b1, b2, b3)],
+                      "{\n\t.reg .b32 t;\n\tshl.b32 t, $4, 8;\n\tor.b32 t, t, $3;\n\tshl.b32 t, t, 8;\n\tor.b32 t, t, $2;\n\t"
+                      "shl.b32 t, t, 8;\n\tor.b32 $0, t, $1;\n\t}", "=r,r,r,r,r", False, loc, ip))
