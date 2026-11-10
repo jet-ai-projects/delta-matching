@@ -284,11 +284,12 @@ def gemm_ptx_ss_w_idx(tiled_mma, acc, tCrA, tCrB, sA, sB, A_idx=None, B_idx=None
 
 def gemm_ptx_bs(
     op, acc_tmem_addr, tCrA, tCrB, sA, sB, sfa_base, sfb_base, sfa_map, sfb_map,
-    zero_init=False, tA_addr=None, cta_group: int = 1, dz=None,
+    zero_init=False, tA_addr=None, cta_group: int = 1, dz=None, k_range=None,
 ):
     """Block-scaled (kind::mxf8f6f4, UE8M0) MMA over all k-steps of tCrA/tCrB, SS (sA given) or TS (A in TMEM at tA_addr).
     sfa_map / sfb_map: per k-step (column offset added to sfa_base / sfb_base, sf byte id 0..3) python tuples.
-    Mirrors flash_attn.cute.blackwell_helpers.gemm_ptx_partial."""
+    Mirrors flash_attn.cute.blackwell_helpers.gemm_ptx_partial.
+    k_range (hd256 dQ split): issue only these k-steps (ascending); zero_init applies to k-step 0 only.  None = all."""
     from flash_attn.cute import mma_sm100_desc as sm100_desc
     from flash_attn.cute.blackwell_helpers import i64_to_i32x2
     is_ts = sA is None
@@ -332,7 +333,7 @@ def gemm_ptx_bs(
             f"mov.b32 b_hi, {hex(b_hi)};\n\t"
             + ("" if is_ts else f"mov.b32 a_hi, {hex(a_hi)};\n\t")
             + "setp.ne.b32 p, $2, 0;\n\t")
-    for k in range(nk):
+    for k in (range(nk) if k_range is None else k_range):
         ca, ia = sfa_map[k]
         cb, ib = sfb_map[k]
         idesc = (idesc_plain & ~(0x3 << 4) & ~(0x7 << 29)) | (1 << 23) | ((ia & 3) << 29) | ((ib & 3) << 4)
