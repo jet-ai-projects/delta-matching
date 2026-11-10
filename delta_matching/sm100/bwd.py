@@ -313,10 +313,9 @@ def _dm_post_convert(acc, out, *a, **k):
     if (sem is not None and sem[1] is not None and sem[0] == "q" and "tconv" in _env("DM_BWD_OPTS", "").split(",")
             and _env("DM_TCONV_OFF", "0") != "1"):   # DM_TCONV_OFF=1: DEBUG, serial FA4 postprocess (isolates bwd main)
         # rw8k tconv: PDL tail converter (tailconv.py): same conversion, each tile as soon as its det counter is final
-        from .tailconv import tconv_convert
-        kind, sem_t, causal_, G, ctn = sem
-        return tconv_convert(sem_t, acc, out, *a, dm_kind=kind, dm_causal=bool(causal_), dm_ctn=int(ctn),
-                             dm_G=int(G), queue=_CTX["tcq_cur"], **k)
+        from .attention_bwd_dq_convert_hd128_sm100 import convert_dq_tail
+        _, sem_t, causal_, _, ctn = sem
+        return convert_dq_tail(sem_t, acc, out, *a, dm_causal=bool(causal_), dm_ctn=int(ctn), queue=_CTX["tcq_cur"], **k)
     return _ORIG_POST(acc, out, *a, **k)
 
 
@@ -393,11 +392,11 @@ def dm_bwd_main(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal: bool, sm: 
             os.environ["DM_BWD_OPTS"] = _ao
             pc = fi._bwd_postprocess_convert.compile_cache
             fi._bwd_postprocess_convert.compile_cache = launch_cache_sm100.RecCache(pc)
-            from . import tailconv as _tc       # rw8k tconv: record the converter launches too
-            if _tc._CACHE is None:
-                _tc._CACHE = _tc._cache()
-            tcc = _tc._CACHE
-            _tc._CACHE = launch_cache_sm100.RecCache(tcc)
+            from . import attention_bwd_dq_convert_hd128_sm100 as dq_convert   # record the converter launches too
+            if dq_convert.COMPILE_CACHE is None:
+                dq_convert.COMPILE_CACHE = dq_convert.make_compile_cache()
+            tcc = dq_convert.COMPILE_CACHE
+            dq_convert.COMPILE_CACHE = launch_cache_sm100.RecCache(tcc)
             try:
                 r = _dm_flash_attn_bwd(q8, k8, v8, do8, do8, lse_c, softmax_scale=sm, causal=causal,
                                        deterministic=deterministic, aux_tensors=aux)[:3]
@@ -405,7 +404,7 @@ def dm_bwd_main(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal: bool, sm: 
                 return tuple(r)
             finally:
                 fi._bwd_postprocess_convert.compile_cache = pc
-                _tc._CACHE = tcc
+                dq_convert.COMPILE_CACHE = tcc
                 os.environ["DM_BWD_OPTS"] = opts0_
                 _CTX.pop("pool", None)
                 _CTX.pop("prestaged", None)

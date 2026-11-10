@@ -36,8 +36,8 @@ NAMES = ("O", "dQ", "dK", "dV")
 
 
 def _api():
-    from delta_matching.sm100 import api
-    return api
+    from delta_matching.sm100 import attention
+    return attention
 
 
 def rel(a, b):

@@ -6,7 +6,7 @@ as e4m3 codes with a power-of-2 scale per 32 tokens, P and dS as MXFP8 (e4m3 + U
 MMAs. Pure Python + CuTe DSL: nothing to build, kernels are JIT-compiled on first use into the CuTe DSL cache.
 
 ```python
-from delta_matching.sm100.api import dm_attn_func
+from delta_matching.sm100.attention import dm_attn_func
 o = dm_attn_func(q, k, v, causal=True, mode="matched")   # q (B, N, H, D) bf16, k / v (B, N, Hk, D); D = 128 or 256
 o.backward(do)
 ```

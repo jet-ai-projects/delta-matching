@@ -1,4 +1,4 @@
-"""sm100 (Blackwell, sm_100) Delta-Matching attention at head_dim 256 through the shipped API (delta_matching.sm100.api):
+"""sm100 (Blackwell, sm_100) Delta-Matching attention at head_dim 256 through the shipped API (delta_matching.sm100.attention):
   accuracy      O / dQ / dK / dV against exact attention, no worse than the torch emulation of the spec (preset sm100-mx-d256 of
                 delta_matching/reference.py: MXFP8 inputs, P per (row, 32 keys), P^T per (key, 32 queries), dS per (128 x 32),
                 num/den delta), matched and stale delta, MHA and GQA, causal and non-causal, odd tile counts;
@@ -23,7 +23,7 @@ def _skip_reason():
     if torch.cuda.get_device_capability(0)[0] != 10:
         return f"sm100 kernel test: needs an sm_100 GPU; found {torch.cuda.get_device_name(0)}"
     try:
-        import delta_matching.sm100.api  # noqa: F401
+        import delta_matching.sm100.attention  # noqa: F401
     except Exception as e:  # noqa: BLE001
         return f"delta_matching.sm100 cannot be imported ({type(e).__name__}: {e})"
     return None
@@ -77,7 +77,7 @@ def _inputs(B, N, H, Hk, family="randn", seed=0):
 
 
 def _run(q, k, v, do, causal, mode="matched"):
-    from delta_matching.sm100.api import dm_attn_func
+    from delta_matching.sm100.attention import dm_attn_func
     qa, ka, va = (x.clone().requires_grad_() for x in (q, k, v))
     o = dm_attn_func(qa, ka, va, causal=causal, mode=mode, deterministic=True)
     o.backward(do)
@@ -124,7 +124,7 @@ def test_accuracy_vs_exact_and_spec_emulation(B, N, H, Hk, causal, mode, family)
     same K-centering mean), close to the emulation itself (rel L2 bounds at ~3x the measured worst), and (Gaussian inputs)
     inside the fp8 floor's absolute bounds; LSE equals the emulation's to fp32 round-off (summation order only)."""
     from delta_matching import reference as R
-    from delta_matching.sm100.api import dm_attn_debug
+    from delta_matching.sm100.attention import dm_attn_debug
     from delta_matching.sm100.quant import quant_qkv2
     q, k, v, do = _inputs(B, N, H, Hk, family, seed=N + H + Hk)
     out = _run(q, k, v, do, causal, mode)
@@ -168,7 +168,7 @@ def test_bitwise_deterministic(B, N, H, Hk, causal):
 @pytest.mark.parametrize("B,N,H,Hk,causal", [(1, 4096, 8, 2, True), (1, 1152, 4, 1, False), (2, 1024, 16, 4, True)])
 def test_zero_sum_identity(B, N, H, Hk, causal, family):
     """max_i |sum_j dS_ij| / sum_j |P_ij dP_ij| <= 1e-5 and its mean <= 2e-7, from the backward's own fp32 dS (pre-quantization)."""
-    from delta_matching.sm100.api import dm_attn_debug
+    from delta_matching.sm100.attention import dm_attn_debug
     q, k, v, do = _inputs(B, N, H, Hk, family, seed=11)
     d = dm_attn_debug(q, k, v, do, causal=causal, mode="matched", identity=True)
     den = d["sum_abs_PdP"].double()
@@ -184,7 +184,7 @@ def test_zero_sum_identity(B, N, H, Hk, causal, family):
 def test_lockstep_dkdv_and_dq_kernels(B, N, H, Hk, causal):
     """The fused dK/dV kernel (KV2) and the dQ kernel compute bitwise the same P, pre-quantization dS and dS codes + scales
     (per-row order-free hashes of every (query, key) value); the dK kernel agrees with the dQ kernel too."""
-    from delta_matching.sm100.api import dm_attn_debug
+    from delta_matching.sm100.attention import dm_attn_debug
     q, k, v, do = _inputs(B, N, H, Hk, "ramp", seed=5)
     d = dm_attn_debug(q, k, v, do, causal=causal, mode="matched", lockstep=True)
     kv, dq, dk = d["lockstep_kv2_kernel"], d["lockstep_dq_kernel"], d["lockstep_dk_kernel"]
@@ -260,7 +260,7 @@ def test_plan_classes_bitwise(causal):
 
 
 def test_input_checks():
-    from delta_matching.sm100.api import dm_attn_func
+    from delta_matching.sm100.attention import dm_attn_func
     q, k, v, _ = _inputs(1, 256, 4, 4)
     with pytest.raises(AssertionError):
         dm_attn_func(q[:, :200], k[:, :200], v[:, :200])                  # N % 128 != 0
