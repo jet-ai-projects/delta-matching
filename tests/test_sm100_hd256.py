@@ -6,7 +6,7 @@
   identity      rowsum(dS) = 0 to fp32 round-off, from the backward's own in-kernel pre-quantization dS (dm_attn_debug identity=True);
   lockstep      P / dS / dS-code hashes of the fused dK/dV kernel equal those of the dQ kernel row by row (dm_attn_debug lockstep=True);
   plan classes  the dS-workspace dQ path under every chunk plan class (batch, KV-head groups, q-head carry, causal q bands, the
-                above-cap fallback) and the two other backward routes (DM_H256_BWD_IMPL=kv2 / mx) are bitwise the default call.
+                above-cap fallback) is bitwise the default call.
 Needs an sm_100 GPU (B200 / GB200) with the CuTe DSL (nvidia-cutlass-dsl, flash-attn cute); skipped elsewhere.  The first run compiles
 the kernels into the CuTe DSL cache (FLASH_ATTENTION_CUTE_DSL_CACHE_DIR), later runs load them (~2 minutes then)."""
 import math
@@ -32,7 +32,7 @@ def _skip_reason():
 REASON = _skip_reason()
 pytestmark = pytest.mark.skipif(REASON is not None, reason=REASON or "")
 D = 256
-ENV_KNOBS = ("DM_BWD_WS_LIMIT_GB", "DM_H256_DQW_GB", "DM_BWD_HEAD_GROUPS", "DM_H256_DQR_CARRY", "DM_H256_BWD_IMPL")
+ENV_KNOBS = ("DM_BWD_WS_LIMIT_GB", "DM_H256_DQW_GB", "DM_BWD_HEAD_GROUPS", "DM_H256_DQR_CARRY")
 
 
 @contextmanager
@@ -197,8 +197,8 @@ def test_lockstep_dkdv_and_dq_kernels(B, N, H, Hk, causal):
 
 # ------------------------------------------------------------------------------------------------------------- plan classes
 def _plan_class(B, H, Hk, N, causal):
-    from delta_matching.sm100 import bwd_hd256dqr as Q
-    p = Q.plan(B, H, Hk, N, causal)
+    from delta_matching.sm100.attention_bwd_hd256_sm100 import plan_backward_chunks
+    p = plan_backward_chunks(B, H, Hk, N, causal)
     if p is None:
         return "fallback"
     r, nt = H // Hk, N // 128
@@ -217,8 +217,8 @@ def _plan_class(B, H, Hk, N, causal):
 
 def _cap_for(cls, B, H, Hk, N, causal, carry):
     """largest workspace cap (GiB, from a fine geometric grid) whose chunk plan is of class cls."""
-    from delta_matching.sm100 import bwd_hd256dqr as Q
-    top = Q._ws_bytes(B, H, N, causal) / 2 ** 30
+    nt = N // 128
+    top = B * H * (nt * (nt + 1) // 2 if causal else nt * nt) * (16384 + 4) / 2 ** 30     # the whole call's workspace
     for i in range(400):
         cap = top * 0.98 ** i
         with _env(DM_BWD_WS_LIMIT_GB=repr(cap), DM_H256_DQR_CARRY=carry):
@@ -232,8 +232,8 @@ PLAN_SHAPE = (2, 4096, 8, 2)
 
 @pytest.mark.parametrize("causal", [True, False])
 def test_plan_classes_bitwise(causal):
-    """dQ / dK / dV / O bitwise the default call (whole-call workspace) under every chunk plan the planner emits for this shape, and
-    under the other two backward routes.  Each reduction keeps its unchunked order, so every plan is exact, not just close."""
+    """dQ / dK / dV / O bitwise the default call (whole-call workspace) under every chunk plan the planner emits for this shape and
+    above the cap.  Each reduction keeps its unchunked order, so every plan is exact, not just close."""
     B, N, H, Hk = PLAN_SHAPE
     q, k, v, do = _inputs(B, N, H, Hk, "randn", seed=21)
     with _env():
@@ -253,9 +253,6 @@ def test_plan_classes_bitwise(causal):
     with _env(DM_BWD_HEAD_GROUPS="1"):
         assert _plan_class(B, H, Hk, N, causal) == "kvgroup"
         assert _bits_equal(ref, _run(q, k, v, do, causal)), "DM_BWD_HEAD_GROUPS=1 differs from the default"
-    for impl in ("kv2", "mx"):
-        with _env(DM_H256_BWD_IMPL=impl):
-            assert _bits_equal(ref, _run(q, k, v, do, causal)), f"DM_H256_BWD_IMPL={impl} differs from the default"
     assert len(seen) == len(arms)
 
 

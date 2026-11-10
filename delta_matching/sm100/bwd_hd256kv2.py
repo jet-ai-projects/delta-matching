@@ -1,6 +1,7 @@
-"""Host entry of the fused paired-CTA hd256 dK/dV kernel KV2.
-dm_bwd_hd256kv2(...) has the signature and outputs of bwd_hd256mx.dm_bwd_hd256mx: dQ from DmHd256Mx's dq mode (unchanged),
-dK / dV from ONE DmHd256Kv2 launch (replacing the dv + dk modes).  Deterministic; no workspace, no atomics outside dbg.
+"""
+Host entry of the fused paired-CTA hd256 dK / dV kernel KV2: kv2_launch runs
+one DmHd256Kv2 launch, composed into the backward by attention_bwd_hd256_sm100.
+Deterministic; no atomics outside the debug builds.
 """
 import torch
 
@@ -88,61 +89,3 @@ def kv2_launch(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal, *, dbg=0, k
     extra = dict(dump=dump, codesP=cp_, codesS=cs_, sbP=sbp, sbS=sbs, hash=hh)
     return dk, dv, extra
 
-
-_SIDE = {}
-
-
-def _side(dev):
-    k = str(dev)
-    if k not in _SIDE:
-        _SIDE[k] = torch.cuda.Stream(device=dev)
-    return _SIDE[k]
-
-
-def _s1_mode():
-    from .launch_cache_sm100 import env as _env
-    v = _env("DM_H256_S1", "kv2first")
-    assert v in ("0", "kv2first", "dqfirst"), v
-    return v
-
-
-def dm_bwd_hd256kv2(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal, *, dbg=0, knob="", opts=None):
-    """Same contract as bwd_hd256mx.dm_bwd_hd256mx: (dq, dk, dv) [+ dbg dict].  dq = DmHd256Mx dq mode, dk/dv = KV2.
-    S1 hand-off proof: at dbg=0 the dq kernel's only global store is dq and KV2's only global
-    stores are dk/dv (no TMA stores, no atomics, no global scratch); both only read the ten inputs.
-    S1 (DM_H256_S1, default kv2first; dbg=0 only): dq and KV2 are independent (both only read the quantized inputs,
-    lse and delta; disjoint outputs) -> dq runs on a side stream concurrently with KV2 on the caller stream, so each fills
-    the other's tail SMs. Same kernels, same inputs, same values; the caller stream joins the side stream before returning."""
-    mode = _s1_mode() if not dbg else "0"
-    if mode != "0" and q8.is_cuda and not _mx._fake() and not torch.cuda.is_current_stream_capturing():  # capture: S1 off
-        main = torch.cuda.current_stream(q8.device)
-        side = _side(q8.device)
-        ready = torch.cuda.Event()
-        ready.record(main)                                  # every input of dq (pass 0's delta included) is enqueued on main
-        ins = (q8, qs, k8, ks, v8, vs, do8, dos, lse, delta)
-
-        def _dq():
-            side.wait_event(ready)
-            with torch.cuda.stream(side):
-                r = _mx.dm_bwd_hd256mx(*ins, causal, modes=("dq",))
-            for t in ins:
-                t.record_stream(side)                       # inputs read on side: no reuse before side is done
-                t.record_stream(main)                       # and before KV2 on main is done even if they came from another stream
-            r[0].record_stream(main)                        # side-allocated dq consumed on main
-            return r[0]
-
-        if mode == "dqfirst":
-            dq = _dq()
-        dk, dv, _ = kv2_launch(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal, knob=knob, opts=opts)
-        if mode == "kv2first":
-            dq = _dq()
-        main.wait_stream(side)
-        return dq, dk, dv
-    r = _mx.dm_bwd_hd256mx(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal, dbg=dbg & ~16, modes=("dq",))
-    dq, d = r[0], (r[3] if dbg & ~16 else {})
-    del r                    # the dq-only call's unused (empty) dk / dv buffers go back to the allocator before KV2 allocates
-    dk, dv, ex = kv2_launch(q8, qs, k8, ks, v8, vs, do8, dos, lse, delta, causal, dbg=dbg, knob=knob, opts=opts)
-    if dbg:
-        d["kv2"] = ex
-        return dq, dk, dv, d
-    return dq, dk, dv
