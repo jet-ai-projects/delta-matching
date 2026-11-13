@@ -321,15 +321,24 @@ struct DeltaV4N {
             if (barrier_token == cutlass::BarrierStatus::WaitAgain) { shared_storage.pipelines.barrier_KV.wait(0); }
 
             // DeltaV4's exp_step / rowsum_step, verbatim.
-            auto exp_step = [&](auto& tSrS, int m_block, int n_block, float lse0, float lse1, float dsc_g0, float dsc_g1) {
+            // KDA-P0B MSPLIT: the tile's mask predicate (DeltaV4's, verbatim).  It is non-increasing in m_block (the causal
+            // term falls as m_block grows, the seqlen_k tail term does not depend on m_block), so the m loop below is split
+            // at the first m-block where it is false for BOTH of the warpgroup's n-blocks: the leading (diagonal) part runs
+            // the masked body (per-n-block predicate unchanged), the rest a body with no mask code at all (bitwise: there
+            // the predicate is false, so the masked body would have skipped the mask and the floor too).
+            auto need_mask_fn = [&](int m_block, int n_block) {
+                return (Is_causal && (n_block + 1) * kBlockN > m_block * kBlockM + (seqlen_k - seqlen_q))
+                       || ((n_block + 1) * kBlockN > seqlen_k);
+            };
+            auto exp_step = [&](auto& tSrS, int m_block, int n_block, float lse0, float lse1, float dsc_g0, float dsc_g1, auto masked_c) {
                 Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
                 static_assert(decltype(size<0>(scores))::value == 2 && decltype(size<1>(scores))::value == 16,
                               "DeltaV4N: expected 2 rows x 16 columns per thread for a 64x64 tile");
-                bool const need_mask = (Is_causal && (n_block + 1) * kBlockN > m_block * kBlockM + (seqlen_k - seqlen_q))
-                                       || ((n_block + 1) * kBlockN > seqlen_k);
-                if (need_mask) {
-                    mask.template apply<true /*Seqlenk_mask*/, Is_causal, false /*Is_local*/>(tSrS, m_block, n_block);
-                    dsc_g0 = fmaxf(dsc_g0, 1.17549435e-38f); dsc_g1 = fmaxf(dsc_g1, 1.17549435e-38f);
+                if constexpr (decltype(masked_c)::value) {
+                    if (need_mask_fn(m_block, n_block)) {
+                        mask.template apply<true /*Seqlenk_mask*/, Is_causal, false /*Is_local*/>(tSrS, m_block, n_block);
+                        dsc_g0 = fmaxf(dsc_g0, 1.17549435e-38f); dsc_g1 = fmaxf(dsc_g1, 1.17549435e-38f);
+                    }
                 }
                 #pragma unroll
                 for (int mi = 0; mi < 2; ++mi) {
@@ -376,8 +385,7 @@ struct DeltaV4N {
             Tensor tdPrdP_j0 = make_tensor(tdPrdP.data(), lay64);
             Tensor tdPrdP_j1 = make_tensor(tdPrdP.data() + decltype(size(lay64))::value, lay64);
 
-            CUTLASS_PRAGMA_NO_UNROLL
-            for (int m_block = m_block_min; m_block < m_block_max; ++m_block) {
+            auto body = [&](int m_block, auto masked_c) {
                 auto tok = pipeline_qdo.consumer_try_wait(smem_pipe_read);
                 pipeline_qdo.consumer_wait(smem_pipe_read, tok);
                 int const stage = smem_pipe_read.index();
@@ -390,9 +398,9 @@ struct DeltaV4N {
                 warpgroup_wait<1>();   // S retired
                 warpgroup_fence_operand(tSrS);
                 exp_step(tSrS_j0, m_block, nb_base + 0, lse0, lse1,
-                         fq8_q8sc * fq8_k8s_g0[0] * float(M_LOG2E), fq8_q8sc * fq8_k8s_g1[0] * float(M_LOG2E));
+                         fq8_q8sc * fq8_k8s_g0[0] * float(M_LOG2E), fq8_q8sc * fq8_k8s_g1[0] * float(M_LOG2E), masked_c);
                 exp_step(tSrS_j1, m_block, nb_base + 1, lse0, lse1,
-                         fq8_q8sc * fq8_k8s_g0[1] * float(M_LOG2E), fq8_q8sc * fq8_k8s_g1[1] * float(M_LOG2E));
+                         fq8_q8sc * fq8_k8s_g0[1] * float(M_LOG2E), fq8_q8sc * fq8_k8s_g1[1] * float(M_LOG2E), masked_c);
                 warpgroup_wait<0>();   // dP retired: every read of the stage is done
                 warpgroup_fence_operand(tdPrdP);
                 pipeline_qdo.consumer_release(smem_pipe_read);
@@ -401,6 +409,15 @@ struct DeltaV4N {
                 rowsum_step(tSrS_j1, tdPrdP_j1, m_block, 1, fq8_do8sc * fq8_v8s_g0[1], fq8_do8sc * fq8_v8s_g1[1]);
                 warpgroup_fence_operand(tSrS);
                 warpgroup_fence_operand(tdPrdP);
+            };
+            int m_block = m_block_min;
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (; m_block < m_block_max && (need_mask_fn(m_block, nb_base) || need_mask_fn(m_block, nb_base + 1)); ++m_block) {
+                body(m_block, cute::true_type{});
+            }
+            CUTLASS_PRAGMA_NO_UNROLL
+            for (; m_block < m_block_max; ++m_block) {
+                body(m_block, cute::false_type{});
             }
         }
     }
