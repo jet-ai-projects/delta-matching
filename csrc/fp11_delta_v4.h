@@ -28,6 +28,7 @@
 #include <array>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <tuple>
 #include <vector>
 
@@ -527,6 +528,9 @@ struct DeltaV4 {
 
 #include "fp11_delta_v4n.h"   // KDA-P0: d256 pass 0 with one n128 wgmma chain per warpgroup
 
+#ifndef FA3FP11_D256_P0TAIL
+#define FA3FP11_D256_P0TAIL 1
+#endif
 #ifndef FA3FP11_D256_P0LPT
 #define FA3FP11_D256_P0LPT 1
 #endif
@@ -599,15 +603,70 @@ void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t str
                 }
             }
             std::stable_sort(part.begin(), part.end(), [](auto const& a, auto const& b) { return (a[3] - a[2]) > (b[3] - b[2]); });
+            std::vector<std::array<int, 4>> units = full;
+            units.insert(units.end(), part.begin(), part.end());
+            if (kHeadDim_ >= 256 && FA3FP11_D256_P0LPT && FA3FP11_D256_P0TAIL) {
+                // KDA-P0B TAIL (persistent-kernel / tail-effect style balance on the unit table, bitwise): the units are
+                // dispatched in table order to whichever SM frees first.  Equal-length non-causal units leave a partial
+                // last wave (e.g. 512 units of 256 m-blocks on 132 SMs = 3.88 waves).  Keep the first K units whole and cut
+                // the rest stream-K style: their m ranges, concatenated, are cut into num_sm segments of equal work, each
+                // piece = the part of one unit inside one segment; pieces are dispatched longest first.  K (from
+                // (waves - w) * num_sm, w = 0..5, or no cut at all) minimizes a list-scheduling model of the dispatch
+                // (piece cost = its m-blocks + 2 for the K/V load and pipeline fill; fitted to the measured chunk-32 vs
+                // one-unit pass 0 times).  Every (m-block, n-block) tile is still computed exactly once into its slot.
+                int const S = std::max(1, params.num_sm);
+                auto simulate = [&](std::vector<std::array<int, 4>> const& v) {
+                    std::priority_queue<double, std::vector<double>, std::greater<double>> h;
+                    for (int i = 0; i < S; ++i) { h.push(0.0); }
+                    double mx = 0.0;
+                    for (auto const& e : v) {
+                        double t = h.top(); h.pop();
+                        t += double(e[3] - e[2]) + 2.0;
+                        mx = std::max(mx, t);
+                        h.push(t);
+                    }
+                    return mx;
+                };
+                auto streamk = [&](int K) {
+                    std::vector<std::array<int, 4>> out(units.begin(), units.begin() + K), pieces;
+                    int64_t tot = 0;
+                    for (size_t i = K; i < units.size(); ++i) { tot += units[i][3] - units[i][2]; }
+                    if (tot == 0) { return out; }
+                    int64_t const seg = (tot + S - 1) / S;
+                    int64_t pos = 0;
+                    for (size_t i = K; i < units.size(); ++i) {
+                        auto const& e = units[i];
+                        int lo = e[2];
+                        while (lo < e[3]) {
+                            int64_t const room = seg - pos % seg;
+                            int const take = int(std::min<int64_t>(room, e[3] - lo));
+                            pieces.push_back({e[0], e[1], lo, lo + take});
+                            lo += take; pos += take;
+                        }
+                    }
+                    std::stable_sort(pieces.begin(), pieces.end(), [](auto const& a, auto const& b) { return (a[3] - a[2]) > (b[3] - b[2]); });
+                    out.insert(out.end(), pieces.begin(), pieces.end());
+                    return out;
+                };
+                std::vector<std::array<int, 4>> best = units;
+                double best_t = simulate(units);
+                int const U = int(units.size());
+                for (int w = 0; w < 6; ++w) {
+                    int const Kw = std::max(0, (U / S - w) * S);
+                    auto c = streamk(Kw);
+                    double const t = simulate(c);
+                    if (t < best_t - 1e-6) { best_t = t; best = std::move(c); }
+                }
+                units = std::move(best);
+            }
             std::vector<int> flat;
-            for (auto const& e : full) { flat.insert(flat.end(), e.begin(), e.end()); }
-            for (auto const& e : part) { flat.insert(flat.end(), e.begin(), e.end()); }
+            for (auto const& e : units) { flat.insert(flat.end(), e.begin(), e.end()); }
             int* dbuf = nullptr;
             CHECK_CUDA(cudaMalloc(&dbuf, flat.size() * sizeof(int)));
             // stream-ordered and synchronous for this call (the host vector dies at the end of the scope)
             CHECK_CUDA(cudaMemcpyAsync(dbuf, flat.data(), flat.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
             CHECK_CUDA(cudaStreamSynchronize(stream));
-            it = cache.emplace(key, std::make_pair(dbuf, int(full.size() + part.size()))).first;
+            it = cache.emplace(key, std::make_pair(dbuf, int(units.size()))).first;
         }
         unit_tab = it->second.first;
         nunits = it->second.second;
