@@ -103,7 +103,14 @@ constexpr int kBK = 64;      // contraction depth per tile (= pass-1 kBlockN)
 // kStages=2 the CTA is 109568 B -> 2 CTAs/SM again (regs R158 allow 3), and
 // the measured cost is 0.462 ms.  Pipeline depth changes NO arithmetic: the
 // barrier phase/slot math below is depth-generic.
-constexpr int kStages = 2;
+constexpr int kStages = 3;
+// ## P2W2: kWG row blocks (one math warpgroup each) per CTA share every K^T tile: the K^T bytes pass 2 streams from L2
+// (16 KB per 64 x 256 x 64 tile, the dominant traffic) drop by kWG.  Each warpgroup runs the single-warpgroup tile
+// sequence of its own row block verbatim (same psi, skips, windows, promotes, epilogue): bitwise by construction.
+constexpr int kWG = 2;
+// ## P2D: plus one producer warp (TMA issue, decoupled from the math warpgroups through per-stage empty barriers),
+// so the two warpgroups drift independently by up to kStages - 1 tiles instead of running in lockstep.
+constexpr int kThreads = 128 * kWG + 32;
 
 // ## FP11-M3: promotion window length in tiles (C).  PINNED at 8 (512 keys):
 // ONE realization class per the design notes (no build knob).  the derivation notes: the
@@ -140,12 +147,13 @@ using SmemLayoutB = decltype(tile_to_shape(
     SmemLayoutAtomB{}, make_shape(Int<kBD>{}, Int<kBK>{}, Int<kStages>{})));
 
 struct SharedStorage {
-    cute::array_aligned<Element, cute::cosize_v<SmemLayoutA>, 1024> smem_a;
+    cute::array_aligned<Element, cute::cosize_v<SmemLayoutA> * kWG, 1024> smem_a;   // [wg][stage] (cosize is 1024-B multiple)
     cute::array_aligned<Element, cute::cosize_v<SmemLayoutB>, 1024> smem_b;
     // ## FP11-M3: persistent fp32 dQ accumulator, TRUE unnormalized units
-    // (psi folded at promote time), 64 x 264 x 4 = 67584 B.
-    cute::array_aligned<float, kBM * kDqPitch, 1024> smem_dq;
+    // (psi folded at promote time), 64 x 264 x 4 = 67584 B per warpgroup.
+    cute::array_aligned<float, kWG * kBM * kDqPitch, 1024> smem_dq;
     alignas(16) cutlass::arch::ClusterTransactionBarrier full_bar[kStages];
+    alignas(16) cutlass::arch::ClusterBarrier empty_bar[kStages];   // P2D: one arrival per math warpgroup per tile
 };
 
 using ShapeA = cute::Shape<Int<kBM>, Int<kBK>, int32_t, int32_t, int32_t>;   // (m, k, nb, mb, bh)
@@ -161,7 +169,9 @@ using TmaB = decltype(make_tma_copy(
     make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeB{}, StrideB{}),
     SmemLayoutB{}(_, _, _0{})));
 
-constexpr uint32_t kTxBytes = kBM * kBK + kBD * kBK;   // both tiles, e4m3 bytes
+constexpr uint32_t kTxBytesA = kBM * kBK;   // one row block's dS' tile, e4m3 bytes
+constexpr uint32_t kTxBytesB = kBD * kBK;   // the shared K^T tile
+static_assert(cute::cosize_v<SmemLayoutA> % 1024 == 0, "pass 2: per-warpgroup A stages must keep the swizzle alignment");
 
 struct P2Params {
     TmaA tma_a;
@@ -179,34 +189,39 @@ struct P2Params {
 };
 
 template <bool Is_causal>
-__global__ void __launch_bounds__(128, 1)
+__global__ void __launch_bounds__(kThreads, 1)
 fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     extern __shared__ char smem_raw[];
     auto& shared = *reinterpret_cast<SharedStorage*>(smem_raw);
-    int const mb = params.nbm - 1 - blockIdx.x;   // longest-first
+    int const npair = (params.nbm + kWG - 1) / kWG;
+    int const mb0 = (npair - 1 - int(blockIdx.x)) * kWG;   // longest-first (by the CTA's last row block)
+    int const wg = __shfl_sync(0xffffffff, int(threadIdx.x) / 128, 0);
+    int const mb = mb0 + wg;
+    bool const wg_valid = mb < params.nbm;
+    int const mb_last = min(mb0 + kWG - 1, params.nbm - 1);
     int const bh = blockIdx.y;
-    int const nb_end = Is_causal ? (mb + 1) : params.nbn;
-    int const tid = threadIdx.x;
+    // nb_end: this warpgroup's tile count; nb_cta: the CTA's (the shared loop trip count, uniform over the CTA).
+    int const nb_end = !wg_valid ? 0 : (Is_causal ? (mb + 1) : params.nbn);
+    int const nb_cta = Is_causal ? (mb_last + 1) : params.nbn;
+    int const tid = threadIdx.x % 128;     // thread index inside the warpgroup (the single-warpgroup kernel's tid)
+    int const ctid = threadIdx.x;
 
-    if (tid == 0) {
+    if (ctid == 0) {
         #pragma unroll
-        for (int s = 0; s < kStages; ++s) { shared.full_bar[s].init(1); }
+        for (int s = 0; s < kStages; ++s) { shared.full_bar[s].init(1); shared.empty_bar[s].init(kWG); }
     }
     cutlass::arch::fence_barrier_init();
     __syncthreads();
 
-    Tensor sA = make_tensor(make_smem_ptr(shared.smem_a.data()), SmemLayoutA{});
+    Tensor sA = make_tensor(make_smem_ptr(shared.smem_a.data() + wg * cute::cosize_v<SmemLayoutA>), SmemLayoutA{});
     Tensor sB = make_tensor(make_smem_ptr(shared.smem_b.data()), SmemLayoutB{});
     Tensor mA = params.tma_a.get_tma_tensor(params.shape_a);
     Tensor mB = params.tma_b.get_tma_tensor(params.shape_b);
-    Tensor gA = mA(_, _, _, mb, bh);                                    // (64, 64, nbn)
     // ## FP11-M16 (native GQA): B operand indexed by KV head.
     int const bh_kv = (bh / params.h) * params.h_k + (bh % params.h) / (params.h / params.h_k);
     Tensor gB = flat_divide(mB(_, _, bh_kv), Shape<Int<kBD>, Int<kBK>>{})(_, _, _0{}, _);  // (256, 64, nbn)
     auto blkA = params.tma_a.get_slice(_0{});
     auto blkB = params.tma_b.get_slice(_0{});
-    Tensor tAgA = group_modes<0, 3>(blkA.partition_S(gA));              // (TMA, nbn)
-    Tensor tAsA = group_modes<0, 3>(blkA.partition_D(sA));              // (TMA, stages)
     Tensor tBgB = group_modes<0, 3>(blkB.partition_S(gB));
     Tensor tBsB = group_modes<0, 3>(blkB.partition_D(sB));
 
@@ -222,30 +237,57 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     // map keys smem_dq ownership (promote + zero-init) and the epilogue.
     Tensor cC = cute::make_identity_tensor(make_shape(Int<kBM>{}, Int<kBD>{}));
     Tensor tCcC = wg_mma.partition_C(cC);
-    float* const smem_dq = shared.smem_dq.data();
+    float* const smem_dq = shared.smem_dq.data() + wg * (kBM * kDqPitch);
 
     // ## FP11-M3: cooperative zero-init of the persistent dQ accumulator,
     // before the pipeline warmup.  Each thread zeroes exactly its own
     // fragment-owned slots, so no extra __syncthreads is needed anywhere:
     // every later access to these slots is by the writing thread itself.
+    if (wg < kWG) {   // P2D: the producer warp owns no smem_dq slots
     #pragma unroll
     for (int i = 0; i < size(acc); i += 2) {
         int const m = get<0>(tCcC(i));
         int const d = get<1>(tCcC(i));
         *reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]) = make_float2(0.0f, 0.0f);
     }
+    }
 
+    // One elected thread loads the shared K^T tile and the dS' tile of every row block that needs this tile
+    // (causal: the lower row block of a pair stops one tile early).
     auto issue = [&](int tile) {
-        if (tid == 0) {
+        {
             int const s = tile % kStages;
-            shared.full_bar[s].arrive_and_expect_tx(kTxBytes);
+            int na = 0;
+            #pragma unroll
+            for (int w = 0; w < kWG; ++w) {
+                int const mbw = mb0 + w;
+                na += (mbw < params.nbm && (!Is_causal || tile <= mbw)) ? 1 : 0;
+            }
+            shared.full_bar[s].arrive_and_expect_tx(kTxBytesB + na * kTxBytesA);
             auto& bar = reinterpret_cast<uint64_t&>(shared.full_bar[s]);
-            copy(params.tma_a.with(bar, 0 /*mcast*/), tAgA(_, tile), tAsA(_, s));
+            #pragma unroll
+            for (int w = 0; w < kWG; ++w) {
+                int const mbw = mb0 + w;
+                if (mbw < params.nbm && (!Is_causal || tile <= mbw)) {
+                    Tensor sAw = make_tensor(make_smem_ptr(shared.smem_a.data() + w * cute::cosize_v<SmemLayoutA>), SmemLayoutA{});
+                    Tensor tAgA = group_modes<0, 3>(blkA.partition_S(mA(_, _, _, mbw, bh)));   // (TMA, nbn)
+                    Tensor tAsA = group_modes<0, 3>(blkA.partition_D(sAw));                     // (TMA, stages)
+                    copy(params.tma_a.with(bar, 0 /*mcast*/), tAgA(_, tile), tAsA(_, s));
+                }
+            }
             copy(params.tma_b.with(bar, 0 /*mcast*/), tBgB(_, tile), tBsB(_, s));
         }
     };
-    #pragma unroll 1
-    for (int t = 0; t < (kStages < nb_end ? kStages : nb_end); ++t) { issue(t); }
+    if (wg == kWG) {   // P2D producer warp: refill slot s once both warpgroups released its previous tile
+        if (cute::elect_one_sync()) {
+            #pragma unroll 1
+            for (int nb = 0; nb < nb_cta; ++nb) {
+                if (nb >= kStages) { shared.empty_bar[nb % kStages].wait(((nb / kStages) - 1) & 1); }
+                issue(nb);
+            }
+        }
+        return;
+    }
 
     float const* psi_row = params.ptr_psi + (int64_t(bh) * params.nbm + mb) * params.nbn;
     // ## FP11-M3 window state: psi_w = the last TAKEN psi in the CURRENT
@@ -258,9 +300,9 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     // psi of tile nb is loaded one iteration early, so its load latency overlaps the barrier wait.
     float psi_pf = nb_end > 0 ? psi_row[0] : 0.0f;
     #pragma unroll 1
-    for (int nb = 0; nb < nb_end; ++nb) {
+    for (int nb = 0; nb < nb_cta; ++nb) {
         int const s = nb % kStages;
-        float const psi_cur = psi_pf;
+        float const psi_cur = nb < nb_end ? psi_pf : 0.0f;   // past this warpgroup's tail: psi 0 = no gemm, no state change
         if (nb + 1 < nb_end) { psi_pf = psi_row[nb + 1]; }
         shared.full_bar[s].wait((nb / kStages) & 1);
         // ## FP11-F2: psi == 0.0f is pass 1's zero-tile sentinel (fully
@@ -322,9 +364,11 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
         // count (nb_end is CTA-uniform), zero arithmetic effect (bitwise-
         // invisible on every input); on taken tiles the warps are already
         // converged by wg_wait=0, so the cost is a no-op bar.sync per tile.
-        __syncthreads();
-        int const nxt = nb + kStages;   // slot s fully consumed (wg_wait=0)
-        if (nxt < nb_end) { issue(nxt); }
+        // P2D release: every thread of this warpgroup has passed wait(nb) (and its gemm retired, wg_wait=0) before
+        // the elected arrive, so the producer's re-arm of slot s can never race a lagging waiter (the M10 invariant,
+        // now per warpgroup); the trip count nb_cta is CTA-uniform.
+        cutlass::arch::NamedBarrier::sync(128, 1 + wg);
+        if (tid == 0) { shared.empty_bar[s].arrive(); }
         // ## FP11-M3 window boundary: geometry-fixed (every kPromoteTiles-th
         // tile index + the tail), data-independent.  Promote the window into
         // smem_dq in TRUE units (fold psi_w NOW: this replaces v10's row-end
@@ -332,7 +376,7 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
         // explicit re-zero: the next window's first taken wgmma starts with
         // scale_d = 0.  An all-skipped window (psi_w == 0) promotes nothing.
         // Placed after issue(nxt) so the promote overlaps the next TMA loads.
-        if ((nb & (kPromoteTiles - 1)) == kPromoteTiles - 1 || nb == nb_end - 1) {
+        if (nb < nb_end && ((nb & (kPromoteTiles - 1)) == kPromoteTiles - 1 || nb == nb_end - 1)) {
             if (psi_w != 0.0f) {
                 #pragma unroll
                 for (int i = 0; i < size(acc); i += 2) {
@@ -352,6 +396,7 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     // Epilogue: smem_dq already holds TRUE unnormalized dQ (psi folded per
     // window); apply final_scale = sm/256 ONLY.  A row whose every tile was
     // a sentinel/skip leaves smem_dq at its zero-init: dq is exactly zero.
+    if (!wg_valid) { return; }
     float const fin = params.final_scale;
     int const b_idx = bh / params.h;
     int const h_idx = bh % params.h;
@@ -406,10 +451,10 @@ void run_fq8_dq_pass2_fp11(Flash_bwd_fp8_params &params, cudaStream_t stream) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem));
     }
     if (std::getenv("DM_DEBUG")) {
-        fprintf(stderr, "[delta_matching pass 2] smem_size=%d grid=(%d,%d) block=128 kPromoteTiles=%d kDqPitch=%d\n",
-                kSmem, nbm, bh, kPromoteTiles, kDqPitch);
+        fprintf(stderr, "[delta_matching pass 2] smem_size=%d grid=(%d,%d) block=%d kPromoteTiles=%d kDqPitch=%d\n",
+                kSmem, cute::ceil_div(nbm, kWG), bh, kThreads, kPromoteTiles, kDqPitch);
     }
-    dim3 grid(nbm, bh, 1);
-    kernel<<<grid, 128, kSmem, stream>>>(p2);
+    dim3 grid(cute::ceil_div(nbm, kWG), bh, 1);
+    kernel<<<grid, kThreads, kSmem, stream>>>(p2);
     { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { fprintf(stderr, "[delta_matching pass 2] launch: %s\n", cudaGetErrorString(e_)); exit(1); } }
 }
