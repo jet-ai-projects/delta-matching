@@ -78,8 +78,8 @@ public:
     // spills.  40/232 fits the file: 128*(40 + 2*232) = 64512 <= 65536.
     // ## FQ8-V9 register split, MEASURED repeatedly: 24 spills the transposer
     // to 31.7ms; 32 starves it into a crawl even at ILP=1; 40/232 is the point.
-    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 2 ? 40 : 32;
-    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 232 : 160;
+    static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 2 ? 24 : 32;   // GT: the transposer warps idle; 24 frees 8 regs per MMA thread
+    static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 240 : 160;
     // If you want to print from the producer warp, you'd need to increase the number of registers
     // Otherwise you'll get CUDA error.
     // static constexpr uint32_t LoadRegisterRequirement = 40;
