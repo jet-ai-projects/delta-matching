@@ -2248,10 +2248,15 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             // overlaps the next tile's TMA waits.
             if ((m_block & (kFq8PromoteTiles - 1)) == kFq8PromoteTiles - 1
                     || m_block == m_block_max - 1) {
+                // PROMOTEBATCH: all 64 slot loads first (the dK temp is dead here), then the 64 FMAs and stores, so the
+                // LDS latency is paid once instead of per short dependent group.  Same fmaf per element.
+                static_assert(decltype(size(tdVrdV))::value == 64, "delta_matching PROMOTEBATCH: 64 dV values per thread");
+                float fq8_pv[64];
                 #pragma unroll
-                for (int i = 0; i < size(tdVrdV); ++i) {
-                    float* const slot = fq8_dv_base[i & 1][(i >> 1) & 1] + fq8_dv_off(i);
-                    *slot = fmaf(tdVrdV(i), fq8_f_prev, *slot);
+                for (int i = 0; i < 64; ++i) { fq8_pv[i] = fq8_dv_base[i & 1][(i >> 1) & 1][fq8_dv_off(i)]; }
+                #pragma unroll
+                for (int i = 0; i < 64; ++i) {
+                    fq8_dv_base[i & 1][(i >> 1) & 1][fq8_dv_off(i)] = fmaf(tdVrdV(i), fq8_f_prev, fq8_pv[i]);
                     tdVrdV(i) = 0.0f;
                 }
             }
