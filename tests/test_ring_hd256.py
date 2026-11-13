@@ -125,6 +125,10 @@ def test_rejections():
         _call_g(t, A, acc.bfloat16(), 2)
     with pytest.raises(RuntimeError):
         _call_g(t, A, acc[:1024], 2)
+    with pytest.raises(RuntimeError):   # 4-byte aligned float2 target
+        _call_g(t, A, torch.zeros(2048 * H * D + 2, device="cuda")[1:-1].view(2048, H, D), 2)
+    with pytest.raises(RuntimeError):   # overlapping rows (every row the same memory)
+        _call_g(t, A, torch.zeros(1, H, D, device="cuda").expand(2048, H, D), 2)
     bad = list(A)
     kt = t["kTt"][..., :t["c"]]
     bad[6] = kt.transpose(2, 3).contiguous().transpose(2, 3)   # s not unit-stride

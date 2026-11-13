@@ -291,6 +291,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
                     && dq_acc.size(2) == head_size && dq_acc.stride(2) == 1 && dq_acc.stride(0) % 2 == 0 && dq_acc.stride(1) % 2 == 0,
                     "delta_matching bwd (ring): dq_acc must be fp32 (s_q, h, d) with d contiguous");
         TORCH_CHECK(dq_acc_mode == 1 || dq_acc_mode == 2, "delta_matching bwd (ring): dq_acc_mode 1 (accumulate) or 2 (store)");
+        // pass 2 reads / writes dq_acc as float2 and each (row, head) is owned by one CTA warpgroup: 8-byte aligned and
+        // non-overlapping ((s, h, d) or (h, s, d) order with no shared rows).
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(dq_acc.data_ptr()) % 8 == 0, "delta_matching bwd (ring): dq_acc must be 8-byte aligned");
+        TORCH_CHECK((dq_acc.stride(1) >= head_size && dq_acc.stride(0) >= dq_acc.stride(1) * num_heads)
+                    || (dq_acc.stride(0) >= head_size && dq_acc.stride(1) >= dq_acc.stride(0) * seqlen_q),
+                    "delta_matching bwd (ring): dq_acc rows must not overlap");
         for (auto const& t : {kt8, qt8, dot8}) {
             TORCH_CHECK(t.stride(3) == 1 && t.stride(2) % 16 == 0 && t.stride(1) % 16 == 0 && t.stride(0) % 16 == 0,
                         "delta_matching bwd (ring): twins need s unit-stride and 16-byte multiple strides");

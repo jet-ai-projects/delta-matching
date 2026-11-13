@@ -356,6 +356,15 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
         }
     };
 
+    // ## CP ring, accumulate mode: pull this row block's fp32 dQ (64 rows x 1 KB) into L2 now, so the epilogue's
+    // read-modify-write hits L2 instead of exposing an HBM round trip at the CTA's tail (cache hint only).
+    if (params.dq_acc != nullptr && params.dq_acc_mode == 1 && wg_valid) {
+        float const* const dqa = params.dq_acc + int64_t(bh % params.h) * params.dqa_head_stride + int64_t(mb) * kBM * params.dqa_row_stride;
+        #pragma unroll
+        for (int l = tid; l < kBM * (kBD / 32); l += 128) {   // 32 floats = one 128-B line
+            asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(dqa + int64_t(l / (kBD / 32)) * params.dqa_row_stride + (l % (kBD / 32)) * 32));
+        }
+    }
     // P2B-OVL: issue one half's two k32 wgmmas and commit, WITHOUT flash::gemm's trailing fence_operand on the
     // in-flight accumulator (that register use made ptxas inject a full wgmma wait before the other half's work).
     auto issue_h = [&](auto& a, auto const& tB, int st, bool zero) {
@@ -444,15 +453,29 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     if (params.dq_acc != nullptr) {   // ## CP ring: fp32 dQ (s_q, h, d) += float(bf16(dQ block)), batch 1
         float* const dqa = params.dq_acc + int64_t(h_idx) * params.dqa_head_stride + int64_t(mb) * kBM * params.dqa_row_stride;
         bool const acc_mode = params.dq_acc_mode == 1;
+        // Batches of kSlots float2 slots: all loads of a batch issue before its stores (one round trip per batch
+        // instead of a load / store chain per slot); same values, same per-slot arithmetic.
+        constexpr int kSlots = 16;
+        static_assert(size(decltype(acc){}) % (2 * kSlots) == 0, "pass 2: dQ slot batches must tile the fragment");
         #pragma unroll
-        for (int i = 0; i < size(acc); i += 2) {
-            int const m = get<0>(tCcC(i));
-            int const d = get<1>(tCcC(i));
-            float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
-            cutlass::bfloat16_t lo(v2.x * fin), hi(v2.y * fin);
-            float2* const o = reinterpret_cast<float2*>(dqa + int64_t(m) * params.dqa_row_stride + d);
-            float2 const base = acc_mode ? *o : make_float2(0.0f, 0.0f);
-            *o = make_float2(add_rn_noftz(base.x, float(lo)), add_rn_noftz(base.y, float(hi)));
+        for (int i0 = 0; i0 < size(acc); i0 += 2 * kSlots) {
+            float2 base[kSlots];
+            #pragma unroll
+            for (int j = 0; j < kSlots; ++j) {
+                int const m = get<0>(tCcC(i0 + 2 * j));
+                int const d = get<1>(tCcC(i0 + 2 * j));
+                base[j] = acc_mode ? *reinterpret_cast<float2 const*>(dqa + int64_t(m) * params.dqa_row_stride + d)
+                                   : make_float2(0.0f, 0.0f);
+            }
+            #pragma unroll
+            for (int j = 0; j < kSlots; ++j) {
+                int const m = get<0>(tCcC(i0 + 2 * j));
+                int const d = get<1>(tCcC(i0 + 2 * j));
+                float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
+                cutlass::bfloat16_t lo(v2.x * fin), hi(v2.y * fin);
+                *reinterpret_cast<float2*>(dqa + int64_t(m) * params.dqa_row_stride + d) =
+                    make_float2(add_rn_noftz(base[j].x, float(lo)), add_rn_noftz(base[j].y, float(hi)));
+            }
         }
         return;
     }
