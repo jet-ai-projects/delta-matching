@@ -173,8 +173,8 @@ struct SharedStorage {
 
 using ShapeA = cute::Shape<Int<kBM>, Int<kBK>, int32_t, int32_t, int32_t>;   // (m, k, nb, mb, bh)
 using StrideA = cute::Stride<Int<kBK>, _1, int64_t, int64_t, int64_t>;
-using ShapeB = cute::Shape<Int<kBD>, int32_t, int32_t>;                       // (d, s, bh)
-using StrideB = cute::Stride<int64_t, _1, int64_t>;
+using ShapeB = cute::Shape<Int<kBD>, int32_t, int32_t, int32_t>;              // (d, s, h_k, b)  ## CP ring: 4-D, strided
+using StrideB = cute::Stride<int64_t, _1, int64_t, int64_t>;
 using TmaA = decltype(make_tma_copy(
     cute::SM90_TMA_LOAD{},
     make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeA{}, StrideA{}),
@@ -199,6 +199,12 @@ struct P2Params {
     // ## FP11-M16 (native GQA, READ side): the Kt twin is per KV head
     // [b, h_k, d, s]; h_k == h reproduces the M10 index arithmetic exactly.
     int h_k;
+    // ## CP ring (dm_cp): dq_acc != nullptr: grid.y = h, each CTA loops over the nbatch batches of its (m-block, head)
+    // (one tile stream, the promote windows continue across batches) and writes fp32 dQ (mode 1 accumulate, 2 store).
+    float* dq_acc;
+    int64_t dqa_row_stride, dqa_head_stride;
+    int dq_acc_mode;
+    int nbatch;
 };
 
 template <bool Is_causal>
@@ -207,12 +213,15 @@ fq8_dq_pass2_kernel_hd128(CUTE_GRID_CONSTANT P2Params const params) {
     extern __shared__ char smem_raw[];
     auto& shared = *reinterpret_cast<SharedStorage*>(smem_raw);
     int const mb = params.nbm - 1 - blockIdx.x;   // longest-first
-    int const bh = blockIdx.y;
+    bool const loopb = params.dq_acc != nullptr;   // ## CP ring: batch loop inside the CTA
+    int const nbat = loopb ? params.nbatch : 1;
+    int const bh = blockIdx.y;                      // loopb: the head (batch 0); else b * h + head
     // ## Delta-Matching-128 FIX (M19): the d256 form `mb + 1` assumes kBM == kBK (64-key tiles).  At hd128 the
     // dS' tiles are 128 keys wide (kBK = 2 kBM): the last tile a causal row block reads is the one holding its last
     // row's diagonal key, nb_end = ((mb + 1) kBM - 1) / kBK + 1 (= mb/2 + 1); pass 1 writes exactly these tiles
     // (m_block_min = 2 nb), and every tile beyond is UNWRITTEN workspace (the nondeterministic NaN dq of an earlier build).
-    int const nb_end = Is_causal ? (((mb + 1) * kBM - 1) / kBK + 1) : params.nbn;
+    int const nb_end1 = Is_causal ? (((mb + 1) * kBM - 1) / kBK + 1) : params.nbn;   // tiles per batch
+    int const nb_end = nb_end1 * nbat;                                                  // ## CP ring: the whole tile stream
     int const tid = threadIdx.x;
 
     if (tid == 0) {
@@ -226,15 +235,14 @@ fq8_dq_pass2_kernel_hd128(CUTE_GRID_CONSTANT P2Params const params) {
     Tensor sB = make_tensor(make_smem_ptr(shared.smem_b.data()), SmemLayoutB{});
     Tensor mA = params.tma_a.get_tma_tensor(params.shape_a);
     Tensor mB = params.tma_b.get_tma_tensor(params.shape_b);
-    Tensor gA = mA(_, _, _, mb, bh);                                    // (64, 64, nbn)
+    // ## CP ring: A / B sliced per (batch, tile) at issue time; bh0 = batch-0 (b * h + head) index.
+    int const b0 = bh / params.h;
+    int const hq = bh % params.h;
     // ## FP11-M16 (native GQA): B operand indexed by KV head.
-    int const bh_kv = (bh / params.h) * params.h_k + (bh % params.h) / (params.h / params.h_k);
-    Tensor gB = flat_divide(mB(_, _, bh_kv), Shape<Int<kBD>, Int<kBK>>{})(_, _, _0{}, _);  // (256, 64, nbn)
+    int const h_kv = hq / (params.h / params.h_k);
     auto blkA = params.tma_a.get_slice(_0{});
     auto blkB = params.tma_b.get_slice(_0{});
-    Tensor tAgA = group_modes<0, 3>(blkA.partition_S(gA));              // (TMA, nbn)
     Tensor tAsA = group_modes<0, 3>(blkA.partition_D(sA));              // (TMA, stages)
-    Tensor tBgB = group_modes<0, 3>(blkB.partition_S(gB));
     Tensor tBsB = group_modes<0, 3>(blkB.partition_D(sB));
 
     TiledMmaP2 tiled_mma;
@@ -262,19 +270,53 @@ fq8_dq_pass2_kernel_hd128(CUTE_GRID_CONSTANT P2Params const params) {
         *reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]) = make_float2(0.0f, 0.0f);
     }
 
+    // Tiles are issued in order: the (batch, tile) cursor advances incrementally and the batch's TMA partitions are rebuilt
+    // only at a batch change (no division / tensor building on the per-tile issue path).
+    auto mkA = [&](int g) { return group_modes<0, 3>(blkA.partition_S(mA(_, _, _, mb, bh + g * params.h))); };
+    auto mkB = [&](int g) {
+        return group_modes<0, 3>(blkB.partition_S(flat_divide(mB(_, _, h_kv, b0 + g), Shape<Int<kBD>, Int<kBK>>{})(_, _, _0{}, _)));
+    };
+    auto tAgA = mkA(0);
+    auto tBgB = mkB(0);
+    int is_g = 0, is_nb = 0;
     auto issue = [&](int tile) {
         if (tid == 0) {
             int const s = tile % kStages;
             shared.full_bar[s].arrive_and_expect_tx(kTxBytes);
             auto& bar = reinterpret_cast<uint64_t&>(shared.full_bar[s]);
-            copy(params.tma_a.with(bar, 0 /*mcast*/), tAgA(_, tile), tAsA(_, s));
-            copy(params.tma_b.with(bar, 0 /*mcast*/), tBgB(_, tile), tBsB(_, s));
+            copy(params.tma_a.with(bar, 0 /*mcast*/), tAgA(_, is_nb), tAsA(_, s));
+            copy(params.tma_b.with(bar, 0 /*mcast*/), tBgB(_, is_nb), tBsB(_, s));
+            if (++is_nb == nb_end1) {
+                is_nb = 0;
+                if (++is_g < nbat) { tAgA = mkA(is_g); tBgB = mkB(is_g); }
+            }
         }
     };
     #pragma unroll 1
     for (int t = 0; t < (kStages < nb_end ? kStages : nb_end); ++t) { issue(t); }
+    // ## CP ring, accumulate mode: seed the smem accumulator with the existing fp32 dQ (in true unnormalized units, i.e.
+    // divided by final_scale) under the warmup loads, so the epilogue is a plain store (no load on the CTA's tail).
+    if (loopb && params.dq_acc_mode == 1) {
+        float const inv_fin = 1.0f / params.final_scale;
+        float const* dqa = params.dq_acc + int64_t(bh % params.h) * params.dqa_head_stride + int64_t(mb) * kBM * params.dqa_row_stride;
+        #pragma unroll
+        for (int i = 0; i < size(acc); i += 2) {
+            int const m = get<0>(tCcC(i));
+            int const d = get<1>(tCcC(i));
+            float2 const a = *reinterpret_cast<float2 const*>(dqa + int64_t(m) * params.dqa_row_stride + d);
+            *reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]) = make_float2(a.x * inv_fin, a.y * inv_fin);
+        }
+    }
 
-    float const* psi_row = params.ptr_psi + (int64_t(bh) * params.nbm + mb) * params.nbn;
+    // ## CP ring: batch g's psi row is at bh + g * h (nbn psi per row); psi_at(t) walks the flattened tile stream.
+    float const* psi_p = params.ptr_psi + (int64_t(bh) * params.nbm + mb) * params.nbn;
+    int ps_nb = 0;
+    int64_t const psi_bstride = int64_t(params.h) * params.nbm * params.nbn;
+    auto psi_next = [&]() {   // reads the cursor's psi and advances it (tiles in order)
+        float const v = *(psi_p + ps_nb);
+        if (++ps_nb == nb_end1) { ps_nb = 0; psi_p += psi_bstride; }
+        return v;
+    };
     // ## FP11-M3 window state: psi_w = the last TAKEN psi in the CURRENT
     // window (acc's units), 0.0f = window empty (no taken tile yet: skip the
     // rescale; acc is zero there anyway).  psi_max stays ROW-GLOBAL: the M2
@@ -283,12 +325,12 @@ fq8_dq_pass2_kernel_hd128(CUTE_GRID_CONSTANT P2Params const params) {
     float psi_w = 0.0f;
     float psi_max = 0.0f;
     // psi of tile nb is loaded one iteration early, so its load latency overlaps the barrier wait.
-    float psi_pf = nb_end > 0 ? psi_row[0] : 0.0f;
+    float psi_pf = nb_end > 0 ? psi_next() : 0.0f;
     #pragma unroll 1
     for (int nb = 0; nb < nb_end; ++nb) {
         int const s = nb % kStages;
         float const psi_cur = psi_pf;
-        if (nb + 1 < nb_end) { psi_pf = psi_row[nb + 1]; }
+        if (nb + 1 < nb_end) { psi_pf = psi_next(); }
         shared.full_bar[s].wait((nb / kStages) & 1);
         // ## FP11-F2: psi == 0.0f is pass 1's zero-tile sentinel (fully
         // underflowed or fully masked tile; its dS' codes are exact zeros).
@@ -382,6 +424,18 @@ fq8_dq_pass2_kernel_hd128(CUTE_GRID_CONSTANT P2Params const params) {
     float const fin = params.final_scale;
     int const b_idx = bh / params.h;
     int const h_idx = bh % params.h;
+    if (loopb) {   // ## CP ring: fp32 dQ (s_q, h, d) accumulate / store
+        float* dqa = params.dq_acc + int64_t(h_idx) * params.dqa_head_stride + int64_t(mb) * kBM * params.dqa_row_stride;
+        #pragma unroll
+        for (int i = 0; i < size(acc); i += 2) {
+            int const m = get<0>(tCcC(i));
+            int const d = get<1>(tCcC(i));
+            float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
+            float2* const o = reinterpret_cast<float2*>(dqa + int64_t(m) * params.dqa_row_stride + d);
+            *o = make_float2(v2.x * fin, v2.y * fin);   // mode 1 was seeded into smem_dq
+        }
+        return;
+    }
     auto* dq_base = reinterpret_cast<cutlass::bfloat16_t*>(params.dq_ptr)
         + int64_t(b_idx) * params.dq_batch_stride + int64_t(h_idx) * params.dq_head_stride
         + int64_t(mb) * kBM * params.dq_row_stride;
@@ -417,16 +471,16 @@ void run_fq8_dq_pass2_fp11_d128(Flash_bwd_fp8_params &params, cudaStream_t strea
     Tensor mA = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.ds8_ptr)),
                             shape_a, stride_a);
     TmaA tma_a = make_tma_copy(cute::SM90_TMA_LOAD{}, mA, SmemLayoutA{}(_, _, _0{}));
-    ShapeB shape_b = make_shape(Int<kBD>{}, params.seqlen_k, params.b * params.h_k);   // ## FP11-M16: per KV head
-    StrideB stride_b = make_stride(int64_t(params.seqlen_k), _1{},
-                                   int64_t(kBD) * params.seqlen_k);
+    ShapeB shape_b = make_shape(Int<kBD>{}, params.seqlen_k, params.h_k, params.b);   // ## FP11-M16: per KV head; CP ring: 4-D
+    StrideB stride_b = make_stride(params.kt_d_stride, _1{}, params.kt_head_stride, params.kt_batch_stride);
     Tensor mB = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.kt_ptr)),
                             shape_b, stride_b);
     TmaB tma_b = make_tma_copy(cute::SM90_TMA_LOAD{}, mB, SmemLayoutB{}(_, _, _0{}));
     P2Params p2{tma_a, tma_b, shape_a, shape_b, params.psi_ptr,
                 params.dq_ptr, params.dq_row_stride, params.dq_head_stride,
                 params.dq_batch_stride,
-                params.scale_softmax / 256.0f, nbm, nbn, params.h, params.h_k};
+                params.scale_softmax / 256.0f, nbm, nbn, params.h, params.h_k,
+                params.dq_acc_ptr, params.dqa_row_stride, params.dqa_head_stride, params.dq_acc_mode, params.b};
     auto* kernel = &fq8p2h128::fq8_dq_pass2_kernel_hd128<Is_causal>;
     constexpr int kSmem = int(sizeof(SharedStorage));
     if (kSmem >= 48 * 1024) {
@@ -436,7 +490,7 @@ void run_fq8_dq_pass2_fp11_d128(Flash_bwd_fp8_params &params, cudaStream_t strea
         fprintf(stderr, "[delta_matching pass 2 hd128] smem_size=%d grid=(%d,%d) block=128 kPromoteTiles=%d kDqPitch=%d\n",
                 kSmem, nbm, bh, kPromoteTiles, kDqPitch);
     }
-    dim3 grid(nbm, bh, 1);
+    dim3 grid(nbm, params.dq_acc_ptr != nullptr ? params.h : bh, 1);   // ## CP ring: batch loop in the CTA
     kernel<<<grid, 128, kSmem, stream>>>(p2);
     { cudaError_t e_ = cudaGetLastError(); if (e_ != cudaSuccess) { fprintf(stderr, "[delta_matching pass 2 hd128] launch: %s\n", cudaGetErrorString(e_)); exit(1); } }
 }

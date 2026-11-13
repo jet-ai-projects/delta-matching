@@ -242,10 +242,15 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     // ## bf16-dP: the RAW bf16 V / dO for SageBwd's exempt matmul (5) dP = dO V^T.  Undefined on every
     // certified call; required, and required to be absent, exactly as FA3FP11_P1R_SAGEDP dictates.
     at::Tensor vraw = at::Tensor(),
-    at::Tensor doraw = at::Tensor()
+    at::Tensor doraw = at::Tensor(),
+    // ## CP ring (dm_cp): fp32 dQ (s_q, h, d) that pass 2 accumulates into (mode 1) or stores to (mode 2), the batch looped
+    // inside each pass-2 CTA; the twins may then carry any (d-row, head, batch) strides with s unit-stride (batch 0 = shared).
+    at::Tensor dq_acc = at::Tensor(),
+    int64_t dq_acc_mode = 0
 ) {
     c10::cuda::CUDAGuard device_guard(q8.device());
-    dm_check_inputs("bwd", q8, {dout8, k8, v8, lse, delta, kt8, qt8, dot8, q8s, k8s, v8s, do8s, vraw, doraw});
+    bool const ring = dq_acc.defined();
+    dm_check_inputs("bwd", q8, {dout8, k8, v8, lse, delta, kt8, qt8, dot8, q8s, k8s, v8s, do8s, vraw, doraw, dq_acc});
     dm_check_codes("bwd", {dout8, q8, k8, v8, kt8, qt8, dot8});
     dm_check_scales("bwd", {q8s, k8s, v8s, do8s});
     auto const sizes = q8.sizes();
@@ -270,6 +275,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
                 "delta_matching bwd: kt8 must be (b, h_k, d, s_k)");
     TORCH_CHECK(k8s.size(1) == num_heads_k && v8s.size(1) == num_heads_k && q8s.size(1) == num_heads && do8s.size(1) == num_heads,
                 "delta_matching bwd: scale head counts (q/do: h, k/v: h_k)");
+    if (ring) {
+        TORCH_CHECK(head_size == 128, "delta_matching bwd (ring): head_dim 128 only");
+        TORCH_CHECK(!is_causal || batch_size == 1, "delta_matching bwd (ring): causal needs batch 1");
+        TORCH_CHECK(dq_acc.scalar_type() == at::kFloat && dq_acc.dim() == 3 && dq_acc.size(0) == seqlen_q && dq_acc.size(1) == num_heads
+                    && dq_acc.size(2) == head_size && dq_acc.stride(2) == 1 && dq_acc.stride(0) % 2 == 0 && dq_acc.stride(1) % 2 == 0,
+                    "delta_matching bwd (ring): dq_acc must be fp32 (s_q, h, d) with d contiguous");
+        TORCH_CHECK(dq_acc_mode == 1 || dq_acc_mode == 2, "delta_matching bwd (ring): dq_acc_mode 1 (accumulate) or 2 (store)");
+        for (auto const& t : {kt8, qt8, dot8}) {
+            TORCH_CHECK(t.stride(3) == 1 && t.stride(2) % 16 == 0 && t.stride(1) % 16 == 0 && t.stride(0) % 16 == 0,
+                        "delta_matching bwd (ring): twins need s unit-stride and 16-byte multiple strides");
+        }
+    }
     TORCH_CHECK(fp11_hd_supported(head_size), "delta_matching bwd: head_dim must be 256 (or 128 in a Delta-Matching-128 build)");
     int const kbn = fp11_bwd_block_n(head_size);   // ## Delta-Matching-128: pass-1 key block (64 at d256, 128 at hd128)
     TORCH_CHECK(seqlen_q % 64 == 0 && seqlen_k % kbn == 0, "delta_matching bwd: seqlen_q must be a 64-multiple, seqlen_k a ", kbn, "-multiple");
@@ -279,12 +296,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
         TORCH_CHECK(k8s.size(2) == seqlen_k / rk && v8s.size(2) == seqlen_k / rk, "delta_matching bwd: k8s/v8s must be (b, h_k, s_k/", rk, ")");
     }
     for (auto const& t : {dout8, q8, k8, v8}) { TORCH_CHECK(t.stride(-1) == 1); }
-    for (auto const& t : {kt8, q8s, k8s, v8s, do8s, lse, delta}) { TORCH_CHECK(t.is_contiguous()); }
+    for (auto const& t : {q8s, k8s, v8s, do8s, lse, delta}) { TORCH_CHECK(t.is_contiguous()); }
+    if (!ring) { TORCH_CHECK(kt8.is_contiguous()); }
     auto opts = q8.options();
     int const seqlen_q_rounded = seqlen_q;    // 64-multiple asserted
     int const head_size_rounded = head_size;
 
-    at::Tensor dq = torch::empty({batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kBFloat16));
+    at::Tensor dq = ring ? torch::empty({1, 1, 1, 1}, opts.dtype(at::kBFloat16))
+                         : torch::empty({batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kBFloat16));
     at::Tensor dk = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
     at::Tensor dv = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
     // Dummy dq_accum: the split backward has no cross-CTA dQ reduction; the
@@ -341,11 +360,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     params.arch = 90;
     // ## FP11-M17 GT: the Q^T / dO^T gmem twins are REAL inputs (pi-ordered s positions).
     TORCH_CHECK(qt8.defined() && dot8.defined(), "delta_matching bwd: the qt8 / dot8 twins are required");
-    TORCH_CHECK(qt8.size(0) == batch_size && qt8.size(1) == num_heads && qt8.size(2) == head_size && qt8.size(3) == seqlen_q && qt8.is_contiguous(),
+    TORCH_CHECK(qt8.size(0) == batch_size && qt8.size(1) == num_heads && qt8.size(2) == head_size && qt8.size(3) == seqlen_q && (ring || qt8.is_contiguous()),
                 "delta_matching bwd: qt8 must be (b, h, d, s_q) contiguous");
-    TORCH_CHECK(dot8.size(0) == batch_size && dot8.size(1) == num_heads && dot8.size(2) == head_size && dot8.size(3) == seqlen_q && dot8.is_contiguous(),
+    TORCH_CHECK(dot8.size(0) == batch_size && dot8.size(1) == num_heads && dot8.size(2) == head_size && dot8.size(3) == seqlen_q && (ring || dot8.is_contiguous()),
                 "delta_matching bwd: dot8 must be (b, h, d, s_q) contiguous");
     params.qt_ptr = qt8.data_ptr(); params.kt_ptr = kt8.data_ptr(); params.dot_ptr = dot8.data_ptr();
+    // ## CP ring: the twin strides (contiguous tensors give exactly the former hard-coded values)
+    params.qt_d_stride = qt8.stride(2); params.qt_head_stride = qt8.stride(1); params.qt_batch_stride = qt8.stride(0);
+    params.kt_d_stride = kt8.stride(2); params.kt_head_stride = kt8.stride(1); params.kt_batch_stride = kt8.stride(0);
+    params.dot_d_stride = dot8.stride(2); params.dot_head_stride = dot8.stride(1); params.dot_batch_stride = dot8.stride(0);
+    if (ring) {
+        params.dq_acc_ptr = dq_acc.data_ptr<float>();
+        params.dqa_row_stride = dq_acc.stride(0); params.dqa_head_stride = dq_acc.stride(1);
+        params.dq_acc_mode = int(dq_acc_mode);
+    }
     params.q8s_ptr = q8s.data_ptr<float>(); params.k8s_ptr = k8s.data_ptr<float>();
     params.v8s_ptr = v8s.data_ptr<float>(); params.do8s_ptr = do8s.data_ptr<float>();
     params.nblk_q = q8s.size(2);
@@ -436,6 +464,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_t(
                         nullptr, nullptr, nullptr);
 }
 
+// ## CP ring (dm_cp): bwd_fp8_t with a batch of ring blocks (Q / dO side may be batch-broadcast, stride 0) whose dQ pass
+// accumulates (mode 1) or stores (mode 2) fp32 into dq_acc (s_q, h, d).  Returns (dk, dv) bf16 (b, s_k, h, d).
+std::tuple<at::Tensor, at::Tensor> bwd_fp8_g(
+    at::Tensor dout8, at::Tensor q8, at::Tensor k8, at::Tensor v8,
+    at::Tensor lse, at::Tensor delta, at::Tensor kt8, at::Tensor qt8, at::Tensor dot8,
+    at::Tensor q8s, at::Tensor k8s, at::Tensor v8s, at::Tensor do8s,
+    double softmax_scale, bool is_causal, at::Tensor dq_acc, int64_t dq_acc_mode
+) {
+    auto r = bwd_fp8_core(dout8, q8, k8, v8, lse, delta, kt8, qt8, dot8, q8s, k8s, v8s, do8s, softmax_scale, is_causal,
+                          nullptr, nullptr, nullptr, at::Tensor(), at::Tensor(), dq_acc, dq_acc_mode);
+    return {std::get<1>(r), std::get<2>(r)};
+}
+
 // ## bf16-dP: bwd_fp8_t plus the RAW bf16 V and dO, i.e. SageBwd's single exemption among the
 // seven attention matmuls (dP = dO V^T unquantized; S, dV, dQ, dK and the stale delta unchanged).  A SEPARATE op
 // so bwd_fp8_t's schema stays unchanged, exactly as delta_fp8 was split out.
@@ -515,7 +556,8 @@ at::Tensor delta_fp8_core(
         TORCH_CHECK(k8s.size(2) == seqlen_k / rk && v8s.size(2) == seqlen_k / rk, "delta_matching delta: k8s/v8s must be (b, h_k, s_k/", rk, ")");
     }
     for (auto const& t : {dout8, q8, k8, v8}) { TORCH_CHECK(t.stride(-1) == 1); }
-    for (auto const& t : {kt8, q8s, k8s, v8s, do8s, lse}) { TORCH_CHECK(t.is_contiguous()); }
+    for (auto const& t : {q8s, k8s, v8s, do8s, lse}) { TORCH_CHECK(t.is_contiguous()); }
+    if (head_size != 128) { TORCH_CHECK(kt8.is_contiguous()); }   // ## CP ring: the hd128 pass 0 never reads kt8
     auto opts = q8.options();
     int const seqlen_q_rounded = seqlen_q;    // 64-multiple asserted
     int const head_size_rounded = head_size;
@@ -693,6 +735,9 @@ TORCH_LIBRARY(delta_matching, m) {
     m.def("bwd_fp8_t(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
           " float softmax_scale, bool is_causal) -> (Tensor, Tensor, Tensor)");
+    m.def("bwd_fp8_g(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
+          " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
+          " float softmax_scale, bool is_causal, Tensor dq_acc, int dq_acc_mode) -> (Tensor, Tensor)");
     m.def("bwd_fp8_bf16dp(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
           " Tensor vraw, Tensor doraw, float softmax_scale, bool is_causal)"
@@ -725,6 +770,7 @@ TORCH_LIBRARY_IMPL(delta_matching, CUDA, m) {
     m.impl("bwd_fp8", &bwd_fp8);
     m.impl("delta_fp8", &delta_fp8);
     m.impl("bwd_fp8_t", &bwd_fp8_t);
+    m.impl("bwd_fp8_g", &bwd_fp8_g);
     m.impl("bwd_fp8_bf16dp", &bwd_fp8_bf16dp);
     m.impl("twin_pi", &fp11_twin_pi);
 #ifdef FA3FP11_DBG
