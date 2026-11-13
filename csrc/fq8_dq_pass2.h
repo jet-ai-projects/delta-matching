@@ -427,16 +427,40 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     auto* dq_base = reinterpret_cast<cutlass::bfloat16_t*>(params.dq_ptr)
         + int64_t(b_idx) * params.dq_batch_stride + int64_t(h_idx) * params.dq_head_stride
         + int64_t(mb) * kBM * params.dq_row_stride;
-    // wgmma C fragment: even/odd i are column-adjacent -> packed u32 stores.
+    // ## P2B-EPI: the bf16 dQ tile is staged through this warpgroup's own smem_dq region and written with coalesced
+    // 16-B stores (one full 512-B row per warp instruction) instead of 64 scattered 4-B stores per thread (8 rows x
+    // 16 B per warp instruction).  Same fp32 * fin, same bf16 rounding, same values.
+    // wgmma C fragment: even/odd i are column-adjacent -> packed u32.
+    uint32_t pk[size(acc) / 2];
     #pragma unroll
     for (int i = 0; i < size(acc); i += 2) {
         int const m = get<0>(tCcC(i));
         int const d = get<1>(tCcC(i));
         float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
         cutlass::bfloat16_t lo(v2.x * fin), hi(v2.y * fin);
-        uint32_t const pack = (uint32_t(reinterpret_cast<uint16_t const&>(hi)) << 16)
-                            | uint32_t(reinterpret_cast<uint16_t const&>(lo));
-        *reinterpret_cast<uint32_t*>(dq_base + int64_t(m) * params.dq_row_stride + d) = pack;
+        pk[i / 2] = (uint32_t(reinterpret_cast<uint16_t const&>(hi)) << 16)
+                  | uint32_t(reinterpret_cast<uint16_t const&>(lo));
+    }
+    // Staging tile: 64 rows x kStPitchW u32 (kStPitchW == 4 mod 32: the fragment's 8 rows x 4 lanes per store hit
+    // 32 distinct banks; 528-B rows keep the 16-B read alignment).  It aliases this warpgroup's smem_dq slots, so
+    // every thread's fp32 reads above must retire first.
+    constexpr int kStPitchW = kBD / 2 + 4;
+    static_assert(kBM * kStPitchW <= kBM * kDqPitch, "pass 2: bf16 staging tile must fit the smem_dq region");
+    uint32_t* const st = reinterpret_cast<uint32_t*>(smem_dq);
+    cutlass::arch::NamedBarrier::sync(128, 1 + wg);
+    #pragma unroll
+    for (int i = 0; i < size(acc); i += 2) {
+        int const m = get<0>(tCcC(i));
+        int const d = get<1>(tCcC(i));
+        st[m * kStPitchW + d / 2] = pk[i / 2];
+    }
+    cutlass::arch::NamedBarrier::sync(128, 1 + wg);
+    #pragma unroll
+    for (int it = 0; it < kBM / 4; ++it) {
+        int const row = it * 4 + tid / 32;
+        int const c = tid % 32;   // 16-B chunk of the 512-B row
+        uint4 const v = *reinterpret_cast<uint4 const*>(st + row * kStPitchW + c * 4);
+        *reinterpret_cast<uint4*>(dq_base + int64_t(row) * params.dq_row_stride + c * 8) = v;
     }
 }
 
