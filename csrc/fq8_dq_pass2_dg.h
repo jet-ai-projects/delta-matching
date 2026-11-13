@@ -264,7 +264,7 @@ void run_cl(Flash_bwd_fp8_params &params, cudaStream_t stream) {
     Tensor mA = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.ds8_ptr)), shape_a, stride_a);
     TmaA tma_a = make_tma_copy(cute::SM90_TMA_LOAD{}, mA, SmemLayoutA{}(_, _, _0{}));
     ShapeB shape_b = make_shape(Int<kBD>{}, params.seqlen_k, params.b * params.h_k);
-    StrideB stride_b = make_stride(int64_t(params.seqlen_k), _1{}, int64_t(kBD) * params.seqlen_k);
+    StrideB stride_b = make_stride(params.kt_d_stride, _1{}, params.kt_head_stride);   // the API's K-twin strides (strided ring twins too)
     Tensor mB = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.kt_ptr)), shape_b, stride_b);
     TmaBT<kCL> tma_b = make_tma_copy(std::conditional_t<(kCL > 1), cute::SM90_TMA_LOAD_MULTICAST, cute::SM90_TMA_LOAD>{},
                                      mB, SmemLayoutB{}(_, _, _0{}), Int<kCL>{});
