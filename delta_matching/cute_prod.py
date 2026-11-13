@@ -363,7 +363,9 @@ def _ct_kernel(X: cute.Tensor, COS: cute.Tensor, SIN: cute.Tensor, Q8: cute.Tens
     if t == 0:
         QS[pbh, pm] = s
     codes = cute.make_rmem_tensor(cute.make_layout((4, 16), stride=(16, 1)), cutlass.Float8E4M3FN)  # [col j, pi pos p]
-    fast = m >= F32(2.0 ** -80)
+    # fast division only for finite blocks with amax >= 2^-80; an Inf / NaN block (s = Inf: x / Inf, Inf / Inf) and tiny
+    # blocks take div.rn, so every code (incl. the clamp of NaN quotients to -448) is the reference's
+    fast = (m >= F32(2.0 ** -80)) & (m <= F32(3.4028234663852886e38))
     y = _rcp_rn(s)
     ns = -s
     q8 = cute.recast_tensor(Q8, cutlass.Float8E4M3FN)
@@ -467,7 +469,7 @@ def _ct_ok(x, blk):
     if x.dim() != 4 or x.dtype != torch.bfloat16 or x.stride(-1) != 1 or x.data_ptr() % 16 != 0:
         return False
     B, H, N, D = x.shape
-    return D % 32 == 0 and D <= 1024 and blk == 64 and N % blk == 0 and \
+    return D == 256 and blk == 64 and N % blk == 0 and \
         all(s % 4 == 0 for s in x.stride()[:3])
 
 
