@@ -1659,9 +1659,22 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             if constexpr (kHeadDim >= 256) { return 2048 * ((i >> 2) & 7) + 128 * ((i >> 5) & 1); }
             else { return 1024 * ((i >> 2) & 15); }
         };
-        #pragma unroll
-        for (int i = 0; i < size(tdVrdV); ++i) {
-            fq8_dv_base[i & 1][(i >> 1) & 1][fq8_dv_off(i)] = 0.0f;
+        // DV4: at head_dim 256 (kHalves == 1) each thread's 64 window slots are 16 float4 groups, group g of thread t at
+        // float4 index g * NumMmaThreads + t of the overlay (a warp's 128-bit access is 512 contiguous bytes: conflict-free),
+        // so the promote / zero / read-back move 16 LDS.128 / STS.128 instead of 64 scalar accesses.  Slot i holds the
+        // same window value as before (only its smem address changes; the slots are private to the owning thread).
+        static constexpr bool kFq8Dv4 = kHeadDim >= 256;
+        static_assert(!kFq8Dv4 || decltype(size(tdVrdV))::value * NumMmaThreads == kFq8DvOverlayFloats,
+                      "delta_matching DV4: the per-thread float4 slot map must tile the smem_dv overlay exactly");
+        float4* const fq8_dv4 = reinterpret_cast<float4*>(fq8_smem_dv) + thread_idx;
+        if constexpr (kFq8Dv4) {
+            #pragma unroll
+            for (int g = 0; g < 16; ++g) { fq8_dv4[g * NumMmaThreads] = make_float4(0.0f, 0.0f, 0.0f, 0.0f); }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < size(tdVrdV); ++i) {
+                fq8_dv_base[i & 1][(i >> 1) & 1][fq8_dv_off(i)] = 0.0f;
+            }
         }
 
         cutlass::ConsumerToken barrier_token = static_cast<cutlass::BarrierStatus>(shared_storage.pipelines.barrier_KV.try_wait(work_idx % 2));
@@ -2264,6 +2277,23 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                 // PROMOTEBATCH: all 64 slot loads first (the dK temp is dead here), then the 64 FMAs and stores, so the
                 // LDS latency is paid once instead of per short dependent group.  Same fmaf per element.
                 static_assert(decltype(size(tdVrdV))::value == 64, "delta_matching PROMOTEBATCH: 64 dV values per thread");
+                if constexpr (kFq8Dv4) {
+                    // DV4: 16 LDS.128 first, then per group 4 fmaf + one STS.128 (same fmaf per element as before).
+                    float4 fq8_pv4[16];
+                    #pragma unroll
+                    for (int g = 0; g < 16; ++g) { fq8_pv4[g] = fq8_dv4[g * NumMmaThreads]; }
+                    #pragma unroll
+                    for (int g = 0; g < 16; ++g) {
+                        float4 fq8_o;
+                        fq8_o.x = fmaf(tdVrdV(4 * g + 0), fq8_f_prev, fq8_pv4[g].x);
+                        fq8_o.y = fmaf(tdVrdV(4 * g + 1), fq8_f_prev, fq8_pv4[g].y);
+                        fq8_o.z = fmaf(tdVrdV(4 * g + 2), fq8_f_prev, fq8_pv4[g].z);
+                        fq8_o.w = fmaf(tdVrdV(4 * g + 3), fq8_f_prev, fq8_pv4[g].w);
+                        fq8_dv4[g * NumMmaThreads] = fq8_o;
+                    }
+                    #pragma unroll
+                    for (int i = 0; i < 64; ++i) { tdVrdV(i) = 0.0f; }
+                } else {
                 float fq8_pv[64];
                 #pragma unroll
                 for (int i = 0; i < 64; ++i) { fq8_pv[i] = fq8_dv_base[i & 1][(i >> 1) & 1][fq8_dv_off(i)]; }
@@ -2271,6 +2301,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                 for (int i = 0; i < 64; ++i) {
                     fq8_dv_base[i & 1][(i >> 1) & 1][fq8_dv_off(i)] = fmaf(tdVrdV(i), fq8_f_prev, fq8_pv[i]);
                     tdVrdV(i) = 0.0f;
+                }
                 }
             }
         };
@@ -2592,9 +2623,17 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         // and the epilogue's smem staging window (the first 64 KB of the
         // TensorStorage union) does not overlap this member (see the overlay
         // comment at the mainloop entry).
-        #pragma unroll
-        for (int i = 0; i < size(tdVrdV); ++i) {
-            tdVrdV(i) = fq8_dv_base[i & 1][(i >> 1) & 1][fq8_dv_off(i)];
+        if constexpr (kFq8Dv4) {
+            #pragma unroll
+            for (int g = 0; g < 16; ++g) {
+                float4 const fq8_v = fq8_dv4[g * NumMmaThreads];
+                tdVrdV(4 * g + 0) = fq8_v.x; tdVrdV(4 * g + 1) = fq8_v.y; tdVrdV(4 * g + 2) = fq8_v.z; tdVrdV(4 * g + 3) = fq8_v.w;
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < size(tdVrdV); ++i) {
+                tdVrdV(i) = fq8_dv_base[i & 1][(i >> 1) & 1][fq8_dv_off(i)];
+            }
         }
 
         if constexpr (Q_dO_same_stages) { smem_pipe_read_do = smem_pipe_read; }
