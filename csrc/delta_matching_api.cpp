@@ -368,7 +368,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     params.do_row_stride = dout8.stride(1); params.do_head_stride = dout8.stride(2); params.do_batch_stride = dout8.stride(0);
     params.dq_ptr = dq.data_ptr(); params.dk_ptr = dk.data_ptr(); params.dv_ptr = dv.data_ptr();
     // head_dim 256 pass 2 stores dQ rows as 16-B vectors (fq8_dq_pass2.h epilogue)
-    TORCH_CHECK(head_size != 256 || (reinterpret_cast<uintptr_t>(dq.data_ptr()) % 16 == 0 && dq.stride(1) % 8 == 0 && dq.stride(3) == 1),
+    // (ring: dq is a 1-element stand-in, pass 2 writes dq_acc instead)
+    TORCH_CHECK(ring || head_size != 256 || (reinterpret_cast<uintptr_t>(dq.data_ptr()) % 16 == 0 && dq.stride(1) % 8 == 0 && dq.stride(3) == 1),
                 "bwd: head_dim 256 dq needs 16-B aligned rows (row stride % 8 elements)");
     params.dq_row_stride = dq.stride(1); params.dq_head_stride = dq.stride(2); params.dq_batch_stride = dq.stride(0);
     params.dk_row_stride = dk.stride(1); params.dk_head_stride = dk.stride(2); params.dk_batch_stride = dk.stride(0);
