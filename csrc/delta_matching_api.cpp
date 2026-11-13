@@ -276,7 +276,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     // ## CP ring (dm_cp): fp32 dQ (s_q, h, d) that pass 2 accumulates into (mode 1) or stores to (mode 2), the batch looped
     // inside each pass-2 CTA; the twins may then carry any (d-row, head, batch) strides with s unit-stride (batch 0 = shared).
     at::Tensor dq_acc = at::Tensor(),
-    int64_t dq_acc_mode = 0
+    int64_t dq_acc_mode = 0,
+    // ## WS (bwd_fp8_tw): caller-owned pass-1 -> pass-2 workspace (uint8, >= bwd_ws_bytes) and dq / dk / dv outputs, so a
+    // caller that runs this op on a side stream can keep every large buffer in its own stream's allocator pool.  Same
+    // kernels, same arguments otherwise (the workspace is never read before pass 1 writes it, as the fresh torch::empty).
+    at::Tensor ws = at::Tensor(),
+    at::Tensor dq_out = at::Tensor(),
+    at::Tensor dk_out = at::Tensor(),
+    at::Tensor dv_out = at::Tensor()
 ) {
     c10::cuda::CUDAGuard device_guard(q8.device());
     bool const ring = dq_acc.defined();
@@ -343,10 +350,18 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     int const seqlen_q_rounded = seqlen_q;    // 64-multiple asserted
     int const head_size_rounded = head_size;
 
-    at::Tensor dq = ring ? torch::empty({1, 1, 1, 1}, opts.dtype(at::kBFloat16))
+    auto out_ok = [&](at::Tensor const& t, int64_t s) {
+        return t.scalar_type() == at::kBFloat16 && t.is_contiguous() && t.device() == q8.device()
+               && t.sizes() == at::IntArrayRef({batch_size, s, num_heads, head_size});
+    };
+    TORCH_CHECK(!dq_out.defined() || (!ring && out_ok(dq_out, seqlen_q)), "delta_matching bwd_fp8_tw: dq must be bf16 (b, s_q, h, d) contiguous");
+    TORCH_CHECK(!dk_out.defined() || out_ok(dk_out, seqlen_k), "delta_matching bwd_fp8_tw: dk must be bf16 (b, s_k, h, d) contiguous");
+    TORCH_CHECK(!dv_out.defined() || out_ok(dv_out, seqlen_k), "delta_matching bwd_fp8_tw: dv must be bf16 (b, s_k, h, d) contiguous");
+    at::Tensor dq = dq_out.defined() ? dq_out
+                  : ring ? torch::empty({1, 1, 1, 1}, opts.dtype(at::kBFloat16))
                          : torch::empty({batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kBFloat16));
-    at::Tensor dk = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
-    at::Tensor dv = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
+    at::Tensor dk = dk_out.defined() ? dk_out : torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
+    at::Tensor dv = dv_out.defined() ? dv_out : torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
     // Dummy dq_accum: the split backward has no cross-CTA dQ reduction; the
     // pointer is never dereferenced (plumbing only).
     at::Tensor dq_accum = torch::empty({4}, opts.dtype(at::kFloat));
@@ -357,12 +372,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     // Pass-1 -> pass-2 workspaces: tile-contiguous dS' codes + per-tile psi.
     // For causal only nb <= mb tiles are written or read: no zeroing needed.
     int const nbm = seqlen_q / 64, nbn = seqlen_k / kbn;
-    at::Tensor ds8 = torch::empty({int64_t(batch_size) * num_heads, nbm, nbn, 64, kbn}, opts);   // ## Delta-Matching-128: [64, kbn] tiles
 #ifndef FA3FP11_HALFPSI
 #define FA3FP11_HALFPSI 0
 #endif
     // ## M23 HALFPSI: at head_dim 128 pass 1 publishes one psi per (tile, warpgroup half): [BH, nbm, nbn, 2].
-    at::Tensor psi = torch::empty({int64_t(batch_size) * num_heads, nbm, nbn, (FA3FP11_HALFPSI && head_size == 128) ? 2 : 1}, opts.dtype(at::kFloat));
+    int const npsi_t = (FA3FP11_HALFPSI && head_size == 128) ? 2 : 1;
+    at::Tensor ds8, psi;
+    if (ws.defined()) {   // ## WS: [ds8 tiles | psi] carved from the caller's buffer (layout = the two torch::empty below)
+        int64_t const nds8 = int64_t(batch_size) * num_heads * nbm * nbn * 64 * kbn;
+        int64_t const npsi = int64_t(batch_size) * num_heads * nbm * nbn * npsi_t;
+        TORCH_CHECK(ws.scalar_type() == at::kByte && ws.is_contiguous() && ws.device() == q8.device()
+                    && ws.numel() >= nds8 + 4 * npsi && reinterpret_cast<uintptr_t>(ws.data_ptr()) % 256 == 0,
+                    "delta_matching bwd_fp8_tw: ws must be a contiguous 256-B aligned uint8 tensor of >= ", nds8 + 4 * npsi, " bytes");
+        ds8 = ws.narrow(0, 0, nds8).view({int64_t(batch_size) * num_heads, nbm, nbn, 64, kbn});
+        psi = ws.narrow(0, nds8, 4 * npsi).view(at::kFloat).view({int64_t(batch_size) * num_heads, nbm, nbn, npsi_t});
+    } else {
+        ds8 = torch::empty({int64_t(batch_size) * num_heads, nbm, nbn, 64, kbn}, opts);   // ## Delta-Matching-128: [64, kbn] tiles
+        psi = torch::empty({int64_t(batch_size) * num_heads, nbm, nbn, npsi_t}, opts.dtype(at::kFloat));
+    }
 #ifdef FA3FP11_DBG
     if (g_dbg_ds8 != nullptr) { *g_dbg_ds8 = ds8; *g_dbg_psi = psi; }   // ## DBG (bwd_fp8_dbg_ds only)
 #endif
@@ -529,6 +556,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_t(
     return bwd_fp8_core(dout8, q8, k8, v8, lse, delta, kt8, qt8, dot8, q8s, k8s, v8s,
                         do8s, softmax_scale, is_causal,
                         nullptr, nullptr, nullptr);
+}
+
+// ## WS: bwd_fp8_t into caller-owned buffers: ws (uint8, >= bwd_ws_bytes(b, h, s_q, s_k, d) bytes, 256-B aligned) holds the
+// pass-1 -> pass-2 dS' tiles + psi; dq / dk / dv (bf16 (b, s, h, d) contiguous) receive the grads.  Bitwise bwd_fp8_t.
+void bwd_fp8_tw(
+    at::Tensor dout8, at::Tensor q8, at::Tensor k8, at::Tensor v8,
+    at::Tensor lse, at::Tensor delta, at::Tensor kt8, at::Tensor qt8, at::Tensor dot8,
+    at::Tensor q8s, at::Tensor k8s, at::Tensor v8s, at::Tensor do8s,
+    double softmax_scale, bool is_causal, at::Tensor ws, at::Tensor dq, at::Tensor dk, at::Tensor dv
+) {
+    TORCH_CHECK(ws.defined() && dq.defined() && dk.defined() && dv.defined(), "delta_matching bwd_fp8_tw: ws / dq / dk / dv required");
+    bwd_fp8_core(dout8, q8, k8, v8, lse, delta, kt8, qt8, dot8, q8s, k8s, v8s, do8s, softmax_scale, is_causal,
+                 nullptr, nullptr, nullptr, at::Tensor(), at::Tensor(), at::Tensor(), 0, ws, dq, dk, dv);
+}
+
+int64_t bwd_ws_bytes(int64_t b, int64_t h, int64_t s_q, int64_t s_k, int64_t d) {
+    int64_t const kbn = fp11_bwd_block_n(int(d));
+    int64_t const tiles = b * h * (s_q / 64) * (s_k / kbn);
+    return tiles * 64 * kbn + 4 * tiles * ((FA3FP11_HALFPSI && d == 128) ? 2 : 1);
 }
 
 // ## CP ring (dm_cp): bwd_fp8_t with a batch of ring blocks (Q / dO side may be batch-broadcast, stride 0) whose dQ pass
@@ -802,6 +848,10 @@ TORCH_LIBRARY(delta_matching, m) {
     m.def("bwd_fp8_t(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
           " float softmax_scale, bool is_causal) -> (Tensor, Tensor, Tensor)");
+    m.def("bwd_fp8_tw(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
+          " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
+          " float softmax_scale, bool is_causal, Tensor(a!) ws, Tensor(b!) dq, Tensor(c!) dk, Tensor(d!) dv) -> ()");   // ## WS
+    m.def("bwd_ws_bytes(int b, int h, int s_q, int s_k, int d) -> int");   // ## WS
     m.def("bwd_fp8_g(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
           " float softmax_scale, bool is_causal, Tensor dq_acc, int dq_acc_mode) -> (Tensor, Tensor)");
@@ -831,6 +881,7 @@ TORCH_LIBRARY_IMPL(delta_matching, CompositeExplicitAutograd, m) {
     m.impl("build_gt", &fp11_build_gt);
     m.impl("build_bf16dp", &fp11_build_bf16dp);
     m.impl("build_hd128", &fp11_build_hd128);
+    m.impl("bwd_ws_bytes", &bwd_ws_bytes);   // ## WS
 }
 
 TORCH_LIBRARY_IMPL(delta_matching, CUDA, m) {
@@ -838,6 +889,7 @@ TORCH_LIBRARY_IMPL(delta_matching, CUDA, m) {
     m.impl("bwd_fp8", &bwd_fp8);
     m.impl("delta_fp8", &delta_fp8);
     m.impl("bwd_fp8_t", &bwd_fp8_t);
+    m.impl("bwd_fp8_tw", &bwd_fp8_tw);   // ## WS
     m.impl("bwd_fp8_g", &bwd_fp8_g);
     m.impl("bwd_fp8_bf16dp", &bwd_fp8_bf16dp);
     m.impl("twin_pi", &fp11_twin_pi);
