@@ -213,7 +213,6 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     cutlass::arch::fence_barrier_init();
     __syncthreads();
 
-    Tensor sA = make_tensor(make_smem_ptr(shared.smem_a.data() + wg * cute::cosize_v<SmemLayoutA>), SmemLayoutA{});
     Tensor sB = make_tensor(make_smem_ptr(shared.smem_b.data()), SmemLayoutB{});
     Tensor mA = params.tma_a.get_tma_tensor(params.shape_a);
     Tensor mB = params.tma_b.get_tma_tensor(params.shape_b);
@@ -225,32 +224,6 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     Tensor tBgB = group_modes<0, 3>(blkB.partition_S(gB));
     Tensor tBsB = group_modes<0, 3>(blkB.partition_D(sB));
 
-    TiledMmaP2 tiled_mma;
-    auto wg_mma = tiled_mma.get_thread_slice(tid);
-    Tensor tCrA = wg_mma.partition_fragment_A(sA);   // GMMA descriptors (MMA, M, K, stages)
-    Tensor tCrB = wg_mma.partition_fragment_B(sB);
-    Tensor acc = partition_fragment_C(tiled_mma, select<0, 1>(TileShapeMNK{}));
-    clear(acc);
-
-    // wgmma C fragment coordinates: even/odd i are column-adjacent (d, d+1),
-    // so i steps of 2 index 8-byte-aligned float2 slots.  The SAME (m, d)
-    // map keys smem_dq ownership (promote + zero-init) and the epilogue.
-    Tensor cC = cute::make_identity_tensor(make_shape(Int<kBM>{}, Int<kBD>{}));
-    Tensor tCcC = wg_mma.partition_C(cC);
-    float* const smem_dq = shared.smem_dq.data() + wg * (kBM * kDqPitch);
-
-    // ## FP11-M3: cooperative zero-init of the persistent dQ accumulator,
-    // before the pipeline warmup.  Each thread zeroes exactly its own
-    // fragment-owned slots, so no extra __syncthreads is needed anywhere:
-    // every later access to these slots is by the writing thread itself.
-    if (wg < kWG) {   // P2D: the producer warp owns no smem_dq slots
-    #pragma unroll
-    for (int i = 0; i < size(acc); i += 2) {
-        int const m = get<0>(tCcC(i));
-        int const d = get<1>(tCcC(i));
-        *reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]) = make_float2(0.0f, 0.0f);
-    }
-    }
 
     // One elected thread loads the shared K^T tile and the dS' tile of every row block that needs this tile
     // (causal: the lower row block of a pair stops one tile early).
@@ -278,7 +251,9 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
             copy(params.tma_b.with(bar, 0 /*mcast*/), tBgB(_, tile), tBsB(_, s));
         }
     };
-    if (wg == kWG) {   // P2D producer warp: refill slot s once both warpgroups released its previous tile
+    // P2D producer warp (wg == kWG): classified before any math-warpgroup smem tensor / fragment is built; it only
+    // touches the barriers, sB and the per-row-block dS' stage tensors of the issue lambda.
+    if (wg == kWG) {   // refill slot s once both warpgroups released its previous tile
         if (cute::elect_one_sync()) {
             #pragma unroll 1
             for (int nb = 0; nb < nb_cta; ++nb) {
@@ -287,6 +262,34 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
             }
         }
         return;
+    }
+
+    // Math warpgroups only from here (wg < kWG): this warpgroup's dS' stages, its wgmma fragments / descriptors and
+    // its smem_dq slots are built after the producer warp's branch, so no tensor ever points past smem_a / smem_dq.
+    Tensor sA = make_tensor(make_smem_ptr(shared.smem_a.data() + wg * cute::cosize_v<SmemLayoutA>), SmemLayoutA{});
+    TiledMmaP2 tiled_mma;
+    auto wg_mma = tiled_mma.get_thread_slice(tid);
+    Tensor tCrA = wg_mma.partition_fragment_A(sA);   // GMMA descriptors (MMA, M, K, stages)
+    Tensor tCrB = wg_mma.partition_fragment_B(sB);
+    Tensor acc = partition_fragment_C(tiled_mma, select<0, 1>(TileShapeMNK{}));
+    clear(acc);
+
+    // wgmma C fragment coordinates: even/odd i are column-adjacent (d, d+1),
+    // so i steps of 2 index 8-byte-aligned float2 slots.  The SAME (m, d)
+    // map keys smem_dq ownership (promote + zero-init) and the epilogue.
+    Tensor cC = cute::make_identity_tensor(make_shape(Int<kBM>{}, Int<kBD>{}));
+    Tensor tCcC = wg_mma.partition_C(cC);
+    float* const smem_dq = shared.smem_dq.data() + wg * (kBM * kDqPitch);
+
+    // ## FP11-M3: cooperative zero-init of the persistent dQ accumulator,
+    // before the pipeline warmup.  Each thread zeroes exactly its own
+    // fragment-owned slots, so no extra __syncthreads is needed anywhere:
+    // every later access to these slots is by the writing thread itself.
+    #pragma unroll
+    for (int i = 0; i < size(acc); i += 2) {
+        int const m = get<0>(tCcC(i));
+        int const d = get<1>(tCcC(i));
+        *reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]) = make_float2(0.0f, 0.0f);
     }
 
     float const* psi_row = params.ptr_psi + (int64_t(bh) * params.nbm + mb) * params.nbn;
