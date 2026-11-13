@@ -2016,7 +2016,9 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             // MERGED PdS barrier: the previous tile's dS' tile store is drained before the psi barrier, and every
             // thread reaches the psi barrier only after its previous tile's dV / dK gemms retired (the loop tail's
             // wait<0>), so the psi barrier also frees sPt / sdSt / sdS for this tile's exchange stores.
-            if constexpr (kStages_dS == 1 && !(kAbl & 4)) { if (thread_idx == 0) { cute::tma_store_wait<0>(); } }
+            // WAITALL: every thread executes the bulk-store drain (a no-op for the threads that issued none), so warp 0
+            // no longer diverges into a BSSY/BSYNC region right before the fence and the psi barrier.
+            if constexpr (kStages_dS == 1 && !(kAbl & 4)) { cute::tma_store_wait<0>(); }
             cutlass::arch::fence_view_async_shared();
             // ## FQ8-V8: psi gets its OWN barrier id (dQEmptyWG3, unused at 2 WGs);
             // v1 borrowed dQEmptyWG1 which the TMA-dQ protocol now owns.
