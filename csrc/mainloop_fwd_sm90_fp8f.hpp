@@ -27,6 +27,9 @@
 #ifndef FA3FP11_D256_SCPRE
 #define FA3FP11_D256_SCPRE 1
 #endif
+#ifndef FA3FP11_D256_ALPHADEF
+#define FA3FP11_D256_ALPHADEF 1
+#endif
 #ifndef FA3FP11_M16_FWDIL
 #define FA3FP11_M16_FWDIL 0
 #endif
@@ -1771,6 +1774,40 @@ struct CollectiveMainloopFwdSm90Fp8F {
             // and ptxas then reports C7510, "wgmma instructions are serialized
             // due to wgmma pipeline crossing function boundary".  Measured cost
             // of letting it outline: 37.5 ms vs 0.69 ms for the parent.
+            static constexpr bool kD256AD = FA3FP11_D256_ALPHADEF && kHeadDim == 256 && kGroups == 4 && kAtomsPerGroup == 1
+                && kGroupsPerPromote == 4 && kPVNSplit == 2 && !kFwdLazy && !LargeHeadDimV;
+// One 128-wide slab of the D256 chain (zero-init k0, rho1, k1, rho2, k2, rho3, k3, promote) with a quarter of the
+// slab's pending alpha rescale issued while each sub-gemm is in flight.
+#define FQ8_D256_AQ(O_, Q_)                                                                                     \
+    {                                                                                                          \
+        auto orc_ = make_tensor(O_.data(), flash::convert_layout_acc_rowcol(O_.layout()));                    \
+        _Pragma("unroll") for (int mi = 0; mi < size<0>(orc_); ++mi) {                                         \
+            _Pragma("unroll") for (int ni = (Q_) * (size<1>(orc_) / 4); ni < ((Q_) + 1) * (size<1>(orc_) / 4); ++ni) { \
+                orc_(mi, ni) *= scores_scale(mi); }                                                            \
+        }                                                                                                      \
+    }
+#define FQ8_D256_SLAB_AD(NI_C, VST, LAST)                                                                       \
+    {                                                                                                          \
+        auto B_ = pv_B_slab(NI_C, VST);                                                                        \
+        auto O_ = pv_O_slab(NI_C);                                                                             \
+        fq8_gemm_krange</*zero_init=*/true,  /*wg_wait=*/-1, 0, 1>(tiled_mma_pv, tOrP, B_, tOrD);              \
+        FQ8_D256_AQ(O_, 0)                                                                                     \
+        warpgroup_wait<0>(); warpgroup_fence_operand(tOrD);                                                    \
+        softmax.rescale_o(tOrD, fq8_rho(softmax, 1));                                                          \
+        fq8_gemm_krange</*zero_init=*/false, /*wg_wait=*/-1, 1, 2>(tiled_mma_pv, tOrP, B_, tOrD);              \
+        FQ8_D256_AQ(O_, 1)                                                                                     \
+        warpgroup_wait<0>(); warpgroup_fence_operand(tOrD);                                                    \
+        softmax.rescale_o(tOrD, fq8_rho(softmax, 2));                                                          \
+        fq8_gemm_krange</*zero_init=*/false, /*wg_wait=*/-1, 2, 3>(tiled_mma_pv, tOrP, B_, tOrD);              \
+        FQ8_D256_AQ(O_, 2)                                                                                     \
+        warpgroup_wait<0>(); warpgroup_fence_operand(tOrD);                                                    \
+        softmax.rescale_o(tOrD, fq8_rho(softmax, 3));                                                          \
+        fq8_gemm_krange</*zero_init=*/false, /*wg_wait=*/-1, 3, 4>(tiled_mma_pv, tOrP, B_, tOrD);              \
+        FQ8_D256_AQ(O_, 3)                                                                                     \
+        warpgroup_wait<0>(); warpgroup_fence_operand(tOrD);                                                    \
+        if constexpr (LAST) { fq8_lazy_rebase(cute::true_type{}); }                                            \
+        softmax.promote_o(O_, tOrD, softmax.basis_last(fq8_v[3]));                                             \
+    }
             // Scheduler-barrier ids, once per work tile.
             int const fq8_bar_sync_id = static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1) + warp_group_idx;
             int const fq8_bar_arv_id = static_cast<int>(FwdNamedBarriers::WarpSchedulerWG1)
@@ -1818,6 +1855,13 @@ struct CollectiveMainloopFwdSm90Fp8F {
                         fq8_gemm_krange</*zero_init=*/false, /*wg_wait=*/0, 2, 4>(tiled_mma_pv, tOrP, B_, tOrD);
                         auto O0_ = pv_O_slab(cute::Int<0>{});
                         softmax.promote_o(O0_, tOrD, pre_w_);
+                    } else if constexpr (kD256AD) {
+                    // D256 ALPHADEF: the previous step's alpha (scores_scale) is applied to tOrO HERE, a quarter slab per
+                    // in-flight sub-gemm, before that slab's promote: per element the op sequence (promote_{j-1},
+                    // *alpha_j, promote_j) is unchanged, the multiplies just leave the softmax path for the gemm waits.
+                    auto vst_ = tOrV(_, _, _, smem_pipe_read_v.index());
+                    FQ8_D256_SLAB_AD(cute::Int<0>{}, vst_, false)
+                    FQ8_D256_SLAB_AD(cute::Int<1>{}, vst_, true)
                     } else {
                     fq8_pv_tile(tOrV(_, _, _, smem_pipe_read_v.index()), tOrD);
                     warpgroup_wait<0>();
@@ -1850,7 +1894,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
                     // the Triton reference forward do.  It is not a P-hat basis quantity, so the
                     // denominator invariant (row_sum *= scores_scale,
                     // softmax_fq8f.h:195) is untouched.
-                    if constexpr (!kFwdLazy) { softmax.rescale_o(tOrO, scores_scale); }
+                    if constexpr (!kFwdLazy && !kD256AD) { softmax.rescale_o(tOrO, scores_scale); }
                     if constexpr (kFwdDfold && !Check_inf) { softmax.template online_softmax_grouped_raw</*Is_first=*/false, Check_inf>(tSrS, fq8_g_); }
                     else { softmax.template online_softmax_grouped</*Is_first=*/false, Check_inf>(tSrS); }
                     if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
@@ -1935,6 +1979,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
             // the final sub-gemm stays in flight through finalize (which
             // touches only row stats, never ms_ or row_max, so w_3 is still
             // valid after it).
+            if constexpr (kD256AD) { softmax.rescale_o(tOrO, scores_scale); }   // the last step's deferred alpha
             auto tOrD = make_tOrD();
             fq8_pv_tile(tOrV(_, _, _, smem_pipe_read.index()), tOrD);
             // ## V3-TILEPROMOTE: tOrO is in TRUE exp(-m) units, so finalize is
