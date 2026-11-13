@@ -538,8 +538,10 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
 template <bool Is_causal>
 void run_fq8_dq_pass2_fp11(Flash_bwd_fp8_params &params, cudaStream_t stream) {
 #if defined(FA3FP11_D256_P2DG) && FA3FP11_D256_P2DG
-    run_fq8_dq_pass2_dg<Is_causal>(params, stream);
-    return;
+    if (params.dq_acc_ptr == nullptr) {   // the CP ring's in-kernel fp32 dQ accumulation keeps the windowed kernel
+        run_fq8_dq_pass2_dg<Is_causal>(params, stream);
+        return;
+    }
 #endif
     using namespace fq8p2;
     int const nbm = cute::ceil_div(params.seqlen_q, kBM);
