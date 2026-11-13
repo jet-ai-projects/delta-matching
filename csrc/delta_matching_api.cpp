@@ -220,6 +220,14 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8(
 static at::Tensor* g_dbg_ds8 = nullptr;
 static at::Tensor* g_dbg_psi = nullptr;
 #endif
+// A (b, h, d, s) twin's batch (i = 0) / head (i = 1) stride for the TMA descriptor: a size-1 mode is never stepped, so it
+// gets the contiguous value of the mode inside it (what a contiguous tensor has), whatever stride the view carries.
+static int64_t dm_twin_stride(at::Tensor const& t, int i) {
+    int64_t const head = t.size(1) == 1 ? int64_t(t.size(2)) * t.stride(2) : t.stride(1);
+    if (i == 1) { return head; }
+    return t.size(0) == 1 ? int64_t(t.size(1)) * head : t.stride(0);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     at::Tensor dout8,   // (b, s_q, h, d) e4m3 codes
     at::Tensor q8,      // (b, s_q, h, d) e4m3
@@ -227,9 +235,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     at::Tensor v8,      // (b, s_k, h, d) e4m3
     at::Tensor lse,     // (b, h, s_q) fp32 (natural-log LSE)
     at::Tensor delta,   // (b, h, s_q) fp32 (the recipe delta: stale or matched)
-    at::Tensor kt8,     // (b, h, d, s_k) e4m3 transposed K twin, contiguous
-    at::Tensor qt8,     // ## FP11-M17 GT: (b, h, d, s_q) e4m3 Q twin (pi-ordered s), contiguous; ignored at GT=0
-    at::Tensor dot8,    // ## FP11-M17 GT: (b, h, d, s_q) e4m3 dO twin (pi-ordered s), contiguous; ignored at GT=0
+    at::Tensor kt8,     // (b, h, d, s_k) e4m3 transposed K twin (s unit-stride, 16-byte multiple strides)
+    at::Tensor qt8,     // ## FP11-M17 GT: (b, h, d, s_q) e4m3 Q twin (pi-ordered s), strides as kt8
+    at::Tensor dot8,    // ## FP11-M17 GT: (b, h, d, s_q) e4m3 dO twin (pi-ordered s), strides as kt8
     at::Tensor q8s,     // (b, h, s_q/64) fp32
     at::Tensor k8s,     // (b, h, s_k/32) fp32
     at::Tensor v8s,     // (b, h, s_k/32) fp32
@@ -276,7 +284,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     TORCH_CHECK(k8s.size(1) == num_heads_k && v8s.size(1) == num_heads_k && q8s.size(1) == num_heads && do8s.size(1) == num_heads,
                 "delta_matching bwd: scale head counts (q/do: h, k/v: h_k)");
     if (ring) {
-        TORCH_CHECK(head_size == 128, "delta_matching bwd (ring): head_dim 128 only");
+        // head_dim 256: pass 2 has no batch loop; each launch adds its own block (batch 1) into dq_acc.
+        TORCH_CHECK(head_size == 128 || batch_size == 1, "delta_matching bwd (ring): head_dim 256 needs batch 1");
         TORCH_CHECK(!is_causal || batch_size == 1, "delta_matching bwd (ring): causal needs batch 1");
         TORCH_CHECK(dq_acc.scalar_type() == at::kFloat && dq_acc.dim() == 3 && dq_acc.size(0) == seqlen_q && dq_acc.size(1) == num_heads
                     && dq_acc.size(2) == head_size && dq_acc.stride(2) == 1 && dq_acc.stride(0) % 2 == 0 && dq_acc.stride(1) % 2 == 0,
@@ -297,7 +306,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     }
     for (auto const& t : {dout8, q8, k8, v8}) { TORCH_CHECK(t.stride(-1) == 1); }
     for (auto const& t : {q8s, k8s, v8s, do8s, lse, delta}) { TORCH_CHECK(t.is_contiguous()); }
-    if (!ring) { TORCH_CHECK(kt8.is_contiguous()); }
+    // The twins: s unit-stride, every other stride a 16-byte multiple (the TMA descriptors take the strides).
+    for (auto const& t : {kt8, qt8, dot8}) {
+        TORCH_CHECK(t.stride(3) == 1 && t.stride(2) % 16 == 0 && dm_twin_stride(t, 1) % 16 == 0 && dm_twin_stride(t, 0) % 16 == 0,
+                    "delta_matching bwd: twins need s unit-stride and 16-byte multiple strides");
+    }
     auto opts = q8.options();
     int const seqlen_q_rounded = seqlen_q;    // 64-multiple asserted
     int const head_size_rounded = head_size;
@@ -363,15 +376,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     params.arch = 90;
     // ## FP11-M17 GT: the Q^T / dO^T gmem twins are REAL inputs (pi-ordered s positions).
     TORCH_CHECK(qt8.defined() && dot8.defined(), "delta_matching bwd: the qt8 / dot8 twins are required");
-    TORCH_CHECK(qt8.size(0) == batch_size && qt8.size(1) == num_heads && qt8.size(2) == head_size && qt8.size(3) == seqlen_q && (ring || qt8.is_contiguous()),
-                "delta_matching bwd: qt8 must be (b, h, d, s_q) contiguous");
-    TORCH_CHECK(dot8.size(0) == batch_size && dot8.size(1) == num_heads && dot8.size(2) == head_size && dot8.size(3) == seqlen_q && (ring || dot8.is_contiguous()),
-                "delta_matching bwd: dot8 must be (b, h, d, s_q) contiguous");
+    TORCH_CHECK(qt8.size(0) == batch_size && qt8.size(1) == num_heads && qt8.size(2) == head_size && qt8.size(3) == seqlen_q,
+                "delta_matching bwd: qt8 must be (b, h, d, s_q)");
+    TORCH_CHECK(dot8.size(0) == batch_size && dot8.size(1) == num_heads && dot8.size(2) == head_size && dot8.size(3) == seqlen_q,
+                "delta_matching bwd: dot8 must be (b, h, d, s_q)");
     params.qt_ptr = qt8.data_ptr(); params.kt_ptr = kt8.data_ptr(); params.dot_ptr = dot8.data_ptr();
-    // ## CP ring: the twin strides (contiguous tensors give exactly the former hard-coded values)
-    params.qt_d_stride = qt8.stride(2); params.qt_head_stride = qt8.stride(1); params.qt_batch_stride = qt8.stride(0);
-    params.kt_d_stride = kt8.stride(2); params.kt_head_stride = kt8.stride(1); params.kt_batch_stride = kt8.stride(0);
-    params.dot_d_stride = dot8.stride(2); params.dot_head_stride = dot8.stride(1); params.dot_batch_stride = dot8.stride(0);
+    // ## CP ring: the twin strides (contiguous tensors give exactly the former hard-coded values).  A size-1 batch / head
+    // mode is never stepped; its stride is set to the contiguous value of the mode inside it (as a contiguous tensor's).
+    params.qt_d_stride = qt8.stride(2); params.qt_head_stride = dm_twin_stride(qt8, 1); params.qt_batch_stride = dm_twin_stride(qt8, 0);
+    params.kt_d_stride = kt8.stride(2); params.kt_head_stride = dm_twin_stride(kt8, 1); params.kt_batch_stride = dm_twin_stride(kt8, 0);
+    params.dot_d_stride = dot8.stride(2); params.dot_head_stride = dm_twin_stride(dot8, 1); params.dot_batch_stride = dm_twin_stride(dot8, 0);
+    // head_dim 256 pass 2 reads Kt over one collapsed (b, h_k) mode.
+    TORCH_CHECK(head_size != 256 || batch_size == 1 || params.kt_batch_stride == int64_t(num_heads_k) * params.kt_head_stride,
+                "delta_matching bwd: at head_dim 256 a batched kt8 needs batch stride == h_k * head stride");
     if (ring) {
         params.dq_acc_ptr = dq_acc.data_ptr<float>();
         params.dqa_row_stride = dq_acc.stride(0); params.dqa_head_stride = dq_acc.stride(1);
@@ -560,7 +577,7 @@ at::Tensor delta_fp8_core(
     }
     for (auto const& t : {dout8, q8, k8, v8}) { TORCH_CHECK(t.stride(-1) == 1); }
     for (auto const& t : {q8s, k8s, v8s, do8s, lse}) { TORCH_CHECK(t.is_contiguous()); }
-    if (head_size != 128) { TORCH_CHECK(kt8.is_contiguous()); }   // ## CP ring: the hd128 pass 0 never reads kt8
+    TORCH_CHECK(kt8.stride(3) == 1, "delta_matching delta: kt8 needs s unit-stride");   // ## CP ring: no shipped pass 0 reads kt8
     auto opts = q8.options();
     int const seqlen_q_rounded = seqlen_q;    // 64-multiple asserted
     int const head_size_rounded = head_size;
