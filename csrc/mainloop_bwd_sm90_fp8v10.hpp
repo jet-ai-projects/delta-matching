@@ -534,7 +534,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         // anchored to the physical address, coordinate stores to the tensor base;
         // a base not aligned to the full swizzle period shows up as a uniform
         // XOR-phase between store and read (measured: XOR 0x20 on the m axis).
-        cute::array_aligned<Element, cute::cosize_v<SmemLayoutPdSt>, 1024> smem_pt;
+        cute::array_aligned<Element, 2 * cute::cosize_v<SmemLayoutPdSt>, 1024> smem_pt;   // H1a: [m parity]
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutPdSt>, 1024> smem_dst;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutPdS>, 1024> smem_ds;
         // ## FP11-F3: 8 slots, one per MMA warp (fq8_psired[thread_idx/32] with
@@ -544,7 +544,8 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         // member-reorder away from corrupting the pipeline barriers).  sizeof
         // (TensorStorage) is 1024-aligned with ~1008 B of tail padding, so the
         // extra 16 B does not change the smem footprint.
-        cute::array_aligned<ElementAccum, 8, 16> smem_psired;
+        // H1a: smem_psired moved to the kernel's PipelineStorage (keeps this struct a 1024-B multiple with the
+        // parity-buffered smem_pt: the 32 B member used to round the struct up by a whole KB).
     };
     // ## FP11-M5 (pass-0 storage): only what the S/dP recompute consumes.
     // smem_k/v/q/do/kt/lse/dpsum keep the EXACT pass-1 member declarations
@@ -1455,6 +1456,10 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         Tensor sKt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_kt.data()), SmemLayoutKt{});
         Tensor sPt = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_pt.data()), SmemLayoutPdSt{});
         Tensor sPt_pi = cute::as_position_independent_swizzle_tensor(sPt);
+        // H1a: the P~^T exchange buffer of tile m (m parity); sPt above is buffer 0.
+        auto fq8_sPt_par = [&](int m) {
+            return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_pt.data() + (m & 1) * cute::cosize_v<SmemLayoutPdSt>), SmemLayoutPdSt{});
+        };
         Tensor sdS = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_ds.data()), SmemLayoutPdS{});
         Tensor sdS_pi = cute::as_position_independent_swizzle_tensor(sdS);
         Tensor sdS16_pi = cute::as_position_independent_swizzle_tensor(cute::recast<uint16_t>(sdS));
@@ -1719,7 +1724,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         // M2/M3's, so the psi field and dS' codes pass 2 consumes are
         // byte-identical (the M4 dq-bitwise guarantee).
         float fq8_g_max = 0.0f;
-        float* fq8_psired = shared_storage.tensors.mainloop.smem_psired.data();
+        float* fq8_psired = shared_storage.pipelines.smem_psired.data();
         static constexpr float kFq8MoE = 8.0f;          // log2(2^8)
         static constexpr float kFq8MoInv = 1.0f / 256.0f;
         // ## FP11-M4: dK promotion window length in m-tiles.  PINNED at 8
@@ -1861,6 +1866,14 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             // ## FP11-M17 GT: the dP gemm (raw dO's only reader) has retired and
             // dPsum was copied to registers above: release raw dO now.
             pipeline_do.consumer_release(smem_pipe_read_do_cur);
+            // EARLY dV window rescale (v10 sequence, moved before the dV issue at the psi barrier): placed where no
+            // wgmma is outstanding (touching a GMMA accumulator with S / dP in flight makes ptxas inject a full
+            // wgmma wait, serializing S retire behind dP).  Same multiplies, same values.
+            float const fq8_f_cur = kFq8MoInv * fq8_do8sc;
+            float const fq8_rf = fq8_clamp_ratio(fq8_f_prev / fq8_f_cur);
+            #pragma unroll
+            for (int i = 0; i < size(tdVrdV); ++i) { tdVrdV(i) *= fq8_rf; }
+            fq8_f_prev = fq8_f_cur;
             // Reshape tdPrdP from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2, MMA_N))
             Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
 #ifdef FA3FP11_DBG
@@ -1932,6 +1945,25 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                 }
             }
 #endif
+            // H1a: P~ codes and their transposed exchange (buffer m & 1) BEFORE the psi barrier, so dV = P~^T dO can be
+            // issued right after it (dV does not depend on psi).  Buffer m & 1 was last read by tile m - 2's dV gemms,
+            // which both warpgroups retired before reaching tile m - 1's psi barrier.
+            static_assert((kAbl & 2) == 0, "delta_matching H1a: the P~^T exchange is published by the psi barrier");
+            Tensor rP = make_tensor_like<Element>(tSrS);
+            flash::convert_type_out(tSrS, rP);
+            Tensor rP_rc = make_tensor(rP.data(), scores.layout());
+            Tensor sPt_cur = fq8_sPt_par(m_block);
+            if constexpr (!(kAbl & 4)) {
+            Tensor sPt_cur_pi = cute::as_position_independent_swizzle_tensor(sPt_cur);
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(rP_rc); ++mi) {
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(rP_rc); ++ni) {
+                    auto crd = tScS_rc(mi, ni);
+                    sPt_cur_pi(get<1>(crd), fq8_pi_m(get<0>(crd)), _0{}) = rP_rc(mi, ni);
+                }
+            }
+            }
             if constexpr (!(kAbl & 32)) {
             #pragma unroll
             for (int mi = 0; mi < size<0>(dS); ++mi) {
@@ -1974,6 +2006,13 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             // ## FQ8-V8: psi gets its OWN barrier id (dQEmptyWG3, unused at 2 WGs);
             // v1 borrowed dQEmptyWG1 which the TMA-dQ protocol now owns.
             cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG3) /*id: free at 2 WGs*/);
+            // H1a: both warpgroups' P~^T halves are published (fence + psi barrier): issue dV now, so it flies under the
+            // psi / dS' conversion / exchange stores / PdS barrier below.  Same operands, same accumulator, same order.
+            if constexpr (!(kAbl & 256)) { consumer_wait(pipeline_dot, smem_pipe_read_dot); }
+            if constexpr (!(kAbl & 1)) {
+            Tensor tdVrPt = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(wg_mma_dKV, sPt_cur);
+            flash::gemm</*zero_init=*/false, /*wg_wait=*/-1, /*SwapAB=*/dKV_swapAB>(tiled_mma_dKV, tdVrPt(_, _, _, _0{}), tdVrdO(_, _, _, smem_pipe_read_dot.index()), tdVrdV);
+            }
             #pragma unroll
             for (int w = 0; w < NumMmaThreads / cutlass::NumThreadsPerWarp; ++w) {
                 fq8_amax = fmaxf(fq8_amax, fq8_psired[w]);
@@ -2021,22 +2060,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             // e4m3 satfinite converter matches the reference rounding).  P-hat is
             // consumed ONLY transposed (dV's A operand): scatter bytes straight
             // into the (n, m) exchange.
-            Tensor rP = make_tensor_like<Element>(tSrS);
-            flash::convert_type_out(tSrS, rP);
-            Tensor rP_rc = make_tensor(rP.data(), scores.layout());
-            if constexpr (kStages_dS == 1 && !(kAbl & 4) && (kAbl & 2)) {   // ABL 2 drops the psi barrier: keep the separate one
-                if (thread_idx == 0) { cute::tma_store_wait<0>(); }
-                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::PdS) /*id*/);
-            }
             if constexpr (!(kAbl & 4)) {
-            #pragma unroll
-            for (int mi = 0; mi < size<0>(rP_rc); ++mi) {
-                #pragma unroll
-                for (int ni = 0; ni < size<1>(rP_rc); ++ni) {
-                    auto crd = tScS_rc(mi, ni);
-                    sPt_pi(get<1>(crd), fq8_pi_m(get<0>(crd)), _0{}) = rP_rc(mi, ni);
-                }
-            }
             // ## FQ8: dS8 codes = e4m3(dS/psi) (identical to the reference: the 2^8
             // factor cancels between dS and psi).  Natural (m, n) tile: packed u16
             // PAIR stores (the C fragment's even/odd columns are byte-adjacent);
@@ -2104,11 +2128,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                     // boundary, so a window's first tile rescales exact
                     // zeros: value-identical to a zero_init chain start, and
                     // the tile body stays branch-free).
-                    float const fq8_f_cur = kFq8MoInv * fq8_do8sc;
-                    float const fq8_rf = fq8_clamp_ratio(fq8_f_prev / fq8_f_cur);
-                    #pragma unroll
-                    for (int i = 0; i < size(tdVrdV); ++i) { tdVrdV(i) *= fq8_rf; }
-                    fq8_f_prev = fq8_f_cur;
+                    // (the dV window rescale moved to the S-retire bubble: H1a)
                     // ## FP11-F2 + M4: a zero tile (psi-floor sentinel, see
                     // the psi site above) contributes exact zeros: its dS'
                     // codes are all zero, so its dK temp gemm below produces
@@ -2136,8 +2156,6 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                     Tensor tdQrdS_cur = tdQrdS(_, _, _, cute::conditional_return<kStages_dS==1>(_0{}, smem_pipe_read.index()));
                     static_assert(decltype(size<2>(tdQrK))::value == kBlockN / 32,
                                   "delta_matching: dQ contraction must be kBlockN/32 fp8 k-atoms");
-                    Tensor tdVrPt = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(wg_mma_dKV, sPt);
-                    Tensor tdVrPt_cur = tdVrPt(_, _, _, _0{});
                     Tensor tdKrdS = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(wg_mma_dKV, sdSt);
                     Tensor tdKrdS_cur = tdKrdS(_, _, _, _0{});
 
@@ -2148,12 +2166,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                     // the dP gemm (raw dO's only MMA reader) retired at the dS
                     // stage: release raw dO here so the 1-stage refill starts a
                     // dV-gemm earlier.
-                    if constexpr (!(kAbl & 256)) { consumer_wait(pipeline_dot, smem_pipe_read_dot); }
-                    // ## FP11-M16 DO2: the transposed twin is indexed by ITS pipeline's
-                    // stage (1 stage under DO2; equal to the raw index in the M10 config).
-                    if constexpr (!(kAbl & 1)) {
-                    flash::gemm</*zero_init=*/false, /*wg_wait=*/-1, /*SwapAB=*/dKV_swapAB>(tiled_mma_dKV, tdVrPt_cur, tdVrdO(_, _, _, smem_pipe_read_dot.index()), tdVrdV);
-                    }
+                    // (H1a: the dot wait and the dV gemm were issued right after the psi barrier.)
                     // ## FQ8-V9: sQt is produced by the transpose warps.  The qt
                     // wait proves the transposer is done with raw q, and the S gemm
                     // (raw q's only MMA reader) retired at softmax: release raw q

@@ -108,6 +108,8 @@ public:
             alignas(16) typename MainloopPipelineQt::SharedStorage pipeline_qt;
             alignas(16) typename MainloopPipelineDOt::SharedStorage pipeline_dot;
             alignas(16) typename TileScheduler::SharedStorage smem_scheduler;
+            // pass 1: the psi cross-warpgroup amax slots (8 MMA warps; moved here from the mainloop tensor storage).
+            alignas(16) cute::array_aligned<float, 8, 16> smem_psired;
         } pipelines;
 
     };
