@@ -39,9 +39,34 @@ def _add_rn(a, b):
     return cute.arch.inline_ptx("add.rn.f32 {$w0}, {$r0}, {$r1};", write_only_types=[F32], read_only_args=[a, b])
 
 
+def _f32hex(c):
+    import struct
+    return "0f%08X" % struct.unpack("<I", struct.pack("<f", c))[0]
+
+
+def _mul_rn_c(a, c):
+    """a * c (RN) with c a Python float, rounded to fp32, as a PTX immediate."""
+    return cute.arch.inline_ptx("mul.rn.f32 {$w0}, {$r0}, " + _f32hex(c) + ";", write_only_types=[F32],
+                                read_only_args=[a])
+
+
 def _add0_rn(a):
     """a + 0.0 (RN): normalizes -0 to +0, as torch's add of a zeros tensor."""
     return cute.arch.inline_ptx("add.rn.f32 {$w0}, {$r0}, 0f00000000;", write_only_types=[F32], read_only_args=[a])
+
+
+# The Triton references' libdevice mul_rn / add_rn compile with nvvm-reflect-ftz=1: mul.rn.ftz.f32 / add.rn.ftz.f32
+# (checked in their PTX); their plain `*` (the sm bake), div_rn and the e4m3 cast keep denormals.
+def _mul_rnz(a, b):
+    return cute.arch.inline_ptx("mul.rn.ftz.f32 {$w0}, {$r0}, {$r1};", write_only_types=[F32], read_only_args=[a, b])
+
+
+def _add_rnz(a, b):
+    return cute.arch.inline_ptx("add.rn.ftz.f32 {$w0}, {$r0}, {$r1};", write_only_types=[F32], read_only_args=[a, b])
+
+
+def _add0_rnz(a):
+    return cute.arch.inline_ptx("add.rn.ftz.f32 {$w0}, {$r0}, 0f00000000;", write_only_types=[F32], read_only_args=[a])
 
 
 def _fold_row(X, O, b, n, hk, c, R: cutlass.Constexpr):
@@ -138,8 +163,8 @@ def _rope_row(DQ, COS, SIN, b, n, h, lane, HALFC, RDC):
     out = cute.make_rmem_tensor((_V,), F32)
     for j in range(_V):
         gp = cute.arch.shuffle_sync_bfly(g[j], offset=HALFC)
-        t = _mul_rn(_mul_rn(gp, ss[j]), sgn)
-        out[j] = _add_rn(_add0_rn(t), _mul_rn(g[j], cc[j]))
+        t = _mul_rn(_mul_rnz(gp, ss[j]), sgn)          # sgn: an exact sign flip (torch.neg)
+        out[j] = _add_rnz(_add0_rnz(t), _mul_rnz(g[j], cc[j]))
     return graw, out.load().to(BF16)
 
 
@@ -208,3 +233,201 @@ def fold_rope_bwd(dk, dv, dq, cos, sin, n_rep: int, tok: int | None = None):
         _CACHE[key] = cute.compile(_fold_rope, *args, B, N, Hkv, n_rep, H, TOK, RD // 16, RD // _V, st)
     _CACHE[key](*args, st)
     return dqo, ok, ov
+
+
+# ------------------------------------------------------------------ Q / dO cast-transpose: codes + scales + pi twin, one read
+# TE's quantize_transpose (block scaling) design: ONE read of the bf16 tile, the block amax reduced in registers (warp
+# shuffle + a CTA smem step), then BOTH outputs written from registers: the row-major codes and the transposed (pi-ordered)
+# twin.  The thread tile is 16 rows (one pi window) x 4 columns, so each twin segment (16 positions of one column) is
+# assembled in registers and leaves as ONE 16 B store; no shared-memory transpose is needed.
+_E4M3_MAX = 448.0
+_INV_E4M3_MAX = float(__import__("numpy").float32(1.0) / __import__("numpy").float32(448.0))
+_SIGMA = [0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15]   # pi window: physical position p holds row SIGMA[p]
+
+
+def _rcp_rn(a):
+    return cute.arch.inline_ptx("rcp.rn.f32 {$w0}, {$r0};", write_only_types=[F32], read_only_args=[a])
+
+
+def _fdiv(x, ns, y):
+    """RN(x / s) from ns = -s and y = RN(1 / s): q0 = x y; q1 = q0 + (x - s q0) y; q2 = q1 + (x - s q1) y; copysign(q2, x)."""
+    return cute.arch.inline_ptx(
+        "{\n.reg .f32 q, e;\nmul.rn.f32 q, {$r0}, {$r2};\nfma.rn.f32 e, {$r1}, q, {$r0};\nfma.rn.f32 q, e, {$r2}, q;\n"
+        "fma.rn.f32 e, {$r1}, q, {$r0};\nfma.rn.f32 q, e, {$r2}, q;\ncopysign.f32 {$w0}, {$r0}, q;\n}",
+        write_only_types=[F32], read_only_args=[x, ns, y])
+
+
+def _div_rn(a, b):
+    return cute.arch.inline_ptx("div.rn.f32 {$w0}, {$r0}, {$r1};", write_only_types=[F32], read_only_args=[a, b])
+
+
+@cute.kernel
+def _ct_kernel(X: cute.Tensor, COS: cute.Tensor, SIN: cute.Tensor, Q8: cute.Tensor, QS: cute.Tensor, QT: cute.Tensor,
+               H: cutlass.Constexpr, BLK: cutlass.Constexpr, D: cutlass.Constexpr, RD: cutlass.Constexpr,
+               ROPE: cutlass.Constexpr, SM: cutlass.Constexpr, WANT_T: cutlass.Constexpr,
+               FASTDIV: cutlass.Constexpr):
+    """One CTA per (64-row block, b*H + h), D threads; thread = 16 rows (one pi window) x 4 columns, lane = window * 8 +
+    column group, so each warp store of the twin writes 8 x 64 B contiguous runs (4 windows of one column).
+    ROPE (the Q producer, tier3a_ropeq): partial RoPE (mul_rn / add_rn, bf16 RTNE), x SM, s = div.full(max(amax, 1e-30),
+    448).  Otherwise (the dO producer, doq_m17): x as is, s = max(amax, 1e-30) * fp32(1 / 448).
+    Codes: div_rn(x, s), clamp +-448 (max / min), RTNE e4m3."""
+    t, _, _ = cute.arch.thread_idx()
+    pm, pbh, _ = cute.arch.block_idx()
+    b = pbh // H
+    h = pbh - b * H
+    lane = t % 32
+    w = t // 32
+    NW = D // 32                            # warps: 8 column groups (32 columns) each
+    k = lane % 8
+    wr = lane // 8                          # pi window (16 rows) of the 64-row block
+    cg = w * 8 + k                          # 4-column group, 0 .. D/4 - 1
+    n0 = pm * BLK + wr * 16
+    # the tile stays in registers as bf16 (32 regs): the RoPE output IS bf16, the sm bake (x SM, exact at D = 256) and the
+    # fp32 upcast are recomputed where used (same op, same input, same bits), so occupancy is not register-bound
+    vals = cute.make_rmem_tensor(cute.make_layout((16, 4), stride=(4, 1)), BF16)
+    for r in cutlass.range_constexpr(16):
+        vals[r, None].store(X[b, h, n0 + r, cg, None].load())
+    if cutlass.const_expr(ROPE):
+        HALFG = RD // 8                      # partner group offset (HALF / 4)
+        RDG = RD // 4
+        if cg < RDG:                         # rotated lanes: own + partner (L1 hits), cos / sin of the own lanes
+            sgn = F32(2.0) * F32((cg // HALFG) % 2) - F32(1.0)   # -1: lanes < HALF pair with -x2; +1: >= HALF with x1
+            for r in cutlass.range_constexpr(16):
+                xo = vals[r, None].load().to(F32)
+                xp = X[b, h, n0 + r, cg ^ HALFG, None].load().to(F32)
+                cc = COS[b, n0 + r, cg, None].load().to(F32)
+                ss = SIN[b, n0 + r, cg, None].load().to(F32)
+                ov = cute.make_rmem_tensor((4,), F32)
+                for j in cutlass.range_constexpr(4):
+                    ov[j] = _add_rnz(_mul_rnz(xo[j], cc[j]), _mul_rnz(_mul_rn(xp[j], sgn), ss[j]))
+                vals[r, None].store(ov.load().to(BF16))
+    # block amax: max |RN(x SM)| = RN(max |x| SM) (RN is monotone), so the bake is applied once to the max
+    a = F32(0.0)
+    for r in cutlass.range_constexpr(16):
+        xr = vals[r, None].load().to(F32)
+        for j in cutlass.range_constexpr(4):
+            a = cute.arch.fmax(a, cute.math.absf(xr[j]))
+    if cutlass.const_expr(ROPE):
+        a = _mul_rn_c(a, SM)
+    smem = cute.make_tensor(cute.arch.alloc_smem(F32, NW), cute.make_layout(NW))
+    wm = cute.arch.warp_reduction_max(a)
+    if lane == 0:
+        smem[w] = wm
+    cute.arch.barrier()
+    m = smem[0]
+    for i in cutlass.range_constexpr(1, NW):
+        m = cute.arch.fmax(m, smem[i])
+    s = F32(0.0)
+    if cutlass.const_expr(ROPE):
+        s = cute.math.div(cute.arch.fmax(m, F32(1e-30)), F32(_E4M3_MAX), full=True)
+    else:
+        s = _mul_rn_c(cute.arch.fmax(m, F32(1e-30)), _INV_E4M3_MAX)
+    if t == 0:
+        QS[pbh, pm] = s
+    codes = cute.make_rmem_tensor(cute.make_layout((4, 16), stride=(16, 1)), cutlass.Float8E4M3FN)  # [col j, pi pos p]
+    fast = m >= F32(2.0 ** -80)
+    y = _rcp_rn(s)
+    ns = -s
+    q8 = cute.recast_tensor(Q8, cutlass.Float8E4M3FN)
+    for p in cutlass.range_constexpr(16):    # row by row (pi order): 4 codes -> the row store now, the twin bytes kept
+        r = _SIGMA[p]
+        qc = cute.make_rmem_tensor((4,), F32)
+        for j in cutlass.range_constexpr(4):
+            x = vals[r, j].to(F32)
+            if cutlass.const_expr(ROPE):
+                x = _mul_rn_c(x, SM)
+            if cutlass.const_expr(FASTDIV):
+                # x / s correctly rounded from y = RN(1 / s): q = x y, two fma corrections (the CUDA div.rn fast path;
+                # Markstein: y within 1/2 ulp and q within 1 ulp -> RN(x / s)), sign copied from x (zeros, underflow).
+                # Exact while every remainder that can move a code is normal: blocks with amax >= 2^-80 (a code needs
+                # |x / s| >= 2^-11, so |x| >= 2^-99 there); smaller blocks take div.rn.
+                qc[j] = _fdiv(x, ns, y)
+            else:
+                qc[j] = _div_rn(x, s)
+        if cutlass.const_expr(FASTDIV):
+            if not fast:
+                for j in cutlass.range_constexpr(4):
+                    x = vals[r, j].to(F32)
+                    if cutlass.const_expr(ROPE):
+                        x = _mul_rn_c(x, SM)
+                    qc[j] = _div_rn(x, s)
+        for j in cutlass.range_constexpr(4):
+            qc[j] = cute.arch.fmin(cute.arch.fmax(qc[j], F32(-_E4M3_MAX)), F32(_E4M3_MAX))
+        codes[None, p].store(qc.load().to(cutlass.Float8E4M3FN))
+        q8[pbh, n0 + r, cg, None].store(codes[None, p].load())
+    if cutlass.const_expr(WANT_T):
+        qt = cute.recast_tensor(QT, cutlass.Float8E4M3FN)
+        for j in cutlass.range_constexpr(4):
+            qt[pbh, cg * 4 + j, n0 // 16, None].store(codes[j, None].load())
+
+
+@cute.jit
+def _ct_host(X, COS, SIN, Q8, QS, QT, NB: cutlass.Constexpr, BH: cutlass.Constexpr, H: cutlass.Constexpr,
+        BLK: cutlass.Constexpr, D: cutlass.Constexpr, RD: cutlass.Constexpr, ROPE: cutlass.Constexpr,
+        SM: cutlass.Constexpr, WANT_T: cutlass.Constexpr, FASTDIV: cutlass.Constexpr, stream):
+    _ct_kernel(X, COS, SIN, Q8, QS, QT, H, BLK, D, RD, ROPE, SM, WANT_T, FASTDIV).launch(
+        grid=[NB, BH, 1], block=[D, 1, 1], stream=stream, min_blocks_per_mp=_MINB)
+
+
+_FASTDIV = __import__("os").environ.get("DM_CUTE_FASTDIV", "1") == "1"
+_MINB = int(__import__("os").environ.get("DM_CUTE_CT_MINB", "3"))
+
+
+def _ct_launch(x_bhnd, cos, sin, blk, rope, want_twin, fastdiv=None):
+    fastdiv = _FASTDIV if fastdiv is None else fastdiv
+    B, H, N, D = x_bhnd.shape
+    BH = B * H
+    dev = x_bhnd.device
+    Q8 = torch.empty(BH, N, D, device=dev, dtype=torch.float8_e4m3fn)
+    Q8s = torch.empty(BH, N // blk, device=dev, dtype=torch.float32)
+    Qt = torch.empty(BH, D, N, device=dev, dtype=torch.float8_e4m3fn) if want_twin else None
+    RD = cos.shape[-1] if rope else 4
+    xc = x_bhnd.view(B, H, N, D // 4, 4)
+    if rope:
+        cc, sc = cos.view(B, N, RD // 4, 4), sin.view(B, N, RD // 4, 4)
+    else:
+        cc = sc = torch.empty(1, 1, 1, 4, device=dev, dtype=torch.bfloat16)
+    qt = (Qt if want_twin else Q8).view(torch.uint8)
+    args = [_ct(xc), _ct(cc), _ct(sc), _ct(Q8.view(torch.uint8).view(BH, N, D // 4, 4)), _ct(Q8s),
+            _ct(qt.view(BH, D, N // 16, 16))]
+    sm = D ** -0.5
+    key = ("ct", x_bhnd.device.index, tuple(xc.shape), tuple(xc.stride()), tuple(cc.shape), tuple(cc.stride()), tuple(sc.stride()), blk,
+           rope, want_twin, fastdiv)
+    st = cutlass_torch.current_stream()
+    if key not in _CACHE:
+        _CACHE[key] = cute.compile(_ct_host, *args, N // blk, BH, H, blk, D, RD, rope, sm, want_twin, fastdiv, st)
+    _CACHE[key](*args, st)
+    return Q8, Q8s, Qt
+
+
+def _ct_ok(x, blk):
+    if x.dim() != 4 or x.dtype != torch.bfloat16 or x.stride(-1) != 1 or x.data_ptr() % 16 != 0:
+        return False
+    B, H, N, D = x.shape
+    return D % 32 == 0 and D <= 1024 and blk == 64 and N % blk == 0 and \
+        all(s % 4 == 0 for s in x.stride()[:3])
+
+
+def ropeq_twin(q, cos, sin, blk: int = 64, want_twin: bool = True, fastdiv=None):
+    """q bf16 (B, H, N, D) pre-RoPE (any strides, lane stride 1); cos / sin bf16 (B, N, RD) ->
+    (Q8 [BH, N, D], Q8s [BH, N // blk], Qt [BH, D, N] pi twin | None), bitwise tier3a_ropeq.ropeq_q + twins.twin_pi,
+    in one launch.  None off the fast path."""
+    if not _ct_ok(q, blk):
+        return None
+    B, H, N, D = q.shape
+    RD = cos.shape[-1]
+    if (cos.shape != (B, N, RD) or sin.shape != cos.shape or cos.dtype != torch.bfloat16 or sin.dtype != torch.bfloat16
+            or cos.stride(-1) != 1 or sin.stride(-1) != 1 or RD % 8 != 0 or RD > D or RD > 128
+            or ((RD // 8) & (RD // 8 - 1)) != 0 or cos.data_ptr() % 8 != 0 or sin.data_ptr() % 8 != 0
+            or any(s % 4 for s in cos.stride()[:2]) or any(s % 4 for s in sin.stride()[:2])):
+        return None
+    return _ct_launch(q, cos, sin, blk, True, want_twin, fastdiv)
+
+
+def doq_twin(dO_bnhd, H: int, blk: int = 64, want_twin: bool = True, fastdiv=None):
+    """dO bf16 (B, N, H, D) (lane stride 1) -> (dO8 [BH, N, D], dO8s [BH, N // blk], dOt [BH, D, N] pi twin | None),
+    bitwise producers.doq_m17(want_delta=False) + twins.twin_pi, in one launch.  None off the fast path."""
+    x = dO_bnhd.permute(0, 2, 1, 3)
+    if dO_bnhd.shape[2] != H or not _ct_ok(x, blk):
+        return None
+    return _ct_launch(x, None, None, blk, False, want_twin, fastdiv)
