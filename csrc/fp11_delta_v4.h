@@ -123,6 +123,8 @@ struct DeltaV4 {
     using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
                                      Int<kBlockN>, Int<kHeadDim / 2>>());
     using SmemLayoutK1 = decltype(tile_to_shape(SmemLayoutAtomK{}, select<1, 2>(TileShape_MNK{})));   // one n-block
+    using SmemLayoutKTma = SmemLayoutK1;
+    using TileShapeKTma = TileShape_MNK;
     using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtomK{},
                  make_shape(Int<kBlockN>{}, Int<kHeadDim>{}, Int<kNbPerCTA>{})));                      // kNbPerCTA n-blocks
     using SmemLayoutV = SmemLayoutK;
@@ -523,10 +525,13 @@ struct DeltaV4 {
 
 }  // namespace flash
 
+#include "fp11_delta_v4n.h"   // KDA-P0: d256 pass 0 with one n128 wgmma chain per warpgroup
+
 // Host launch: pass 0 v3 + the unchanged pass 0.5 reduce (fp11_delta.h's kernel).
 template <bool Is_causal, int kHeadDim_>
 void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t stream) {
-    using Kernel = flash::DeltaV4<Is_causal, FA3FP11_M16_P0V2_ATOMN, (kHeadDim_ < 256 ? FA3FP11_HD128_P0NBWG : FA3FP11_M16_P0V3_NBWG), kHeadDim_>;
+    using KernelV4 = flash::DeltaV4<Is_causal, FA3FP11_M16_P0V2_ATOMN, (kHeadDim_ < 256 ? FA3FP11_HD128_P0NBWG : FA3FP11_M16_P0V3_NBWG), kHeadDim_>;
+    using Kernel = std::conditional_t<(kHeadDim_ >= 256 && FA3FP11_D256_P0N128), flash::DeltaV4N<Is_causal>, KernelV4>;
     using Element = typename Kernel::Element;
     using namespace cute;
     int const seqlen_q = params.seqlen_q;
@@ -550,9 +555,9 @@ void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t str
     typename Kernel::TMA_QdO tma_load_dO = make_tma_copy_A_sm90(
         cute::SM90_TMA_LOAD{}, mdO, take<0, 2>(typename Kernel::SmemLayoutdO{}), typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
     typename Kernel::TMA_K tma_load_K = make_tma_copy_B_sm90(
-        cute::SM90_TMA_LOAD{}, mK, typename Kernel::SmemLayoutK1{}, typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
+        cute::SM90_TMA_LOAD{}, mK, typename Kernel::SmemLayoutKTma{}, typename Kernel::TileShapeKTma{}, typename Kernel::ClusterShape{});
     typename Kernel::TMA_K tma_load_V = make_tma_copy_B_sm90(
-        cute::SM90_TMA_LOAD{}, mV, typename Kernel::SmemLayoutK1{}, typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
+        cute::SM90_TMA_LOAD{}, mV, typename Kernel::SmemLayoutKTma{}, typename Kernel::TileShapeKTma{}, typename Kernel::ClusterShape{});
 
     typename flash::TileSchedulerArguments scheduler_args {
         ngroups, params.h, params.b, 1 /*num_splits*/,
