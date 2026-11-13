@@ -527,6 +527,9 @@ struct DeltaV4 {
 
 #include "fp11_delta_v4n.h"   // KDA-P0: d256 pass 0 with one n128 wgmma chain per warpgroup
 
+#ifndef FA3FP11_D256_P0LPT
+#define FA3FP11_D256_P0LPT 1
+#endif
 // Host launch: pass 0 v3 + the unchanged pass 0.5 reduce (fp11_delta.h's kernel).
 template <bool Is_causal, int kHeadDim_>
 void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t stream) {
@@ -585,10 +588,13 @@ void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t str
                     int const nb0 = Kernel::kNbPerCTA * g;
                     int m_min = 0;
                     if (Is_causal) { m_min = std::max(0, (nb0 * Kernel::kBlockN + seqlen_q - seqlen_k) / Kernel::kBlockM); }
-                    for (int lo = m_min; lo < nbm; lo += FA3FP11_M17_P0MS) {
-                        int const hi = std::min(nbm, lo + FA3FP11_M17_P0MS);
+                    // KDA-P0B LPT (D128-v6 P0LPT at d256): one unit per (bh, group) = no m-split; the length-descending
+                    // stable sort below then dispatches every head's longest group first (a global longest-first order).
+                    int const ms = (kHeadDim_ >= 256 && FA3FP11_D256_P0LPT) ? (1 << 20) : FA3FP11_M17_P0MS;
+                    for (int lo = m_min; lo < nbm; lo += ms) {
+                        int const hi = std::min(nbm, lo + ms);
                         std::array<int, 4> e{bh, g, lo, hi};
-                        if (hi - lo == FA3FP11_M17_P0MS) { full.push_back(e); } else { part.push_back(e); }
+                        if (hi - lo == ms) { full.push_back(e); } else { part.push_back(e); }
                     }
                 }
             }
