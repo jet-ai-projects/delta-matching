@@ -73,11 +73,10 @@ public:
     static_assert(NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
 
     /// Register requirement for Load and Math WGs
-    // ## FQ8-V9: the transpose warps live in the load WG; 24 regs starves the
-    // LDSM fragments + quad-shuffle temps + two-round addressing into local
-    // spills.  40/232 fits the file: 128*(40 + 2*232) = 64512 <= 65536.
-    // ## FQ8-V9 register split, MEASURED repeatedly: 24 spills the transposer
-    // to 31.7ms; 32 starves it into a crawl even at ILP=1; 40/232 is the point.
+    // ## FQ8-V9 history: with the in-smem transposer warps in the load WG, 24 regs spilled them (40/232 was required).
+    // Under FA3FP11_M17_GT=1 (the release flag: the Q / dO twins come from global memory) the transposer path is
+    // compiled out and the load WG only issues TMA + pipeline bookkeeping, so the head_dim-256 split is 24/240:
+    // 128*(24 + 2*240) = 64512 <= 65536 (measured: pass 1 -1.8..-2.3%, bitwise).
     static constexpr uint32_t LoadRegisterRequirement = NumMmaWarpGroups == 2 ? 24 : 32;   // GT: the transposer warps idle; 24 frees 8 regs per MMA thread
     static constexpr uint32_t MmaRegisterRequirement = NumMmaWarpGroups == 2 ? 240 : 160;
     // If you want to print from the producer warp, you'd need to increase the number of registers
