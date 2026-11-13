@@ -1,9 +1,11 @@
 // ## V10 (split bwd) PASS 2: dQ = sm/256 * sum_nb psi[mb,nb] * (dS'8 @ Kt8)
 // as a block-scaled all-e4m3 wgmma GEMM.
 //
-// One CTA per (m-block, bh); a single math warpgroup (128 threads) consumes a
-// 3-stage TMA pipeline (elected-lane issue, one transaction barrier per stage
-// covering both operand tiles).
+// One CTA per (pair of m-blocks, bh) since P2D: two math warpgroups (one per
+// m-block, 128 threads each, the single-warpgroup arithmetic below verbatim)
+// share each K^T tile of a 3-stage TMA pipeline fed by a producer warp (one
+// transaction barrier per stage covering the K^T tile and both dS' tiles, one
+// empty barrier per stage with one arrival per warpgroup).
 //
 // ## FP11-M3 (interval promotion, the design notes): the fp32 register fragment acc
 // is no longer the row-long online chain (v10/M2: ONE psi-ratio-rescaled
@@ -103,6 +105,8 @@ constexpr int kBK = 64;      // contraction depth per tile (= pass-1 kBlockN)
 // kStages=2 the CTA is 109568 B -> 2 CTAs/SM again (regs R158 allow 3), and
 // the measured cost is 0.462 ms.  Pipeline depth changes NO arithmetic: the
 // barrier phase/slot math below is depth-generic.
+// ## P2D: 3 stages of (2 dS' tiles + 1 shared K^T tile) + 2 x 67584-B smem_dq = ~209 KB, 1 CTA (2 math warpgroups)
+// per SM: the same warps per SM as the v10/M3 2-CTA point, with half the K^T bytes.
 constexpr int kStages = 3;
 // ## P2W2: kWG row blocks (one math warpgroup each) per CTA share every K^T tile: the K^T bytes pass 2 streams from L2
 // (16 KB per 64 x 256 x 64 tile, the dominant traffic) drop by kWG.  Each warpgroup runs the single-warpgroup tile
@@ -111,6 +115,10 @@ constexpr int kWG = 2;
 // ## P2D: plus one producer warp (TMA issue, decoupled from the math warpgroups through per-stage empty barriers),
 // so the two warpgroups drift independently by up to kStages - 1 tiles instead of running in lockstep.
 constexpr int kThreads = 128 * kWG + 32;
+// ## P2E: L2 prefetch distance (tiles) of the dS' tiles: each dS' byte is read once, from HBM, and the 3-stage smem
+// pipeline covers ~2 tiles of compute, less than an HBM round trip; the producer prefetches tile nb + kPfTiles into L2
+// (cp.async.bulk.prefetch.tensor) when it issues tile nb.  Cache hint only: no arithmetic change.
+constexpr int kPfTiles = 8;
 
 // ## FP11-M3: promotion window length in tiles (C).  PINNED at 8 (512 keys):
 // ONE realization class per the design notes (no build knob).  the derivation notes: the
@@ -251,14 +259,27 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
             copy(params.tma_b.with(bar, 0 /*mcast*/), tBgB(_, tile), tBsB(_, s));
         }
     };
+    auto prefetch_a = [&](int tile) {
+        #pragma unroll
+        for (int w = 0; w < kWG; ++w) {
+            int const mbw = mb0 + w;
+            if (mbw < params.nbm && tile < (Is_causal ? mbw + 1 : params.nbn)) {
+                Tensor tAgA = group_modes<0, 3>(blkA.partition_S(mA(_, _, _, mbw, bh)));
+                prefetch(params.tma_a, tAgA(_, tile));
+            }
+        }
+    };
     // P2D producer warp (wg == kWG): classified before any math-warpgroup smem tensor / fragment is built; it only
     // touches the barriers, sB and the per-row-block dS' stage tensors of the issue lambda.
     if (wg == kWG) {   // refill slot s once both warpgroups released its previous tile
         if (cute::elect_one_sync()) {
             #pragma unroll 1
+            for (int t = kStages; t < kPfTiles && t < nb_cta; ++t) { prefetch_a(t); }
+            #pragma unroll 1
             for (int nb = 0; nb < nb_cta; ++nb) {
                 if (nb >= kStages) { shared.empty_bar[nb % kStages].wait(((nb / kStages) - 1) & 1); }
                 issue(nb);
+                if (nb + kPfTiles < nb_cta) { prefetch_a(nb + kPfTiles); }
             }
         }
         return;
