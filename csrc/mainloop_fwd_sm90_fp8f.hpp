@@ -24,6 +24,9 @@
 #include "utils.h"
 #include "sm90_pipeline_no_cluster.hpp"
 
+#ifndef FA3FP11_D256_SCPRE
+#define FA3FP11_D256_SCPRE 1
+#endif
 #ifndef FA3FP11_M16_FWDIL
 #define FA3FP11_M16_FWDIL 0
 #endif
@@ -1365,6 +1368,16 @@ struct CollectiveMainloopFwdSm90Fp8F {
         // reproduces the M10 index arithmetic exactly.
         int const fq8_bh_k = (bidb * get<2>(params.shape_K) + bidh_kv) * params.nblk_k;
         float fq8_v[4] = {1.f, 1.f, 1.f, 1.f};
+        // D256 SCPRE (bitwise): a step's four k-scales are loaded right after the QK issue (tOrD is dead there), so the
+        // global-load latency hides under the QK gemm instead of sitting between the QK retire and the descale.
+        static constexpr bool kD256ScPre = FA3FP11_D256_SCPRE && kHeadDim >= 256 && kGroups == 4 && kColsPerGroup == 8 && !kSmemSc;
+        float fq8_kpre[4] = {1.f, 1.f, 1.f, 1.f};
+        auto fq8_pre_sc = [&](int n_blk) __attribute__((always_inline)) {
+            if constexpr (kD256ScPre) {
+                #pragma unroll
+                for (int g = 0; g < 4; ++g) { fq8_kpre[g] = params.ptr_k8s[fq8_bh_k + 4 * n_blk + g]; }
+            }
+        };
         float fq8_ksc[4] = {1.f, 1.f, 1.f, 1.f}, fq8_vsc[4] = {1.f, 1.f, 1.f, 1.f};   // from smem after the K wait
         auto fq8_read_sc = [&](int stage, int n_blk) {
             if constexpr (kSmemSc) {
@@ -1385,7 +1398,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
             if constexpr (kGroups == 4 && kColsPerGroup == 8) {
             // d256: the descale is floored at FLT_MIN on the steps that may mask.
             auto gk = [&](int g) {
-                float const x = fq8_q8sc * params.ptr_k8s[fq8_bh_k + 4 * n_blk + g];
+                float const x = fq8_q8sc * (kD256ScPre ? fq8_kpre[g] : params.ptr_k8s[fq8_bh_k + 4 * n_blk + g]);
                 if constexpr (decltype(may_mask_c)::value) { return fmaxf(x, 1.17549435e-38f); } else { return x; }
             };
             float const g_[4] = {gk(0), gk(1), gk(2), gk(3)};
@@ -1463,6 +1476,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
             Tensor tSrS = partition_fragment_C(tiled_mma_qk, select<0, 1>(TileShape_MNK{}));
             consumer_wait(pipeline_k, smem_pipe_read);
             fq8_read_sc(smem_pipe_read.index(), n_block);
+            fq8_pre_sc(n_block);
             flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
             warpgroup_wait<0>();
             pipeline_k.consumer_release(smem_pipe_read);
@@ -1820,6 +1834,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
                     flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
                     if constexpr (UseSchedulerBarrier) { cutlass::arch::NamedBarrier::arrive(2 * cutlass::NumThreadsPerWarpGroup, fq8_bar_arv_id); }
                     fq8_read_sc(smem_pipe_read.index(), n_block);   // after the ring-turn arrive
+                    fq8_pre_sc(n_block);   // this tile's k-scales, consumed after the QK retire
                     warpgroup_wait<0>();
                     pipeline_k.consumer_release(smem_pipe_read);  // release K
                     scoremod_premask_fn(tSrS);
