@@ -114,7 +114,7 @@ def gqa_fold(dk: torch.Tensor, dv: torch.Tensor, n_rep: int):
     ov = torch.empty_like(ok)
     args = [_ct(dk.view(B, N, Hkv, n_rep, NC, _V)), _ct(dv.view(B, N, Hkv, n_rep, NC, _V)),
             _ct(ok.view(B, Hkv, N, NC, _V)), _ct(ov.view(B, Hkv, N, NC, _V))]
-    key = ("fold", B, N, H, D, n_rep)
+    key = ("fold", dk.device.index, B, N, H, D, n_rep)   # contiguous inputs only (_fold_ok): strides fixed by the shape
     st = cutlass_torch.current_stream()
     if key not in _CACHE:
         _CACHE[key] = cute.compile(_fold, *args, B, N, Hkv, n_rep, NC, TOK, st)
@@ -202,7 +202,7 @@ def fold_rope_bwd(dk, dv, dq, cos, sin, n_rep: int, tok: int | None = None):
             _ct(ok.view(B, Hkv, N, NC, _V)), _ct(ov.view(B, Hkv, N, NC, _V)),
             _ct(dq.view(B, N, H, NC, _V)), _ct(dqo.view(B, H, N, NC, _V)),
             _ct(cos.view(B, N, RD // _V, _V)), _ct(sin.view(B, N, RD // _V, _V))]
-    key = ("fold_rope", B, N, H, D, n_rep, RD, TOK)
+    key = ("fold_rope", dk.device.index, B, N, H, D, n_rep, RD, TOK)   # contiguous inputs only: strides fixed by the shape
     st = cutlass_torch.current_stream()
     if key not in _CACHE:
         _CACHE[key] = cute.compile(_fold_rope, *args, B, N, Hkv, n_rep, H, TOK, RD // 16, RD // _V, st)
