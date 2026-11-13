@@ -531,8 +531,16 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
 // template symbol overlapping the other FA3-derived libraries, and the FP11-F2 sentinel
 // makes this function numerically DIVERGENT from v10's: the overlap must be
 // impossible by construction, same rationale as run_flash_bwd_fp11_d256).
+#if defined(FA3FP11_D256_P2DG) && FA3FP11_D256_P2DG
+#include "fq8_dq_pass2_dg.h"   // ## P2DG: the DeepGEMM-class dQ numerics arm (build flag, default off)
+#endif
+
 template <bool Is_causal>
 void run_fq8_dq_pass2_fp11(Flash_bwd_fp8_params &params, cudaStream_t stream) {
+#if defined(FA3FP11_D256_P2DG) && FA3FP11_D256_P2DG
+    run_fq8_dq_pass2_dg<Is_causal>(params, stream);
+    return;
+#endif
     using namespace fq8p2;
     int const nbm = cute::ceil_div(params.seqlen_q, kBM);
     int const nbn = cute::ceil_div(params.seqlen_k, kBK);

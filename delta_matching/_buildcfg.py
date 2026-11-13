@@ -52,6 +52,9 @@ FLAGS = {
     "FA3FP11_HD128_FWDST": 3,      # hd128 forward: K/V pipeline stages
     "FA3FP11_HD128_FWDLAZY": 1,    # hd128 forward: lazy O rescale
     "FA3FP11_HD128_FWDDFOLD": 1,   # hd128 forward: S descale folded into the exp argument on unmasked steps
+    # hd256 pass 2: the DeepGEMM-class dQ numerics arm (per-tile fresh accumulator + fp32 FFMA psi promotion; NOT the
+    # bitwise kernel): build with DM_P2DG=1.  Default 0 = the bitwise windowed kernel.
+    "FA3FP11_D256_P2DG": int(os.environ.get("DM_P2DG", "0")),
 }
 EXTRA_DEFINES = ["-DFA3FP11_M16_P0V2_ATOMN=64", "-DFA3FP11_HD128_P0V6=1", "-DFA3FP11_P1R_MASKDIAG=1", "-DFA3FP11_P1R_RFSKIP=1"]
 
