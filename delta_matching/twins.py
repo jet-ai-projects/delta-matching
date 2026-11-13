@@ -30,6 +30,24 @@ def twin_pi_reference(x8: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# The forward's V twin (fwd_fp8(..., vt8)): V codes laid out (B * H_k, D, N) in the byte order the forward's in-smem V
+# transpose (LDSM.T + byte_perm + STSM) wrote into the wgmma B buffer: keys in SIGMA order inside every 16-key window
+# (the A-operand order of permute_Cregs_fp8's P), head-dim columns in TAU order inside every 16-column block (the order
+# permute_output_fp8 un-permutes in the epilogue).  The forward TMA-loads it straight into that buffer (bitwise).
+TAU = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15]
+
+
+def vtwin_reference(v8: torch.Tensor) -> torch.Tensor:
+    """[BH, N, D] e4m3 -> [BH, D, N]: VT[bh, dp, c] = v8[bh, (c & ~15) | SIGMA[c & 15], (dp & ~15) | TAU[dp & 15]]
+    (torch, for tests; the kernel op is twin_vt on the (b, s, h_k, d) view)."""
+    BH, N, D = v8.shape
+    n = torch.arange(N, device=v8.device)
+    d = torch.arange(D, device=v8.device)
+    nsrc = (n & ~15) | torch.tensor(SIGMA, device=v8.device)[n & 15]
+    dsrc = (d & ~15) | torch.tensor(TAU, device=v8.device)[d & 15]
+    return v8.view(torch.uint8)[:, nsrc][:, :, dsrc].transpose(1, 2).contiguous().view(v8.dtype)
+
+
 @triton.jit
 def _twin_pi_kernel(X, XT, N, D: tl.constexpr, BS: tl.constexpr, BD: tl.constexpr):
     pid_s = tl.program_id(0)
