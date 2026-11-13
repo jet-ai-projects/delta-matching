@@ -145,6 +145,17 @@ using TiledMmaP2 = decltype(cute::make_tiled_mma(
                                GMMA::Major::K, GMMA::Major::K>(),
     Layout<Shape<_1, _1, _1>>{}));
 
+// ## P2B-OVL: the 64 x 256 tile is issued as two 64 x 128 column halves (element-exact: wgmma N-tiling does not
+// change any element's k reduction; verified bitwise by the n128 variant), so the rescale / promote of half 1
+// overlaps half 0's wgmma.
+constexpr int kNH = 2;
+constexpr int kBDH = kBD / kNH;
+using TileShapeH = Shape<Int<kBM>, Int<kBDH>, Int<kBK>>;
+using TiledMmaH = decltype(cute::make_tiled_mma(
+    cute::GMMA::ss_op_selector<Element, Element, float, TileShapeH,
+                               GMMA::Major::K, GMMA::Major::K>(),
+    Layout<Shape<_1, _1, _1>>{}));
+
 using SmemLayoutAtomA = decltype(cutlass::gemm::collective::detail::ss_smem_selector<
     GMMA::Major::K, Element, Int<kBM>, Int<kBK>>());
 using SmemLayoutA = decltype(tile_to_shape(
@@ -288,39 +299,73 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     // Math warpgroups only from here (wg < kWG): this warpgroup's dS' stages, its wgmma fragments / descriptors and
     // its smem_dq slots are built after the producer warp's branch, so no tensor ever points past smem_a / smem_dq.
     Tensor sA = make_tensor(make_smem_ptr(shared.smem_a.data() + wg * cute::cosize_v<SmemLayoutA>), SmemLayoutA{});
-    TiledMmaP2 tiled_mma;
+    TiledMmaH tiled_mma;
     auto wg_mma = tiled_mma.get_thread_slice(tid);
     Tensor tCrA = wg_mma.partition_fragment_A(sA);   // GMMA descriptors (MMA, M, K, stages)
-    Tensor tCrB = wg_mma.partition_fragment_B(sB);
-    Tensor acc = partition_fragment_C(tiled_mma, select<0, 1>(TileShapeMNK{}));
-    clear(acc);
+    Tensor tCrB0 = wg_mma.partition_fragment_B(flat_divide(sB, Shape<Int<kBDH>, Int<kBK>>{})(_, _, _0{}, _0{}, _));
+    Tensor tCrB1 = wg_mma.partition_fragment_B(flat_divide(sB, Shape<Int<kBDH>, Int<kBK>>{})(_, _, _1{}, _0{}, _));
+    Tensor acc0 = partition_fragment_C(tiled_mma, select<0, 1>(TileShapeH{}));   // columns [0, 128)
+    Tensor acc1 = partition_fragment_C(tiled_mma, select<0, 1>(TileShapeH{}));   // columns [128, 256)
+    clear(acc0);
+    clear(acc1);
 
-    // wgmma C fragment coordinates: even/odd i are column-adjacent (d, d+1),
-    // so i steps of 2 index 8-byte-aligned float2 slots.  The SAME (m, d)
-    // map keys smem_dq ownership (promote + zero-init) and the epilogue.
-    Tensor cC = cute::make_identity_tensor(make_shape(Int<kBM>{}, Int<kBD>{}));
+    // wgmma C fragment coordinates (per half): even/odd i are column-adjacent (d, d+1), so i steps of 2 index
+    // 8-byte-aligned float2 slots; half h's column is d + h * kBDH.  The SAME (m, d) map keys smem_dq ownership
+    // (promote + zero-init) and the epilogue.
+    Tensor cC = cute::make_identity_tensor(make_shape(Int<kBM>{}, Int<kBDH>{}));
     Tensor tCcC = wg_mma.partition_C(cC);
     float* const smem_dq = shared.smem_dq.data() + wg * (kBM * kDqPitch);
+    constexpr int kAH = decltype(size(acc0))::value;   // 64 accumulators per thread per half
 
-    // ## FP11-M3: cooperative zero-init of the persistent dQ accumulator,
-    // before the pipeline warmup.  Each thread zeroes exactly its own
-    // fragment-owned slots, so no extra __syncthreads is needed anywhere:
-    // every later access to these slots is by the writing thread itself.
+    // ## FP11-M3: cooperative zero-init of the persistent dQ accumulator, before the pipeline warmup.  Each thread
+    // zeroes exactly its own fragment-owned slots: every later access to these slots is by the writing thread itself.
     #pragma unroll
-    for (int i = 0; i < size(acc); i += 2) {
-        int const m = get<0>(tCcC(i));
-        int const d = get<1>(tCcC(i));
-        *reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]) = make_float2(0.0f, 0.0f);
+    for (int h = 0; h < kNH; ++h) {
+        #pragma unroll
+        for (int i = 0; i < kAH; i += 2) {
+            int const m = get<0>(tCcC(i));
+            int const d = get<1>(tCcC(i)) + h * kBDH;
+            *reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]) = make_float2(0.0f, 0.0f);
+        }
     }
+    // FP11-M3 promote of one half: smem_dq(m, d) += acc(m, d) * scale (fp32 FMA, per-thread-owned slots).
+    auto promote_h = [&](auto const& a, int coff, float scale) {
+        #pragma unroll
+        for (int i = 0; i < kAH; i += 2) {
+            int const m = get<0>(tCcC(i));
+            int const d = get<1>(tCcC(i)) + coff;
+            float2* const slot = reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]);
+            float2 v2 = *slot;
+            v2.x = fmaf(a(i), scale, v2.x);
+            v2.y = fmaf(a(i + 1), scale, v2.y);
+            *slot = v2;
+        }
+    };
 
+    // P2B-OVL: issue one half's two k32 wgmmas and commit, WITHOUT flash::gemm's trailing fence_operand on the
+    // in-flight accumulator (that register use made ptxas inject a full wgmma wait before the other half's work).
+    auto issue_h = [&](auto& a, auto const& tB, int st, bool zero) {
+        warpgroup_fence_operand(a);
+        warpgroup_arrive();
+        tiled_mma.accumulate_ = zero ? GMMA::ScaleOut::Zero : GMMA::ScaleOut::One;
+        #pragma unroll
+        for (int kb = 0; kb < size<2>(tCrA); ++kb) {
+            cute::gemm(tiled_mma, tCrA(_, _, kb, st), tB(_, _, kb, st), a);
+            tiled_mma.accumulate_ = GMMA::ScaleOut::One;
+        }
+        warpgroup_commit_batch();
+    };
     float const* psi_row = params.ptr_psi + (int64_t(bh) * params.nbm + mb) * params.nbn;
-    // ## FP11-M3 window state: psi_w = the last TAKEN psi in the CURRENT
-    // window (acc's units), 0.0f = window empty (no taken tile yet: skip the
-    // rescale; acc is zero there anyway).  psi_max stays ROW-GLOBAL: the M2
-    // F2b dominance predicate is unchanged, so the skip set is bit-identical
-    // to M2's on any psi field.
+    // ## FP11-M3 window state: psi_w = the last TAKEN psi in the CURRENT window (acc's units), 0.0f = window empty.
+    // psi_max stays ROW-GLOBAL (the M2 F2b dominance predicate is unchanged: the skip set is bit-identical to M2's).
+    // ## P2B-OVL: a closed window's promote is DEFERRED to the next taken tile (or the row end) and interleaved with
+    // that tile's two half wgmmas: promote half 0 -> wgmma half 0 (scale_d = 0) -> promote half 1 (overlaps it) ->
+    // wgmma half 1.  Nothing touches acc / smem_dq in between (skipped tiles are transparent), so every smem_dq
+    // element sees the same FMA sequence in the same order.  Likewise the in-window rescale of half 1 overlaps half
+    // 0's wgmma.
     float psi_w = 0.0f;
     float psi_max = 0.0f;
+    float psi_prom = 0.0f;   // pending promote scale (0.0f = none pending)
     // psi of tile nb is loaded one iteration early, so its load latency overlaps the barrier wait.
     float psi_pf = nb_end > 0 ? psi_row[0] : 0.0f;
     #pragma unroll 1
@@ -329,93 +374,51 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
         float const psi_cur = nb < nb_end ? psi_pf : 0.0f;   // past this warpgroup's tail: psi 0 = no gemm, no state change
         if (nb + 1 < nb_end) { psi_pf = psi_row[nb + 1]; }
         shared.full_bar[s].wait((nb / kStages) & 1);
-        // ## FP11-F2: psi == 0.0f is pass 1's zero-tile sentinel (fully
-        // underflowed or fully masked tile; its dS' codes are exact zeros).
-        // ## FP11-F2b (dominance skip, M2): also skip any tile whose psi sits
-        // > 8 decades below the row's running psi max: its contribution is
-        // < fp32 epsilon of the row's dominant tile (every non-sentinel
-        // tile's max |code| is 448 by construction), while rescaling toward
-        // it would bind the 1e8 up-clamp and compound.  With the skip, every
-        // taken in-window ratio is <= psi_max/psi_cur <= 1e8 exactly.
-        // Healthy tiles run the v10 sequence bit-for-bit within the window
-        // (both predicates are strictly colder than any healthy psi ratio).
-        // A skipped tile is TRANSPARENT to the window (see header): it
-        // contributes exact zeros and leaves psi_w/psi_max untouched.
+        // ## FP11-F2 sentinel / F2b dominance skip (unchanged); a skipped tile is TRANSPARENT to the window.
         if (psi_cur != 0.0f && !(psi_cur < psi_max * 1e-8f)) {
-            if (psi_w != 0.0f) {   // not the window's first taken tile
+            if (psi_w != 0.0f) {   // not the window's first taken tile: rescale -> gemm, per half
                 float ratio = psi_w / psi_cur;
                 ratio = fminf(fmaxf(ratio, 1e-8f), 1e8f);
                 #pragma unroll
-                for (int i = 0; i < size(acc); ++i) { acc(i) *= ratio; }
-                flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(
-                    tiled_mma, tCrA(_, _, _, s), tCrB(_, _, _, s), acc);
+                for (int i = 0; i < kAH; ++i) { acc0(i) *= ratio; }
+                issue_h(acc0, tCrB0, s, false);
+                warpgroup_wait<1>();   // older groups (acc1's loop-carried def) retired; acc0's stays in flight
+                warpgroup_fence_operand(acc1);
+                #pragma unroll
+                for (int i = 0; i < kAH; ++i) { acc1(i) *= ratio; }
+                issue_h(acc1, tCrB1, s, false);
             } else {
-                // Window's first taken tile: acc's logical value is zero, so
-                // start the window's wgmma chain with scale_d = 0 (D = A*B,
-                // value-identical to 0 + A*B) instead of rescaling a zero
-                // fragment; the promote below then need not re-zero acc.
-                // The predicate is warpgroup-uniform (all threads read the
-                // same psi_row), so the wgmma stays converged.
-                flash::gemm</*zero_init=*/true, /*wg_wait=*/0>(
-                    tiled_mma, tCrA(_, _, _, s), tCrB(_, _, _, s), acc);
+                // Window's first taken tile: scale_d = 0 (D = A*B, value-identical to 0 + A*B); the closed window's
+                // pending promote reads each half just before that half's wgmma overwrites it.
+                bool const pend = psi_prom != 0.0f;
+                if (pend) { promote_h(acc0, 0, psi_prom); }
+                issue_h(acc0, tCrB0, s, true);
+                warpgroup_wait<1>();   // older groups (acc1's loop-carried def) retired; acc0's stays in flight
+                warpgroup_fence_operand(acc1);
+                if (pend) { promote_h(acc1, kBDH, psi_prom); }
+                issue_h(acc1, tCrB1, s, true);
+                psi_prom = 0.0f;
             }
             psi_w = psi_cur;
             psi_max = fmaxf(psi_max, psi_cur);
         }
-        // ## FP11-M10 (HANG FIX): unconditional consumer-release
-        // barrier.  This pipeline has NO empty/release mbarrier; v10's safety
-        // invariant was IMPLICIT: every iteration ran the warpgroup-collective
-        // flash::gemm (wg_wait=0), which cannot complete until all 128 threads
-        // issue their part, so thread 0 could never reach issue(nxt) -- the
-        // re-arm of slot s = nb % kStages, in THIS iteration -- while another
-        // warp still spun in full_bar[s].wait(...) on that slot.  The M2
-        // F2/F2b skip predicate above put that collective gemm inside a
-        // data-dependent branch: on a SKIPPED tile the iteration contains no
-        // warpgroup-collective instruction at all, so thread 0 can
-        // arrive_and_expect_tx + TMA-reissue slot s while a descheduled warp
-        // (concurrent-load co-residency: NCCL / other CTAs) is still polling
-        // that mbarrier's parity.  When the reissued load completes, the
-        // parity flips a SECOND time, the lagging warp's try_wait.parity test
-        // goes false again, and it is now one full phase rotation behind: at
-        // the row tail it waits on a phase nothing will ever complete =
-        // permanent spin, wedged CTA, the stream never drains (the observed
-        // matched-mode 8-GPU training hang; matched-only because matched
-        // delta centers dP so tiny-psi skip tiles are common, while stale psi
-        // never trips the predicates and the v10 discipline stays intact).
-        // The fix restores the release EXPLICITLY and unconditionally: no
-        // thread passes this point until every thread has passed wait(nb), so
-        // the re-arm of slot s below can never race a waiter.  Uniform trip
-        // count (nb_end is CTA-uniform), zero arithmetic effect (bitwise-
-        // invisible on every input); on taken tiles the warps are already
-        // converged by wg_wait=0, so the cost is a no-op bar.sync per tile.
-        // P2D release: every thread of this warpgroup has passed wait(nb) (and its gemm retired, wg_wait=0) before
-        // the elected arrive, so the producer's re-arm of slot s can never race a lagging waiter (the M10 invariant,
-        // now per warpgroup); the trip count nb_cta is CTA-uniform.
+        // Retire this tile's wgmmas at ONE point of every iteration (a no-op on skipped tiles), so ptxas can prove
+        // that no wgmma group is outstanding at the loop head (the loop-carried acc defs are retired).
+        warpgroup_wait<0>();
+        warpgroup_fence_operand(acc0);
+        warpgroup_fence_operand(acc1);
+        // ## FP11-M10 / P2D release: every thread of this warpgroup has passed wait(nb) (and its gemm retired) before
+        // the elected arrive, so the producer's re-arm of slot s can never race a lagging waiter; trip count nb_cta
+        // is CTA-uniform.
         cutlass::arch::NamedBarrier::sync(128, 1 + wg);
         if (tid == 0) { shared.empty_bar[s].arrive(); }
-        // ## FP11-M3 window boundary: geometry-fixed (every kPromoteTiles-th
-        // tile index + the tail), data-independent.  Promote the window into
-        // smem_dq in TRUE units (fold psi_w NOW: this replaces v10's row-end
-        // psi_last fold) and reset the window psi tracking; acc needs no
-        // explicit re-zero: the next window's first taken wgmma starts with
-        // scale_d = 0.  An all-skipped window (psi_w == 0) promotes nothing.
-        // Placed after issue(nxt) so the promote overlaps the next TMA loads.
+        // ## FP11-M3 window boundary: geometry-fixed (every kPromoteTiles-th tile index + the tail), data-independent.
+        // The closed window (psi_w != 0) becomes the pending promote; an all-skipped window promotes nothing.
         if (nb < nb_end && ((nb & (kPromoteTiles - 1)) == kPromoteTiles - 1 || nb == nb_end - 1)) {
-            if (psi_w != 0.0f) {
-                #pragma unroll
-                for (int i = 0; i < size(acc); i += 2) {
-                    int const m = get<0>(tCcC(i));
-                    int const d = get<1>(tCcC(i));
-                    float2* const slot = reinterpret_cast<float2*>(&smem_dq[m * kDqPitch + d]);
-                    float2 v2 = *slot;
-                    v2.x = fmaf(acc(i), psi_w, v2.x);
-                    v2.y = fmaf(acc(i + 1), psi_w, v2.y);
-                    *slot = v2;
-                }
-                psi_w = 0.0f;
-            }
+            if (psi_w != 0.0f) { psi_prom = psi_w; psi_w = 0.0f; }
         }
     }
+    if (psi_prom != 0.0f) { promote_h(acc0, 0, psi_prom); promote_h(acc1, kBDH, psi_prom); }
 
     // Epilogue: smem_dq already holds TRUE unnormalized dQ (psi folded per
     // window); apply final_scale = sm/256 ONLY.  A row whose every tile was
@@ -428,31 +431,34 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
         + int64_t(b_idx) * params.dq_batch_stride + int64_t(h_idx) * params.dq_head_stride
         + int64_t(mb) * kBM * params.dq_row_stride;
     // ## P2B-EPI: the bf16 dQ tile is staged through this warpgroup's own smem_dq region and written with coalesced
-    // 16-B stores (one full 512-B row per warp instruction) instead of 64 scattered 4-B stores per thread (8 rows x
-    // 16 B per warp instruction).  Same fp32 * fin, same bf16 rounding, same values.
-    // wgmma C fragment: even/odd i are column-adjacent -> packed u32.
-    uint32_t pk[size(acc) / 2];
+    // 16-B stores (one full 512-B row per warp instruction).  Same fp32 * fin, same bf16 rounding, same values.
+    uint32_t pk[kNH * kAH / 2];
     #pragma unroll
-    for (int i = 0; i < size(acc); i += 2) {
-        int const m = get<0>(tCcC(i));
-        int const d = get<1>(tCcC(i));
-        float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
-        cutlass::bfloat16_t lo(v2.x * fin), hi(v2.y * fin);
-        pk[i / 2] = (uint32_t(reinterpret_cast<uint16_t const&>(hi)) << 16)
-                  | uint32_t(reinterpret_cast<uint16_t const&>(lo));
+    for (int h = 0; h < kNH; ++h) {
+        #pragma unroll
+        for (int i = 0; i < kAH; i += 2) {
+            int const m = get<0>(tCcC(i));
+            int const d = get<1>(tCcC(i)) + h * kBDH;
+            float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
+            cutlass::bfloat16_t lo(v2.x * fin), hi(v2.y * fin);
+            pk[h * (kAH / 2) + i / 2] = (uint32_t(reinterpret_cast<uint16_t const&>(hi)) << 16)
+                                      | uint32_t(reinterpret_cast<uint16_t const&>(lo));
+        }
     }
-    // Staging tile: 64 rows x kStPitchW u32 (kStPitchW == 4 mod 32: the fragment's 8 rows x 4 lanes per store hit
-    // 32 distinct banks; 528-B rows keep the 16-B read alignment).  It aliases this warpgroup's smem_dq slots, so
-    // every thread's fp32 reads above must retire first.
+    // Staging tile: 64 rows x kStPitchW u32 (kStPitchW == 4 mod 32: conflict-free fragment stores; 528-B rows keep
+    // the 16-B read alignment).  It aliases this warpgroup's smem_dq slots: every fp32 read above retires first.
     constexpr int kStPitchW = kBD / 2 + 4;
     static_assert(kBM * kStPitchW <= kBM * kDqPitch, "pass 2: bf16 staging tile must fit the smem_dq region");
     uint32_t* const st = reinterpret_cast<uint32_t*>(smem_dq);
     cutlass::arch::NamedBarrier::sync(128, 1 + wg);
     #pragma unroll
-    for (int i = 0; i < size(acc); i += 2) {
-        int const m = get<0>(tCcC(i));
-        int const d = get<1>(tCcC(i));
-        st[m * kStPitchW + d / 2] = pk[i / 2];
+    for (int h = 0; h < kNH; ++h) {
+        #pragma unroll
+        for (int i = 0; i < kAH; i += 2) {
+            int const m = get<0>(tCcC(i));
+            int const d = get<1>(tCcC(i)) + h * kBDH;
+            st[m * kStPitchW + d / 2] = pk[h * (kAH / 2) + i / 2];
+        }
     }
     cutlass::arch::NamedBarrier::sync(128, 1 + wg);
     #pragma unroll
