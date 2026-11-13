@@ -1966,6 +1966,10 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             if constexpr (!(kAbl & 2)) {
             int const fq8_warp = thread_idx / cutlass::NumThreadsPerWarp;   // 0..7 over MMA threads
             if ((thread_idx % cutlass::NumThreadsPerWarp) == 0) { fq8_psired[fq8_warp] = fq8_amax; }
+            // MERGED PdS barrier: the previous tile's dS' tile store is drained before the psi barrier, and every
+            // thread reaches the psi barrier only after its previous tile's dV / dK gemms retired (the loop tail's
+            // wait<0>), so the psi barrier also frees sPt / sdSt / sdS for this tile's exchange stores.
+            if constexpr (kStages_dS == 1 && !(kAbl & 4)) { if (thread_idx == 0) { cute::tma_store_wait<0>(); } }
             cutlass::arch::fence_view_async_shared();
             // ## FQ8-V8: psi gets its OWN barrier id (dQEmptyWG3, unused at 2 WGs);
             // v1 borrowed dQEmptyWG1 which the TMA-dQ protocol now owns.
@@ -2020,10 +2024,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             Tensor rP = make_tensor_like<Element>(tSrS);
             flash::convert_type_out(tSrS, rP);
             Tensor rP_rc = make_tensor(rP.data(), scores.layout());
-            if constexpr (kStages_dS == 1 && !(kAbl & 4)) {
-                // ## V10: the async dS8 tile-store must retire before this
-                // iteration's stores overwrite sdS (barrier orders everyone
-                // behind the issuing thread's wait).
+            if constexpr (kStages_dS == 1 && !(kAbl & 4) && (kAbl & 2)) {   // ABL 2 drops the psi barrier: keep the separate one
                 if (thread_idx == 0) { cute::tma_store_wait<0>(); }
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(BwdNamedBarriers::PdS) /*id*/);
             }
