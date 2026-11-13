@@ -2064,9 +2064,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             float const fq8_psi_inv = fq8_tile_zero ? 0.0f : 1.0f / fq8_psi;
             // ## V10 (split bwd): publish this tile's psi for pass 2 (0.0f = the
             // FP11-F2 zero-tile sentinel).
-            if (thread_idx == 0) {
-                fq8_psi_row[int64_t(m_block) * params.nbn] = fq8_tile_zero ? 0.0f : fq8_psi;   // PSIROW: hoisted base
-            }
+            // (PSISTG: thread 0 stores psi with the dS' tile store after the PdS barrier, not between the exchange stores)
 
             // ## FQ8: P-hat codes = e4m3(2^8 * P) (scores already carry 2^8; the
             // e4m3 satfinite converter matches the reference rounding).  P-hat is
@@ -2135,6 +2133,9 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                         cute::copy(params.tma_store_dS8, tdS8s, tdS8g);
                         cute::tma_store_arrive();
                     }
+                    // PSISTG: this tile's psi for pass 2 (0.0f = the FP11-F2 zero-tile sentinel), same value, stored next to the
+                    // dS' tile store instead of between the exchange stores before the PdS barrier.
+                    if (thread_idx == 0) { fq8_psi_row[int64_t(m_block) * params.nbn] = fq8_tile_zero ? 0.0f : fq8_psi; }
                     // ## FP11-M4: in-window dV rescale = the v10 sequence
                     // VERBATIM (the window fragment was re-zeroed at the last
                     // boundary, so a window's first tile rescales exact
