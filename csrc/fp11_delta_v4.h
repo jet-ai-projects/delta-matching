@@ -575,14 +575,14 @@ void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t str
     };
     // ## FP11-M17 P0MS: the unit table (bh, group, m_lo, m_hi), full chunks first then remainders by
     // length descending; built once per shape and cached on the device (one entry per distinct
-    // (b, h, seqlen_q, seqlen_k, causal, device)).
+    // (b, h, seqlen_q, seqlen_k, causal, device, num_sm)); the tables are a few KB per shape.
     int const* unit_tab = nullptr;
     int nunits = 0;
     if constexpr (FA3FP11_M17_P0MS > 0) {
-        static std::map<std::tuple<int, int, int, int, bool, int>, std::pair<int*, int>> cache;   // device buffer (kept for the process lifetime), nunits
+        static std::map<std::tuple<int, int, int, int, bool, int, int>, std::pair<int*, int>> cache;   // device buffer (kept for the process lifetime), nunits
         static std::mutex mu;
         int dev = -1; cudaGetDevice(&dev);
-        auto key = std::make_tuple(params.b, params.h, seqlen_q, seqlen_k, Is_causal, dev);
+        auto key = std::make_tuple(params.b, params.h, seqlen_q, seqlen_k, Is_causal, dev, params.num_sm);   // the tail cut depends on num_sm
         std::lock_guard<std::mutex> lk(mu);
         auto it = cache.find(key);
         if (it == cache.end()) {
