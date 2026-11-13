@@ -1696,6 +1696,8 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
         float const fq8_v8s_wg = params.ptr_v8s[fq8_bh_kv * params.nblk_k + 2 * n_block + warp_group_idx];
         float const* fq8_q8s_base = params.ptr_q8s + fq8_bh * params.nblk_q;
         float const* fq8_do8s_base = params.ptr_do8s + fq8_bh * params.nblk_q;
+        // PSIROW: this CTA's psi column (bh, :, n_block); tile m_block's entry is m_block * nbn further.
+        float* const fq8_psi_row = params.ptr_psi + int64_t(fq8_bh) * params.nbm * params.nbn + n_block;
         // ## FQ8-V9: software-pipeline the per-m-block scale loads (global
         // scalar fetches were a top long-scoreboard source).
         // ## Delta-Matching-128: the Q/dO scale block index of an m-block (m-block at d256; m-block / 2 at hd128).
@@ -2013,9 +2015,20 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             Tensor tdVrPt = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(wg_mma_dKV, sPt_cur);
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1, /*SwapAB=*/dKV_swapAB>(tiled_mma_dKV, tdVrPt(_, _, _, _0{}), tdVrdO(_, _, _, smem_pipe_read_dot.index()), tdVrdV);
             }
-            #pragma unroll
-            for (int w = 0; w < NumMmaThreads / cutlass::NumThreadsPerWarp; ++w) {
-                fq8_amax = fmaxf(fq8_amax, fq8_psired[w]);
+            // PSITREE: the joint max as a balanced tree over the 8 slots (the own warp's value is one of them).  The
+            // operands are non-negative, non-NaN floats (fmaxf from +0 over |dS| drops NaN), so any max order returns
+            // the same bits: depth 3 instead of a 9-long serial chain before psi.
+            {
+                constexpr int kFq8W = NumMmaThreads / cutlass::NumThreadsPerWarp;
+                float fq8_r[kFq8W];
+                #pragma unroll
+                for (int w = 0; w < kFq8W; ++w) { fq8_r[w] = fq8_psired[w]; }
+                #pragma unroll
+                for (int st = 1; st < kFq8W; st *= 2) {
+                    #pragma unroll
+                    for (int w = 0; w + st < kFq8W; w += 2 * st) { fq8_r[w] = fmaxf(fq8_r[w], fq8_r[w + st]); }
+                }
+                fq8_amax = fq8_r[0];
             }
             }   // kAbl & 2
             // ## FP11-F2 (psi-floor repair): a tile whose |dS| amax sits below the
@@ -2052,8 +2065,7 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             // ## V10 (split bwd): publish this tile's psi for pass 2 (0.0f = the
             // FP11-F2 zero-tile sentinel).
             if (thread_idx == 0) {
-                params.ptr_psi[(int64_t(fq8_bh) * params.nbm + m_block) * params.nbn + n_block]
-                    = fq8_tile_zero ? 0.0f : fq8_psi;
+                fq8_psi_row[int64_t(m_block) * params.nbn] = fq8_tile_zero ? 0.0f : fq8_psi;   // PSIROW: hoisted base
             }
 
             // ## FQ8: P-hat codes = e4m3(2^8 * P) (scores already carry 2^8; the
