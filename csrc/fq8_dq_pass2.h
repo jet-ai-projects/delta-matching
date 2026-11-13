@@ -456,25 +456,28 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
         // Batches of kSlots float2 slots: all loads of a batch issue before its stores (one round trip per batch
         // instead of a load / store chain per slot); same values, same per-slot arithmetic.
         constexpr int kSlots = 16;
-        static_assert(size(decltype(acc){}) % (2 * kSlots) == 0, "pass 2: dQ slot batches must tile the fragment");
+        static_assert(kAH % (2 * kSlots) == 0, "pass 2: dQ slot batches must tile the half fragment");
         #pragma unroll
-        for (int i0 = 0; i0 < size(acc); i0 += 2 * kSlots) {
-            float2 base[kSlots];
+        for (int h = 0; h < kNH; ++h) {   // P2B-OVL column halves (d offset h * kBDH), as the bf16 epilogue below
             #pragma unroll
-            for (int j = 0; j < kSlots; ++j) {
-                int const m = get<0>(tCcC(i0 + 2 * j));
-                int const d = get<1>(tCcC(i0 + 2 * j));
-                base[j] = acc_mode ? *reinterpret_cast<float2 const*>(dqa + int64_t(m) * params.dqa_row_stride + d)
-                                   : make_float2(0.0f, 0.0f);
-            }
-            #pragma unroll
-            for (int j = 0; j < kSlots; ++j) {
-                int const m = get<0>(tCcC(i0 + 2 * j));
-                int const d = get<1>(tCcC(i0 + 2 * j));
-                float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
-                cutlass::bfloat16_t lo(v2.x * fin), hi(v2.y * fin);
-                *reinterpret_cast<float2*>(dqa + int64_t(m) * params.dqa_row_stride + d) =
-                    make_float2(add_rn_noftz(base[j].x, float(lo)), add_rn_noftz(base[j].y, float(hi)));
+            for (int i0 = 0; i0 < kAH; i0 += 2 * kSlots) {
+                float2 base[kSlots];
+                #pragma unroll
+                for (int j = 0; j < kSlots; ++j) {
+                    int const m = get<0>(tCcC(i0 + 2 * j));
+                    int const d = get<1>(tCcC(i0 + 2 * j)) + h * kBDH;
+                    base[j] = acc_mode ? *reinterpret_cast<float2 const*>(dqa + int64_t(m) * params.dqa_row_stride + d)
+                                       : make_float2(0.0f, 0.0f);
+                }
+                #pragma unroll
+                for (int j = 0; j < kSlots; ++j) {
+                    int const m = get<0>(tCcC(i0 + 2 * j));
+                    int const d = get<1>(tCcC(i0 + 2 * j)) + h * kBDH;
+                    float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
+                    cutlass::bfloat16_t lo(v2.x * fin), hi(v2.y * fin);
+                    *reinterpret_cast<float2*>(dqa + int64_t(m) * params.dqa_row_stride + d) =
+                        make_float2(add_rn_noftz(base[j].x, float(lo)), add_rn_noftz(base[j].y, float(hi)));
+                }
             }
         }
         return;
