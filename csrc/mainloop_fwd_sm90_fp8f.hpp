@@ -52,7 +52,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool VTwin_ = false>
 struct CollectiveMainloopFwdSm90Fp8F {
     // ## FQ8F (delta_matching): the FAITHFUL forward.  Fork of fa3fp8's
     // CollectiveMainloopFwdSm90Fp8 that replaces FA3's constant-basis
@@ -153,6 +153,14 @@ struct CollectiveMainloopFwdSm90Fp8F {
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
+    // ## VT (V twin): V arrives from global memory already transposed and permuted (the VT twin [b, h_k, d, s_k]: keys
+    // and head-dim columns in exactly the order the in-smem LDSM.T / byte_perm / STSM transpose wrote them), so the
+    // producer TMA-loads it straight into the wgmma B buffer: no smem_vt buffer, no transpose, one producer warp.  The
+    // consumers are unchanged (Transpose_V keeps selecting the row-major-V fp8 register conventions permute_Cregs_fp8 /
+    // permute_output_fp8), so the B-operand bytes in smem -- and O / LSE -- are bitwise those of the transpose path.
+    static constexpr bool VTwin = VTwin_;
+    static_assert(!VTwin || Transpose_V, "delta_matching fwd: the V twin replaces the fp8 row-major-V smem transpose");
+    static constexpr bool TransposeVSmem = Transpose_V && !VTwin;
     static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
     static_assert(Use_TMA_KV || CUTE_STATIC_V(size(ClusterShape{})) == 1, "If not using TMA for KV, ClusterShape must be 1");
@@ -251,7 +259,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
 
     static constexpr int NumMmaThreadsQK = size(TiledMmaQK{});
     static constexpr int NumMmaThreads = size(TiledMmaPV{});
-    static constexpr int NumProducerThreads = !Transpose_V && Use_TMA_KV && Use_TMA_Q ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
+    static constexpr int NumProducerThreads = !TransposeVSmem && Use_TMA_KV && Use_TMA_Q ? cutlass::NumThreadsPerWarp : cutlass::NumThreadsPerWarpGroup;
     static_assert(NumMmaThreadsQK % cutlass::NumThreadsPerWarpGroup == 0);
     static_assert(NumMmaThreads % cutlass::NumThreadsPerWarpGroup == 0);
     static constexpr int NumMmaWarpGroups = NumMmaThreads / cutlass::NumThreadsPerWarpGroup;
@@ -392,12 +400,21 @@ struct CollectiveMainloopFwdSm90Fp8F {
         TileShape_MNK{},
         ClusterShape{})); // mcast along M mode for this N load, if any
 
-    using TMA_V = decltype(make_tma_copy(
+    using TMA_V_Rowmajor = decltype(make_tma_copy(
         GmemTiledCopyKV{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, select<1, 0, 2, 3>(StrideV{})),
         take<0, 2>(SmemLayoutVt{}),
         select<1, 2>(TileShape_MNK_PV{}),
         size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
+    // ## VT: the twin is (d, s_k, h_k, b) with s_k contiguous (stride_V read as (d, 1, head, batch)), loaded K-major
+    // into the wgmma layout SmemLayoutVtMma.
+    using TMA_V_Twin = decltype(make_tma_copy(
+        GmemTiledCopyKV{},
+        make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
+        take<0, 2>(SmemLayoutVtMma{}),
+        select<1, 2>(TileShape_MNK_PV{}),
+        size<0>(ClusterShape{})));
+    using TMA_V = std::conditional_t<VTwin, TMA_V_Twin, TMA_V_Rowmajor>;
 
     using TMA_Qv_ = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
@@ -418,7 +435,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
 
     using PipelineTmaAsync = std::conditional_t<CUTE_STATIC_V(size(ClusterShape{})) == 1, typename cutlass::PipelineTmaAsyncNoCluster<kStages>, typename cutlass::PipelineTmaAsync<kStages>>;
     using MainloopPipelineK = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
-    using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    using MainloopPipelineV = std::conditional_t<!TransposeVSmem && Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     // We always use TMA for K_new and V_new
     using MainloopPipelineKVNew = PipelineTmaAsync;
@@ -484,7 +501,18 @@ struct CollectiveMainloopFwdSm90Fp8F {
         cute::array_aligned<float, 8 * kStages, 128> smem_kvsc;   // per K stage, 4 k-scales + 4 v-scales
     };
 
-    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose, TensorStorageTransposeV>;
+    // ## VT: the twin path keeps only the wgmma V buffer (its kStages = 3 fit where 2 x (K, V, Vt) did).
+    struct TensorStorageVTwin : cute::aligned_struct<cute::max(SmemAlignmentQ, SmemAlignmentK, SmemAlignmentV), _0> {
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutVtMma>, SmemAlignmentV> smem_v;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutQ>, SmemAlignmentQ> smem_q;
+        cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentK> smem_k;
+        SmemQv_t smem_qv;
+        SmemScale_t smem_scale;
+        cute::array_aligned<float, 8 * kStages, 128> smem_kvsc;   // per K stage, 4 k-scales + 4 v-scales
+    };
+
+    using TensorStorage = std::conditional_t<!Transpose_V, TensorStorageNoTranspose,
+                                             std::conditional_t<VTwin, TensorStorageVTwin, TensorStorageTransposeV>>;
 
     // These are tuned for speed. They don't affect correctness.
     static constexpr bool UseSchedulerBarrier = (IntraWGOverlap
@@ -666,13 +694,15 @@ struct CollectiveMainloopFwdSm90Fp8F {
             take<0, 2>(SmemLayoutK{}),
             TileShape_MNK{},
             ClusterShape{}); // mcast along M mode for this N load, if any
-        Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V),
-                                make_shape(args.headdim_v, get<0>(args.shape_K), get<2>(args.shape_K), get<3>(args.shape_K)),
-                                select<1, 0, 2, 3>(args.stride_V));
+        Tensor mV = [&] {
+            auto shape_v = make_shape(args.headdim_v, get<0>(args.shape_K), get<2>(args.shape_K), get<3>(args.shape_K));
+            if constexpr (VTwin) { return make_tensor(make_gmem_ptr(args.ptr_V), shape_v, args.stride_V); }   // ## VT
+            else { return make_tensor(make_gmem_ptr(args.ptr_V), shape_v, select<1, 0, 2, 3>(args.stride_V)); }
+        }();
         TMA_V tma_load_V = make_tma_copy(
             GmemTiledCopyKV{},
             mV,
-            take<0, 2>(SmemLayoutVt{}),
+            take<0, 2>(std::conditional_t<VTwin, SmemLayoutVtMma, SmemLayoutVt>{}),
             select<1, 2>(TileShape_MNK_PV{}),
             size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
         Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
@@ -685,12 +715,19 @@ struct CollectiveMainloopFwdSm90Fp8F {
         Tensor mVnew = make_tensor(make_gmem_ptr(args.ptr_V_new),
                                    make_shape(args.headdim_v, get<0>(args.shape_K_new), get<2>(args.shape_K_new), get<3>(args.shape_K_new)),
                                    select<1, 0, 2, 3>(args.stride_V_new));
-        TMA_V tma_load_V_new = make_tma_copy(
-            GmemTiledCopyKV{},
-            cute::conditional_return<AppendKV>(mVnew, mV),
-            take<0, 2>(SmemLayoutVt{}),
-            select<1, 2>(TileShape_MNK_PV{}),
-            size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+        TMA_V tma_load_V_new = [&] {
+            if constexpr (VTwin) {
+                static_assert(!AppendKV, "delta_matching fwd: AppendKV is not wired for the V twin");
+                return tma_load_V;
+            } else {
+                return make_tma_copy(
+                    GmemTiledCopyKV{},
+                    cute::conditional_return<AppendKV>(mVnew, mV),
+                    take<0, 2>(SmemLayoutVt{}),
+                    select<1, 2>(TileShape_MNK_PV{}),
+                    size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
+            }
+        }();
         auto shape_Qv = make_shape(get<0>(args.shape_Q), args.headdim_v, get<2>(args.shape_Q), get<3>(args.shape_Q));
         Tensor mQv = make_tensor(make_gmem_ptr(args.ptr_Qv), shape_Qv, args.stride_Qv);
         TMA_Qv tma_load_Qv = [&] {
@@ -820,6 +857,8 @@ struct CollectiveMainloopFwdSm90Fp8F {
         Tensor sVt = [&] {
             if constexpr (!Transpose_V) {
                 return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVt{});
+            } else if constexpr (VTwin) {   // ## VT: the TMA destination is the wgmma V buffer itself
+                return make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{});
             } else {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVt{}));
             }
@@ -828,7 +867,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
         Tensor sV = cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVtMma{}));
         // Only used if we're using cp.async to load V
         Tensor sVcpasync = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (!TransposeVSmem) {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_v.data()), SmemLayoutVCpAsync{}));
             } else {
                 return cute::as_position_independent_swizzle_tensor(make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_vt.data()), SmemLayoutVCpAsync{}));
@@ -885,7 +924,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
         // This is used to index into the batch dimension of mK and mV
         int const bidb_kv_idx = !is_varlen_k && !params.ptr_pagetable ? bidb_kv : 0;
 
-        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, Transpose_V || !IntraWGOverlap /*KV_Same_Iter*/>;
+        using PagedKVManager_t = PagedKVManager<get<1>(TileShape_MNK{}), get<2>(TileShape_MNK{}), get<1>(TileShape_MNK_PV{}), NumProducerThreads, Element, TransposeVSmem || !IntraWGOverlap /*KV_Same_Iter*/>;
         PagedKVManager_t paged_kv_manager(
             params.ptr_pagetable, params.shape_pagetable, params.stride_pagetable,
             params.ptr_K, params.shape_K, params.stride_K,
@@ -914,7 +953,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
         Tensor tTranssVt = logical_divide(group_modes<1, rank(tTranssVt_) - 1>(tTranssVt_), Shape<Underscore, Int<Transpose_ILP>>{});  // ((16, 1), (2, kHeadDim / 64 * kBlockN / 32 / 2), kStages)
         Tensor tTranssV = logical_divide(group_modes<1, rank(tTranssV_) - 1>(tTranssV_), Shape<Underscore, Int<Transpose_ILP>>{});  // ((16, 1), (2, kHeadDim / 64 * kBlockN / 32 / 2), kStages)
         auto transpose_V = [&](int stage) {
-            if constexpr (Transpose_V) {
+            if constexpr (TransposeVSmem) {
                 #pragma unroll
                 for (int i = 0; i < size<1, 1>(tTranssVt); ++i) {
                     Tensor tTransrV = make_fragment_like(tTranssV(_, make_coord(_, _0{}), _0{}));
@@ -961,7 +1000,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
         };
 
         auto load_V = [&] (int const n_block, auto const& smem_pipe_write, auto need_seqlenk_masking_type) {
-            auto pipeline_v_load = cute::conditional_return<!Transpose_V>(pipeline_v, pipeline_vt);
+            auto pipeline_v_load = cute::conditional_return<!TransposeVSmem>(pipeline_v, pipeline_vt);
             pipeline_v_load.producer_acquire(smem_pipe_write);
             if constexpr (!PagedKVNonTMA) {
                 auto [n_block_idx, bidb_kv_idx] = paged_kv_manager.get_indices_for_V_TMA();
@@ -1004,7 +1043,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
             } else {
                 paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
             }
-            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            if constexpr (TransposeVSmem) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
             // if (thread_idx == 0) { printf("Producer: main load, before load_K, index = %d\n", smem_pipe_write.index());}
             load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
             // if (thread_idx == 0) { printf("Producer: main load, after load K, index = %d\n", smem_pipe_write.index());}
@@ -1053,12 +1092,12 @@ struct CollectiveMainloopFwdSm90Fp8F {
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
         // if (thread_idx == 0) { printf("Producer: main load, after barrier_O\n");}
 
-        if constexpr (!Transpose_V && !IntraWGOverlap) {
+        if constexpr (!TransposeVSmem && !IntraWGOverlap) {
             if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         int n_block_prev = n_block;
         --n_block;
-        #pragma unroll (!Transpose_V && Use_TMA_KV ? 2 : 1)
+        #pragma unroll (!TransposeVSmem && Use_TMA_KV ? 2 : 1)
         for (; n_block >= n_block_min; --n_block) {
             PipelineState smem_pipe_write_v = smem_pipe_write; // copy the state, write_v is always 1 step behind
             ++smem_pipe_write;
@@ -1068,9 +1107,9 @@ struct CollectiveMainloopFwdSm90Fp8F {
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);
                 }
-                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                if constexpr (TransposeVSmem) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
                 load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
-                if constexpr (!Transpose_V) {
+                if constexpr (!TransposeVSmem) {
                     if constexpr (IntraWGOverlap) {
                         load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
                     } else {
@@ -1079,13 +1118,13 @@ struct CollectiveMainloopFwdSm90Fp8F {
                 }
             }
             n_block_prev = n_block;
-            if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write_v); }
+            if constexpr (TransposeVSmem) { copy_Vt_to_V(smem_pipe_write_v); }
         }
         scheduler_prefetch();
-        if constexpr (!Transpose_V && IntraWGOverlap) {
+        if constexpr (!TransposeVSmem && IntraWGOverlap) {
             if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
-        if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
+        if constexpr (TransposeVSmem) { copy_Vt_to_V(smem_pipe_write); }
         ++smem_pipe_write;
         // At the end, all threads have the correct smem_pipe_write.
         ++work_idx;
@@ -1108,7 +1147,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
             */
             pipeline_k.producer_tail(smem_pipe_write);
             pipeline_v.producer_tail(smem_pipe_write);
-            if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
+            if constexpr (TransposeVSmem) { pipeline_vt.producer_tail(smem_pipe_write); }
         }
     }
 
