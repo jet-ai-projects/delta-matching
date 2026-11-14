@@ -98,6 +98,17 @@ def test_attnqat_shares_the_forward_and_differs_from_stale_only_through_delta():
     dO8, dO8s, dlt, dOt = doq_m17(dO, Op, H, BM, want_delta=True, want_twin=True)
     ref = (dO.float() * Op.float()).sum(-1).permute(0, 2, 1).reshape(B * H, N)
     assert _rel(dlt, ref) < 1e-5
+    Q8_, Q8s_, K8_, K8s_, V8_, V8s_, kTt, Qt = quant_qkv_m17(q, k, v, want_qt=True, blocks=(BM, BN))
+
+    def bshd(x, h):
+        return x.view(B, h, N, D).permute(0, 2, 1, 3)
+    dq, dk, dv = ops.bwd_fp8_t(bshd(dO8, H), bshd(Q8_, H), bshd(K8_, Hk), bshd(V8_, Hk), lse, dlt.view(B, H, N),
+                               kTt.view(B, Hk, D, N), Qt.view(B, H, D, N), dOt.view(B, H, D, N), Q8s_.view(B, H, -1),
+                               K8s_.view(B, Hk, -1), V8s_.view(B, Hk, -1), dO8s.view(B, H, -1), D ** -0.5, True)
+    rep = H // Hk
+    dk = dk.permute(0, 2, 1, 3).reshape(B, Hk, rep, N, D).sum(2)
+    assert torch.equal(dq.permute(0, 2, 1, 3), res["attnqat"][1]), "attnqat dq != the stale backward with delta(O')"
+    assert torch.equal(dk, res["attnqat"][2]), "attnqat dk != the stale backward with delta(O')"
 
 
 def test_attnqat_delta_closer_to_the_matched_delta_than_stale():
