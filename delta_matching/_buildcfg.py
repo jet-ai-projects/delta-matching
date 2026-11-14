@@ -118,11 +118,11 @@ def _prefix_maps():
 
 def cxx_flags():
     """The host compiler flags (the api .cpp under setup.py, extra_cflags under the JIT build)."""
-    return ["-O3", "-std=c++17"] + _prefix_maps()
+    return ["-O3", "-std=c++20"] + _prefix_maps()
 
 
 def cuda_flags():
-    f = ["-O3", "-std=c++17", "--use_fast_math", "-DNDEBUG", "--expt-relaxed-constexpr",
+    f = ["-O3", "-std=c++20", "--use_fast_math", "-DNDEBUG", "--expt-relaxed-constexpr",
          "--expt-extended-lambda", "-DCUTE_SM90_EXTENDED_MMA_SHAPES_ENABLED", "-DCUTLASS_ENABLE_GDC_FOR_SM90",
          "-DCUTLASS_DEBUG_TRACE_LEVEL=0", "--threads", "4", "-gencode", "arch=compute_90a,code=sm_90a"]
     if LINEINFO:

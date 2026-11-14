@@ -39,6 +39,16 @@ struct Flash_bwd_fp8_params : public Flash_bwd_params {
     void const* doraw_ptr;
     int64_t vraw_row_stride, vraw_head_stride, vraw_batch_stride;
     int64_t doraw_row_stride, doraw_head_stride, doraw_batch_stride;
+    // ## CP ring (dm_cp): explicit twin strides (d-row, head, batch; s is unit-stride) so that a batch of ring blocks can
+    // share one Q / dO (batch stride 0) and read K^T straight from the gathered buffers.  Zero-init = the contiguous
+    // defaults (bwd_fp8_core fills them).  dq_acc_ptr != nullptr: pass 2 loops over the batch inside each CTA and
+    // accumulates (dq_acc_mode 1) or stores (2) fp32 dQ into one (s_q, h, d) tensor (no bf16 dq is written).
+    int64_t qt_d_stride, qt_head_stride, qt_batch_stride;
+    int64_t kt_d_stride, kt_head_stride, kt_batch_stride;
+    int64_t dot_d_stride, dot_head_stride, dot_batch_stride;
+    float* dq_acc_ptr;
+    int64_t dqa_row_stride, dqa_head_stride;
+    int dq_acc_mode;
 };
 
 // ## FQ8: fwd params extension (per-block scales).

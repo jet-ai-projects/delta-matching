@@ -28,6 +28,7 @@
 #include <array>
 #include <map>
 #include <mutex>
+#include <queue>
 #include <tuple>
 #include <vector>
 
@@ -123,6 +124,8 @@ struct DeltaV4 {
     using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
                                      Int<kBlockN>, Int<kHeadDim / 2>>());
     using SmemLayoutK1 = decltype(tile_to_shape(SmemLayoutAtomK{}, select<1, 2>(TileShape_MNK{})));   // one n-block
+    using SmemLayoutKTma = SmemLayoutK1;
+    using TileShapeKTma = TileShape_MNK;
     using SmemLayoutK = decltype(tile_to_shape(SmemLayoutAtomK{},
                  make_shape(Int<kBlockN>{}, Int<kHeadDim>{}, Int<kNbPerCTA>{})));                      // kNbPerCTA n-blocks
     using SmemLayoutV = SmemLayoutK;
@@ -523,10 +526,19 @@ struct DeltaV4 {
 
 }  // namespace flash
 
+#include "fp11_delta_v4n.h"   // KDA-P0: d256 pass 0 with one n128 wgmma chain per warpgroup
+
+#ifndef FA3FP11_D256_P0TAIL
+#define FA3FP11_D256_P0TAIL 1
+#endif
+#ifndef FA3FP11_D256_P0LPT
+#define FA3FP11_D256_P0LPT 1
+#endif
 // Host launch: pass 0 v3 + the unchanged pass 0.5 reduce (fp11_delta.h's kernel).
 template <bool Is_causal, int kHeadDim_>
 void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t stream) {
-    using Kernel = flash::DeltaV4<Is_causal, FA3FP11_M16_P0V2_ATOMN, (kHeadDim_ < 256 ? FA3FP11_HD128_P0NBWG : FA3FP11_M16_P0V3_NBWG), kHeadDim_>;
+    using KernelV4 = flash::DeltaV4<Is_causal, FA3FP11_M16_P0V2_ATOMN, (kHeadDim_ < 256 ? FA3FP11_HD128_P0NBWG : FA3FP11_M16_P0V3_NBWG), kHeadDim_>;
+    using Kernel = std::conditional_t<(kHeadDim_ >= 256 && FA3FP11_D256_P0N128), flash::DeltaV4N<Is_causal>, KernelV4>;
     using Element = typename Kernel::Element;
     using namespace cute;
     int const seqlen_q = params.seqlen_q;
@@ -550,9 +562,9 @@ void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t str
     typename Kernel::TMA_QdO tma_load_dO = make_tma_copy_A_sm90(
         cute::SM90_TMA_LOAD{}, mdO, take<0, 2>(typename Kernel::SmemLayoutdO{}), typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
     typename Kernel::TMA_K tma_load_K = make_tma_copy_B_sm90(
-        cute::SM90_TMA_LOAD{}, mK, typename Kernel::SmemLayoutK1{}, typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
+        cute::SM90_TMA_LOAD{}, mK, typename Kernel::SmemLayoutKTma{}, typename Kernel::TileShapeKTma{}, typename Kernel::ClusterShape{});
     typename Kernel::TMA_K tma_load_V = make_tma_copy_B_sm90(
-        cute::SM90_TMA_LOAD{}, mV, typename Kernel::SmemLayoutK1{}, typename Kernel::TileShape_MNK{}, typename Kernel::ClusterShape{});
+        cute::SM90_TMA_LOAD{}, mV, typename Kernel::SmemLayoutKTma{}, typename Kernel::TileShapeKTma{}, typename Kernel::ClusterShape{});
 
     typename flash::TileSchedulerArguments scheduler_args {
         ngroups, params.h, params.b, 1 /*num_splits*/,
@@ -563,14 +575,14 @@ void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t str
     };
     // ## FP11-M17 P0MS: the unit table (bh, group, m_lo, m_hi), full chunks first then remainders by
     // length descending; built once per shape and cached on the device (one entry per distinct
-    // (b, h, seqlen_q, seqlen_k, causal, device)).
+    // (b, h, seqlen_q, seqlen_k, causal, device, num_sm)); the tables are a few KB per shape.
     int const* unit_tab = nullptr;
     int nunits = 0;
     if constexpr (FA3FP11_M17_P0MS > 0) {
-        static std::map<std::tuple<int, int, int, int, bool, int>, std::pair<int*, int>> cache;   // device buffer (kept for the process lifetime), nunits
+        static std::map<std::tuple<int, int, int, int, bool, int, int>, std::pair<int*, int>> cache;   // device buffer (kept for the process lifetime), nunits
         static std::mutex mu;
         int dev = -1; cudaGetDevice(&dev);
-        auto key = std::make_tuple(params.b, params.h, seqlen_q, seqlen_k, Is_causal, dev);
+        auto key = std::make_tuple(params.b, params.h, seqlen_q, seqlen_k, Is_causal, dev, params.num_sm);   // the tail cut depends on num_sm
         std::lock_guard<std::mutex> lk(mu);
         auto it = cache.find(key);
         if (it == cache.end()) {
@@ -580,23 +592,81 @@ void run_flash_delta_v4_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t str
                     int const nb0 = Kernel::kNbPerCTA * g;
                     int m_min = 0;
                     if (Is_causal) { m_min = std::max(0, (nb0 * Kernel::kBlockN + seqlen_q - seqlen_k) / Kernel::kBlockM); }
-                    for (int lo = m_min; lo < nbm; lo += FA3FP11_M17_P0MS) {
-                        int const hi = std::min(nbm, lo + FA3FP11_M17_P0MS);
+                    // KDA-P0B LPT (D128-v6 P0LPT at d256): one unit per (bh, group) = no m-split; the length-descending
+                    // stable sort below then dispatches every head's longest group first (a global longest-first order).
+                    int const ms = (kHeadDim_ >= 256 && FA3FP11_D256_P0LPT) ? (1 << 20) : FA3FP11_M17_P0MS;
+                    for (int lo = m_min; lo < nbm; lo += ms) {
+                        int const hi = std::min(nbm, lo + ms);
                         std::array<int, 4> e{bh, g, lo, hi};
-                        if (hi - lo == FA3FP11_M17_P0MS) { full.push_back(e); } else { part.push_back(e); }
+                        if (hi - lo == ms) { full.push_back(e); } else { part.push_back(e); }
                     }
                 }
             }
             std::stable_sort(part.begin(), part.end(), [](auto const& a, auto const& b) { return (a[3] - a[2]) > (b[3] - b[2]); });
+            std::vector<std::array<int, 4>> units = full;
+            units.insert(units.end(), part.begin(), part.end());
+            if (kHeadDim_ >= 256 && FA3FP11_D256_P0LPT && FA3FP11_D256_P0TAIL) {
+                // KDA-P0B TAIL (persistent-kernel / tail-effect style balance on the unit table, bitwise): the units are
+                // dispatched in table order to whichever SM frees first.  Equal-length non-causal units leave a partial
+                // last wave (e.g. 512 units of 256 m-blocks on 132 SMs = 3.88 waves).  Keep the first K units whole and cut
+                // the rest stream-K style: their m ranges, concatenated, are cut into num_sm segments of equal work, each
+                // piece = the part of one unit inside one segment; pieces are dispatched longest first.  K (from
+                // (waves - w) * num_sm, w = 0..5, or no cut at all) minimizes a list-scheduling model of the dispatch
+                // (piece cost = its m-blocks + 2 for the K/V load and pipeline fill; fitted to the measured chunk-32 vs
+                // one-unit pass 0 times).  Every (m-block, n-block) tile is still computed exactly once into its slot.
+                int const S = std::max(1, params.num_sm);
+                auto simulate = [&](std::vector<std::array<int, 4>> const& v) {
+                    std::priority_queue<double, std::vector<double>, std::greater<double>> h;
+                    for (int i = 0; i < S; ++i) { h.push(0.0); }
+                    double mx = 0.0;
+                    for (auto const& e : v) {
+                        double t = h.top(); h.pop();
+                        t += double(e[3] - e[2]) + 2.0;
+                        mx = std::max(mx, t);
+                        h.push(t);
+                    }
+                    return mx;
+                };
+                auto streamk = [&](int K) {
+                    std::vector<std::array<int, 4>> out(units.begin(), units.begin() + K), pieces;
+                    int64_t tot = 0;
+                    for (size_t i = K; i < units.size(); ++i) { tot += units[i][3] - units[i][2]; }
+                    if (tot == 0) { return out; }
+                    int64_t const seg = (tot + S - 1) / S;
+                    int64_t pos = 0;
+                    for (size_t i = K; i < units.size(); ++i) {
+                        auto const& e = units[i];
+                        int lo = e[2];
+                        while (lo < e[3]) {
+                            int64_t const room = seg - pos % seg;
+                            int const take = int(std::min<int64_t>(room, e[3] - lo));
+                            pieces.push_back({e[0], e[1], lo, lo + take});
+                            lo += take; pos += take;
+                        }
+                    }
+                    std::stable_sort(pieces.begin(), pieces.end(), [](auto const& a, auto const& b) { return (a[3] - a[2]) > (b[3] - b[2]); });
+                    out.insert(out.end(), pieces.begin(), pieces.end());
+                    return out;
+                };
+                std::vector<std::array<int, 4>> best = units;
+                double best_t = simulate(units);
+                int const U = int(units.size());
+                for (int w = 0; w < 6; ++w) {
+                    int const Kw = std::max(0, (U / S - w) * S);
+                    auto c = streamk(Kw);
+                    double const t = simulate(c);
+                    if (t < best_t - 1e-6) { best_t = t; best = std::move(c); }
+                }
+                units = std::move(best);
+            }
             std::vector<int> flat;
-            for (auto const& e : full) { flat.insert(flat.end(), e.begin(), e.end()); }
-            for (auto const& e : part) { flat.insert(flat.end(), e.begin(), e.end()); }
+            for (auto const& e : units) { flat.insert(flat.end(), e.begin(), e.end()); }
             int* dbuf = nullptr;
             CHECK_CUDA(cudaMalloc(&dbuf, flat.size() * sizeof(int)));
             // stream-ordered and synchronous for this call (the host vector dies at the end of the scope)
             CHECK_CUDA(cudaMemcpyAsync(dbuf, flat.data(), flat.size() * sizeof(int), cudaMemcpyHostToDevice, stream));
             CHECK_CUDA(cudaStreamSynchronize(stream));
-            it = cache.emplace(key, std::make_pair(dbuf, int(full.size() + part.size()))).first;
+            it = cache.emplace(key, std::make_pair(dbuf, int(units.size()))).first;
         }
         unit_tab = it->second.first;
         nunits = it->second.second;
