@@ -179,7 +179,7 @@ void run_flash_bwd_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t stream) 
     // ## FQ8: e4m3 halves every element buffer vs bf16: dO double-buffers (the
     // bf16 d256 config could only afford Stages_dO=1).
     static constexpr int Stages_d256 = 2;
-    static constexpr int Stages_dO_d256 = 1;
+    static constexpr int Stages_dO_d256 = 2;   // dO double-buffered (Q and dO share one 2-stage pipeline state)
     // ## Delta-Matching-128 lever P1-F (hd128 only; the d256 pins above are untouched): pass 1 at head_dim 128 runs ONE CTA
     // per SM already (169 KB of smem at P1-A), so the remaining ~58 KB is dead space.  Spending it on pipeline DEPTH
     // (raw Q stages FA3FP11_HD128_QST, which also deepens the Q twin, and raw dO stages FA3FP11_HD128_DOST) buys latency

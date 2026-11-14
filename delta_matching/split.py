@@ -2,7 +2,8 @@
 (1 GiB at 8k for B1 H16, 64 GiB at 64k), so the call is split per KV-head group or per query head when that workspace
 would exceed DM_BWD_WS_LIMIT_GB.  Heads are independent inside the ops (per-query-head dk/dv, fixed-order per-head
 reductions), so the concatenation of the per-group results is bitwise the single call's result; in the matched mode the
-delta is taken per group as well (pass 0 per group, bitwise the all-heads delta)."""
+delta is taken per group as well (pass 0 per group, bitwise the all-heads delta).  At head_dim 128 it is taken once on
+all heads instead."""
 from __future__ import annotations
 
 import os as _os
@@ -53,12 +54,16 @@ def _bwd_by_head_groups(ops, a, sm, B, H, Hkv, n_rep, N, D, hp, matched_delta=Fa
     K8kv/V8kv (B, N, Hkv, D), Lse/Dlt (B, H, N), kTtkv (B, Hkv, D, N), Qt/dOt (B, H, D, N), Q8s/dO8s (B, H, nb),
     K8skv/V8skv (B, Hkv, nb); the op returns dq (B, N, h, D), dk/dv (B, N, h, D) per query head.
     matched_delta=True: the group's delta is ops.delta_fp8 on the group (pass 0 per group; Dlt in `a` is ignored), which
-    is bitwise the all-heads delta_fp8 (per-head fixed-order reductions). With DM_BWD_STREAMS=K > 1 the groups run
-    round-robin on K streams (see the note at _BWD_STREAMS)."""
+    is bitwise the all-heads delta_fp8 (per-head fixed-order reductions); at D 128 pass 0 runs once on all heads instead.
+    With DM_BWD_STREAMS=K > 1 the groups run round-robin on K streams (see the note at _BWD_STREAMS)."""
     dO8, Q8, K8kv, V8kv, Lse, Dlt, kTtkv, Qt, dOt, Q8s, K8skv, V8skv, dO8s = a
     Lse3 = Lse.reshape(B, H, N)
     Dlt3 = Dlt.reshape(B, H, N) if Dlt is not None else None     # None on the per-group matched path (pass 0 per group below)
     assert matched_delta or Dlt3 is not None, "the all-heads delta is required unless the delta is taken per group"
+    if matched_delta and D == 128:
+        # D128: pass 0 once on all heads, sliced per group below (bitwise the per-group delta).
+        Dlt3 = ops.delta_fp8(dO8, Q8, K8kv, V8kv, Lse3.contiguous(), kTtkv, Q8s, K8skv, V8skv, dO8s, causal).view(B, H, N)
+        matched_delta = False
     groups = list(range(0, H, hp))
     K = min(_BWD_STREAMS, len(groups))
     cur = torch.cuda.current_stream(dO8.device)

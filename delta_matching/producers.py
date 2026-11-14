@@ -34,6 +34,9 @@ FUSED_TWIN = os.environ.get("DM_FUSED_TWIN", "0") == "1"
 TWIN_MODE = int(os.environ.get("DM_TWIN_MODE", "2"))   # 1 = tl.trans, 2 = transposed addressing
 _checked: set = set()
 _kmean_ok: dict = {}
+# Q / K / V are read through their own (B, H, N, D) strides, without contiguous copies.  The first use of every
+# (kind, shape, strides) signature is checked bitwise against the contiguous route, which is the fallback.
+_strided_ok: dict = {}
 
 
 # ----------------------------------------------------------------------------- k-mean, split
@@ -50,6 +53,98 @@ def _kmean_partial_kernel(K, KP, N, D: tl.constexpr, BD: tl.constexpr):
     x = tl.load(K + base + rn[:, None] * D + rd[None, :]).to(tl.float32)
     s = tl.sum(x, axis=0)
     tl.store(KP + (pid_bh.to(tl.int64) * (N // 64) + pid_j) * D + rd, s)
+
+
+@triton.jit
+def _kmean_partial_strided_kernel(K, KP, N, H, skb, skh, skn, skd, D: tl.constexpr, BD: tl.constexpr):
+    pid_bh = tl.program_id(0)
+    pid_j = tl.program_id(1)
+    pid_d = tl.program_id(2)
+    rd = pid_d * BD + tl.arange(0, BD)
+    b = pid_bh // H
+    h = pid_bh % H
+    base = b.to(tl.int64) * skb + h.to(tl.int64) * skh
+    rn = pid_j * 64 + tl.arange(0, 64)
+    x = tl.load(K + base + rn.to(tl.int64)[:, None] * skn + rd.to(tl.int64)[None, :] * skd).to(tl.float32)
+    s = tl.sum(x, axis=0)
+    tl.store(KP + (pid_bh.to(tl.int64) * (N // 64) + pid_j) * D + rd, s)
+
+
+@triton.jit
+def _quant_strided_kernel(X, KM, X8, X8S, X8T, N, H, sxb, sxh, sxn, sxd,
+                          SM: tl.constexpr, BLK: tl.constexpr, D: tl.constexpr,
+                          MODE: tl.constexpr, WANT_T8: tl.constexpr = False):
+    """Quantize a strided input like quant._quant_kernel."""
+    pid_m = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+    rm = pid_m * BLK + tl.arange(0, BLK)
+    rd = tl.arange(0, D)
+    b = pid_bh // H
+    h = pid_bh % H
+    xin = b.to(tl.int64) * sxb + h.to(tl.int64) * sxh + rm.to(tl.int64)[:, None] * sxn + rd.to(tl.int64)[None, :] * sxd
+    base = pid_bh.to(tl.int64) * N * D + rm.to(tl.int64)[:, None] * D + rd[None, :]
+
+    x = tl.load(X + xin).to(tl.float32)
+    if MODE == 0:
+        x = x * SM
+    if MODE == 1:
+        km = tl.load(KM + pid_bh.to(tl.int64) * D + rd)
+        x = x - km[None, :]
+
+    amax = tl.max(tl.abs(x))
+    s = tl.maximum(amax, 1e-30) / E4M3_MAX
+    tl.store(X8S + pid_bh.to(tl.int64) * (N // BLK) + pid_m, s)
+    q = tl.math.div_rn(x, tl.full([1, 1], 1.0, tl.float32) * s)
+    q = tl.minimum(tl.maximum(q, -E4M3_MAX), E4M3_MAX)
+    q8 = q.to(tl.float8e4nv)
+    tl.store(X8 + base, q8)
+    if WANT_T8:
+        t8_off = pid_bh.to(tl.int64) * N * D + rd.to(tl.int64)[:, None] * N + rm[None, :]
+        tl.store(X8T + t8_off, tl.trans(q8))
+
+
+def _sig(kind, x, *extra):
+    return (kind, tuple(x.shape), tuple(x.stride()), str(x.device)) + extra
+
+
+def _strided_or_reference(sig, strided_fn, reference_fn):
+    """Run the strided path, falling back to the reference if its first result for a signature differs."""
+    if _strided_ok.get(sig) is False:
+        return reference_fn()
+    out = strided_fn()
+    if SELFCHECK and sig not in _strided_ok:
+        ref = reference_fn()
+        ok = all(torch.equal(a.view(torch.uint8) if a.element_size() == 1 else a,
+                             b.view(torch.uint8) if b.element_size() == 1 else b) for a, b in zip(out, ref))
+        _strided_ok[sig] = ok
+        if not ok:
+            warnings.warn(f"delta_matching: the strided producer differs from the contiguous route at {sig}; "
+                          "using the contiguous route for this signature", RuntimeWarning)
+            return ref
+    return out
+
+
+def kmean_strided(k: torch.Tensor) -> torch.Tensor:
+    """Per-head mean of K over the sequence, read through K's own strides."""
+    B, Hk, N, D = k.shape
+    BH = B * Hk
+    kp = torch.empty(BH, N // 64, D, device=k.device, dtype=torch.float32)
+    km = torch.empty(BH, D, device=k.device, dtype=torch.float32)
+    _kmean_partial_strided_kernel[(BH, N // 64, D // 64)](k, kp, N, Hk, *k.stride(), D=D, BD=64)
+    _kmean_fold_kernel[(BH, D // 64)](kp, km, N, D=D, BD=64, num_warps=1)
+    return km
+
+
+def _quant_strided(x, km, mode, blk, want_t8):
+    B, H, N, D = x.shape
+    BH = B * H
+    dev = x.device
+    x8 = torch.empty(BH, N, D, device=dev, dtype=torch.float8_e4m3fn)
+    x8s = torch.empty(BH, N // blk, device=dev, dtype=torch.float32)
+    x8t = torch.empty(BH, D, N, device=dev, dtype=torch.float8_e4m3fn) if want_t8 else x8
+    _quant_strided_kernel[(N // blk, BH)](x, km if km is not None else x8s, x8, x8s, x8t, N, H, *x.stride(),
+                                          SM=D ** -0.5, BLK=blk, D=D, MODE=mode, WANT_T8=want_t8, num_warps=8)
+    return x8, x8s, x8t
 
 
 @triton.jit
@@ -148,6 +243,28 @@ def _selfcheck_twin(tag, x8, x8t):
 
 def quant_q_m17(q: torch.Tensor, blk: int = 64, want_twin: bool = True):
     """q: [B, H, N, D] bf16 (any dense strides) -> (Q8 [BH, N, D], Q8s [BH, N//blk], Qt [BH, D, N] | None)."""
+    if not (want_twin and FUSED_TWIN):
+        Q8, Q8s = _strided_or_reference(_sig("q", q, blk),
+                                        lambda: _quant_strided(q, None, 0, blk, False)[:2],
+                                        lambda: _quant_q_contiguous(q, blk))
+        return Q8, Q8s, (twin_pi(Q8) if want_twin else None)
+    return _quant_q_fused(q, blk)
+
+
+def _quant_q_contiguous(q, blk):
+    B, H, N, D = q.shape
+    BH = B * H
+    qc = q.reshape(BH, N, D).contiguous()
+    Q8 = torch.empty(BH, N, D, device=q.device, dtype=torch.float8_e4m3fn)
+    Q8s = torch.empty(BH, N // blk, device=q.device, dtype=torch.float32)
+    FQ._quant_kernel[(N // blk, BH)](qc, qc, Q8, Q8s, Q8, Q8, Q8, N, H,
+                                     SM=D ** -0.5, BLK=blk, D=D, MODE=0, WANT_T16=False,
+                                     T16_IS_FP8=False, WANT_F16=False, T16_IS_BF16=False,
+                                     F16_IS_BF16=False, WANT_T8=False, num_warps=8)
+    return Q8, Q8s
+
+
+def _quant_q_fused(q: torch.Tensor, blk: int = 64, want_twin: bool = True):
     B, H, N, D = q.shape
     BH = B * H
     qc = q.reshape(BH, N, D).contiguous()
@@ -181,6 +298,15 @@ def quant_kv_m17(k: torch.Tensor, v: torch.Tensor, blk_k: int = 32):
     """k, v: [B, Hk, N, D] bf16 -> (K8, K8s, kTt, V8, V8s) in the quant.py realization (the
     _quant_kernel launches, MODE 1 with the WANT_T8 twin / MODE 2), with the split k-mean.
     ## M19: blk_k = keys per K/V scale block (32 = the M17 d256 default; 64 at hd128)."""
+    def strided():
+        km = kmean_strided(k)
+        K8, K8s, K8t = _quant_strided(k, km, 1, blk_k, True)
+        V8, V8s, _ = _quant_strided(v, km, 2, blk_k, False)
+        return K8, K8s, K8t, V8, V8s
+    return _strided_or_reference(_sig("kv", k, blk_k) + _sig("v", v), strided, lambda: _quant_kv_contiguous(k, v, blk_k))
+
+
+def _quant_kv_contiguous(k: torch.Tensor, v: torch.Tensor, blk_k: int = 32):
     B, Hk, N, D = k.shape
     BH = B * Hk
     dev = k.device
@@ -207,6 +333,12 @@ def quant_kv_m17(k: torch.Tensor, v: torch.Tensor, blk_k: int = 32):
 def quant_k_m17(k: torch.Tensor, blk_k: int = 32):
     """k: [B, Hk, N, D] bf16 -> (K8, K8s, kTt) in the quant.py realization with the split k-mean
     (for callers that produce the V codes themselves).  ## M19: blk_k as quant_kv_m17."""
+    return _strided_or_reference(_sig("k", k, blk_k),
+                                 lambda: _quant_strided(k, kmean_strided(k), 1, blk_k, True),
+                                 lambda: _quant_k_contiguous(k, blk_k))
+
+
+def _quant_k_contiguous(k: torch.Tensor, blk_k: int = 32):
     B, Hk, N, D = k.shape
     BH = B * Hk
     dev = k.device

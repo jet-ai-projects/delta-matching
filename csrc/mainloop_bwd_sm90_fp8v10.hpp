@@ -1811,7 +1811,10 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
             Tensor scores = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(tSrS.layout()));
             // dtanh needs to happen before masking, otherwise we get 1 - (-inf)^2 = NaN in the dtanh
             auto dtanh = [&] { if constexpr (Has_softcap) return flash::calculate_dtanh(scores); else return nullptr; }();
-            mask_fn(tSrS, m_block);
+            // The mask is applied to the exp argument, not to S: a masked S of -inf times a zero descale (a zero Q block
+            // times a zero K block underflows to 0) would give NaN, which the clamp turns into P = 2^12.  Every unmasked
+            // lane does the same arithmetic as before, and a masked lane still gives exp2(-inf) = 0.
+            if constexpr (kAbl & 32) { mask_fn(tSrS, m_block); }
             if constexpr (!(kAbl & 32)) {
             #pragma unroll
             for (int mi = 0; mi < size<0>(scores); ++mi) {
@@ -1835,11 +1838,13 @@ struct CollectiveMainloopBwdSm90Fp8V10 {
                     // exp2f overflowing to +inf at arg >= 128, which was the
                     // mechanized dq/dk NaN: inf dS -> psi = inf -> psi_inv = 0 ->
                     // inf*0 = NaN in the dS' codes feeding the dK and pass-2 dQ
-                    // GEMMs.  Masked lanes: fminf(-inf, 12) = -inf -> exp2f = 0.
-                    scores(mi, ni) = exp2f(fminf(scores(mi, ni) * fq8_s_descale_log2 - lse_scaled + kFq8MoE,
-                                                 kFq8MoE + 4.0f));
+                    // GEMMs.  Masked lanes: the argument is set to -inf below -> exp2f = 0.
+                    scores(mi, ni) = fminf(scores(mi, ni) * fq8_s_descale_log2 - lse_scaled + kFq8MoE, kFq8MoE + 4.0f);
                 }
             }
+            mask_fn(tSrS, m_block);
+            #pragma unroll
+            for (int i = 0; i < size(scores); ++i) { scores(i) = exp2f(scores(i)); }
             }   // kAbl & 32
 
             Tensor tLSErdPsum = cute::conditional_return<!ShuffledPsum>(make_fragment_like(tLSEsdPsum(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));

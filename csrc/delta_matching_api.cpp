@@ -132,11 +132,10 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_core(
                 "delta_matching fwd: k8/v8 heads must divide q8 heads (native GQA)");
     TORCH_CHECK(fp11_hd_supported(head_size), "delta_matching fwd: head_dim must be 256 (or 128 in a Delta-Matching-128 build)");
     TORCH_CHECK(seqlen_q % 128 == 0 && seqlen_k % 128 == 0, "delta_matching fwd: seqlens must be 128-multiples");
-    // ## M20: the F3 forward (256-key tiles at hd128, FA3FP11_HD128_BN256=1) mis-handles a partial last key
-    // tile (measured on an earlier build: seqlen_k 640 / 896 give a finite O but a backward that is not finite; 768 / 1024 are fine;
-    // the 128-key forward is fine at 640 / 896).  Refuse loudly instead of returning a LSE the backward cannot use.
-    if (head_size == 128 && FA3FP11_HD128_BN256) {
-        TORCH_CHECK(seqlen_k % 256 == 0, "delta_matching fwd (Delta-Matching-128, 256-key forward tiles): seqlen_k must be a 256-multiple (got ", seqlen_k, ")");
+    // The hd128 forward stages a 128-key tile's K / V scales by a 16-byte bulk copy of its 256-key pair's four scales:
+    // aligned, and inside the head's scale row, only when seqlen_k is a 256-multiple.
+    if (head_size == 128) {
+        TORCH_CHECK(seqlen_k % 256 == 0, "delta_matching fwd (Delta-Matching-128): seqlen_k must be a 256-multiple (got ", seqlen_k, ")");
     }
     for (auto const& t : {q8, k8, v8}) { TORCH_CHECK(t.stride(-1) == 1); }
     for (auto const& t : {q8s, k8s, v8s}) { TORCH_CHECK(t.is_contiguous()); }

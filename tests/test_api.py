@@ -218,6 +218,82 @@ except RuntimeError as ex:
     assert "RUNTIME-ERROR True" in p.stdout, p.stdout + p.stderr[-2000:]
 
 
+def test_hd128_raw_forward_refuses_seqlens_that_are_not_256_multiples(tmp_path):
+    """At head_dim 128, fwd_fp8 raises a RuntimeError when the sequence length is not a multiple of 256."""
+    code = r"""
+import torch
+from delta_matching.core import _ops, blocks
+from delta_matching.producers import quant_qkv_m17
+ops = _ops()
+B, H, N, D = 1, 4, 384, 128
+x = torch.randn(B, H, N, D, device="cuda").to(torch.bfloat16)
+Q8, Q8s, K8, K8s, V8, V8s, _, _ = quant_qkv_m17(x, x, x, want_qt=True, blocks=blocks(D))
+b = lambda t: t.view(B, H, N, D).permute(0, 2, 1, 3)
+try:
+    ops.fwd_fp8(b(Q8), b(K8), b(V8), Q8s.view(B, H, -1), K8s.view(B, H, -1), V8s.view(B, H, -1), D ** -0.5, True)
+    torch.cuda.synchronize()
+    print("NO-ERROR")
+except RuntimeError as ex:
+    print("RUNTIME-ERROR", "256-multiple" in str(ex))
+"""
+    import delta_matching
+    env = dict(os.environ)
+    pkg_parent = os.path.dirname(os.path.dirname(os.path.abspath(delta_matching.__file__)))
+    env["PYTHONPATH"] = pkg_parent + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+    p = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, env=env, timeout=600, cwd=str(tmp_path))
+    assert p.returncode == 0, f"the process ended with {p.returncode}: {p.stderr[-2000:]}"
+    assert "RUNTIME-ERROR True" in p.stdout, p.stdout + p.stderr[-2000:]
+
+
+def test_hd128_delta_128_row_fallback_matches_the_256_row_cta():
+    """Causal pass 0 at head_dim 128 gives the same delta with 128-row and 256-row CTAs, up to fp32 round-off."""
+    from delta_matching.producers import quant_q_m17
+    ops = _ops()
+    B, H, Hk, N, n, D = 1, 4, 2, 512, 384, 128
+    args = _fwd_args(B=B, H=H, Hk=Hk, N=N, D=D)
+    q8, k8, v8, q8s, k8s, v8s = args[:6]
+    _, lse = ops.fwd_fp8(*args)
+    g = torch.Generator(device="cpu").manual_seed(5)
+    do = torch.randn(B, H, N, D, generator=g).to("cuda", BF)
+    dO8, dO8s, _ = quant_q_m17(do, blk=128, want_twin=False)
+    do8 = dO8.view(B, H, N, D).permute(0, 2, 1, 3)
+    do8s = dO8s.view(B, H, -1)
+    kt = k8.permute(0, 2, 3, 1).contiguous()          # (B, Hk, D, N); pass 0 reads K / V in natural layout
+    lse = lse.reshape(B, H, N).contiguous()
+    full = ops.delta_fp8(do8, q8, k8, v8, lse, kt, q8s, k8s, v8s, do8s, True).view(B, H, N)
+    cut = lambda x: x[:, :n].contiguous()
+    part = ops.delta_fp8(cut(do8), cut(q8), cut(k8), cut(v8), lse[..., :n].contiguous(), kt[..., :n].contiguous(),
+                         q8s[..., :n // 128].contiguous(), k8s[..., :n // 64].contiguous(),
+                         v8s[..., :n // 64].contiguous(), do8s[..., :n // 128].contiguous(), True).view(B, H, n)
+    again = ops.delta_fp8(cut(do8), cut(q8), cut(k8), cut(v8), lse[..., :n].contiguous(), kt[..., :n].contiguous(),
+                          q8s[..., :n // 128].contiguous(), k8s[..., :n // 64].contiguous(),
+                          v8s[..., :n // 64].contiguous(), do8s[..., :n // 128].contiguous(), True).view(B, H, n)
+    assert torch.isfinite(full).all() and torch.equal(part, again)
+    ref = full[..., :n]
+    assert ((part - ref).abs().amax(-1) <= 1e-6 * ref.abs().amax(-1)).all()
+
+
+@pytest.mark.parametrize("D", [128, 256])
+@pytest.mark.parametrize("mode", ["matched", "stale"])
+def test_all_zero_inputs_match_reference(mode, D):
+    """All-zero Q, K and V give zero O, dQ and dK and the reference dV."""
+    import delta_matching as dm
+    B, N, H, Hk = 1, 512, 4, 2
+    q = torch.zeros(B, N, H, D, device="cuda", dtype=BF, requires_grad=True)
+    k = torch.zeros(B, N, Hk, D, device="cuda", dtype=BF, requires_grad=True)
+    v = torch.zeros(B, N, Hk, D, device="cuda", dtype=BF, requires_grad=True)
+    do = torch.randn(B, N, H, D, generator=torch.Generator(device="cpu").manual_seed(0)).to("cuda", BF)
+    o = dm.dm_attn_func(q, k, v, causal=True, mode=mode)
+    o.backward(do)
+    p = torch.ones(N, N, device="cuda", dtype=torch.float64).tril()
+    p /= p.sum(-1, keepdim=True)
+    dv = torch.einsum("ij,bihd->bjhd", p, do.double()).view(B, N, Hk, H // Hk, D).sum(3)
+    assert torch.equal(o, torch.zeros_like(o))
+    assert torch.equal(q.grad, torch.zeros_like(q)) and torch.equal(k.grad, torch.zeros_like(k))
+    err = float((v.grad.double() - dv).norm() / dv.norm())
+    assert err < 0.06, f"dV relative error {err:.4f}"
+
+
 def test_kernel_version_reports_the_loaded_library():
     import delta_matching as dm
     _ops()
