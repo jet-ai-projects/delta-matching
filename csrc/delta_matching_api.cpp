@@ -45,6 +45,9 @@ PyObject* PyInit__C(void)
 
 template <bool Is_causal>
 void run_flash_fwd_fp8f_d256(Flash_fwd_fp8_params &params, cudaStream_t stream);
+// ## ATTNQAT: the d256 O' residual pass (flash_fwd_hdim256_e4m3_fp8f_res_sm90.cu)
+template <bool Is_causal>
+void run_flash_fwd_fp8f_d256_res(Flash_fwd_fp8_params &params, cudaStream_t stream);
 template <bool Is_causal>
 void run_flash_bwd_fp11_d256(Flash_bwd_fp8_params &params, cudaStream_t stream);
 template <bool Is_causal>
@@ -110,7 +113,8 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_core(
     at::Tensor k8s,     // (b, h, s_k/32) fp32
     at::Tensor v8s,     // (b, h, s_k/32) fp32
     double softmax_scale,
-    bool is_causal
+    bool is_causal,
+    bool residual = false   // ## ATTNQAT: the O' residual pass (fwd_fp8_res); false = the shipped forward
 ) {
     c10::cuda::CUDAGuard device_guard(q8.device());
     dm_check_inputs("fwd", q8, {k8, v8, q8s, k8s, v8s});
@@ -187,6 +191,12 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_core(
     params.nblk_k = k8s.size(2);
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
+    if (residual) {   // ## ATTNQAT: d256 only (the 9.3B model's head dim)
+        TORCH_CHECK(head_size == 256, "delta_matching fwd_fp8_res (attnqat O' pass): head_dim 256 only (got ", head_size, ")");
+        if (is_causal) { run_flash_fwd_fp8f_d256_res<true>(params, stream); }
+        else { run_flash_fwd_fp8f_d256_res<false>(params, stream); }
+        return {o, lse};
+    }
     if (head_size == 128) {
         if (is_causal) { run_flash_fwd_fp8f_d128<true>(params, stream); }   // ## Delta-Matching-128
         else { run_flash_fwd_fp8f_d128<false>(params, stream); }
@@ -202,6 +212,18 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8(
     double softmax_scale, bool is_causal
 ) {
     return fwd_fp8_core(q8, k8, v8, q8s, k8s, v8s, softmax_scale, is_causal);
+}
+
+// ## ATTNQAT: the O' residual pass of the attnqat mode (attn-qat, arXiv 2603.00040: the high-precision second forward
+// output O' = P_hp V / l that the backward's delta = rowsum(dO * O') is taken from).  Same operands and contract as
+// fwd_fp8; returns (E bf16 (b,s,h,d), LSE fp32 (b,h,s)) with E = (P_hp - P_q) V / l, where P_q is fwd_fp8's own P-hat
+// codes and P_hp is held to the two-term e4m3 split C + C_lo / 16 (mainloop_fwd_sm90_fp8f.hpp ResidualP).  The LSE is
+// bitwise fwd_fp8's (same S, same online max, same l).  O' = O + E (the caller adds, in fp32, then rounds to bf16).
+std::tuple<at::Tensor, at::Tensor> fwd_fp8_res(
+    at::Tensor q8, at::Tensor k8, at::Tensor v8, at::Tensor q8s, at::Tensor k8s, at::Tensor v8s,
+    double softmax_scale, bool is_causal
+) {
+    return fwd_fp8_core(q8, k8, v8, q8s, k8s, v8s, softmax_scale, is_causal, /*residual=*/true);
 }
 
 // ## FQ8-V10 (SPLIT): the 7/7-fp8 d256 backward.  Pass 1 (column-parallel):
@@ -494,7 +516,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_bf16dp(
 
 int64_t fp11_build_gt() { return FA3FP11_M17_GT; }
 int64_t fp11_build_bf16dp() { return FA3FP11_P1R_SAGEDP; }   // ## bf16-dP: 1 only in a SageBwd-exemption build
-int64_t fp11_build_hd128() { return FA3FP11_HD128; }   // ## Delta-Matching-128: 1 when the hd128 instantiations are compiled in
+int64_t fp11_build_hd128() { return FA3FP11_HD128; }
+int64_t fp11_build_attnqat() { return 1; }   // ## ATTNQAT: the fwd_fp8_res op (the attnqat mode's O' pass) is compiled in   // ## Delta-Matching-128: 1 when the hd128 instantiations are compiled in
 
 // ## FP11-M5 (in-kernel matched delta, the design notes): PASS 0 + PASS 0.5.
 // delta[b,h,i] = sum_j P~(i,j) * dP~(i,j)*do8sc*v8sc, computed from the
@@ -746,6 +769,10 @@ TORCH_LIBRARY(delta_matching, m) {
     m.def("twin_pi(Tensor x8) -> Tensor");
     m.def("build_gt() -> int");
     m.def("build_hd128() -> int");
+    // ## ATTNQAT
+    m.def("fwd_fp8_res(Tensor q8, Tensor k8, Tensor v8, Tensor q8s, Tensor k8s, Tensor v8s,"
+          " float softmax_scale, bool is_causal) -> (Tensor, Tensor)");
+    m.def("build_attnqat() -> int");
 #ifdef FA3FP11_DBG
     m.def("bwd_fp8_dbg(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
@@ -763,10 +790,12 @@ TORCH_LIBRARY_IMPL(delta_matching, CompositeExplicitAutograd, m) {
     m.impl("build_gt", &fp11_build_gt);
     m.impl("build_bf16dp", &fp11_build_bf16dp);
     m.impl("build_hd128", &fp11_build_hd128);
+    m.impl("build_attnqat", &fp11_build_attnqat);
 }
 
 TORCH_LIBRARY_IMPL(delta_matching, CUDA, m) {
     m.impl("fwd_fp8", &fwd_fp8);
+    m.impl("fwd_fp8_res", &fwd_fp8_res);   // ## ATTNQAT
     m.impl("bwd_fp8", &bwd_fp8);
     m.impl("delta_fp8", &delta_fp8);
     m.impl("bwd_fp8_t", &bwd_fp8_t);

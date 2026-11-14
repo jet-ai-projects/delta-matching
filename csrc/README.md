@@ -5,8 +5,9 @@ The CUDA / C++ sources of the `delta_matching` torch library. Every translation 
 
 | file | role |
 |---|---|
-| `delta_matching_api.cpp` | the torch ops (`fwd_fp8`, `bwd_fp8`, `bwd_fp8_t`, `delta_fp8`, `twin_pi`, build flags) and their input checks |
+| `delta_matching_api.cpp` | the torch ops (`fwd_fp8`, `fwd_fp8_res`, `bwd_fp8`, `bwd_fp8_t`, `delta_fp8`, `twin_pi`, build flags) and their input checks |
 | `flash_fwd_hdim{128,256}_e4m3_fp8f_sm90.cu` | forward instantiations (`flash_fwd_fp8f_launch.h`, `flash_fwd_kernel_sm90_fq8f.h`, `mainloop_fwd_sm90_fp8f.hpp`, `softmax_fq8f.h`) |
+| `flash_fwd_hdim256_e4m3_fp8f_res_sm90.cu` | the attnqat mode's O' residual pass (`fwd_fp8_res`): the d256 forward with `ResidualP` (the P-hat codes' own rounding residual on a 2^4 finer basis) |
 | `flash_bwd_hdim{128,256}_e4m3_fp8v10_sm90.cu` | backward instantiations (`flash_bwd_fp8v10_launch.h`; pass 1: `mainloop_bwd_sm90_fp8v10.hpp` at 256, `mainloop_bwd_sm90_fp8r.hpp` at 128; pass 2: `fq8_dq_pass2*.h`) |
 | `flash_delta_hdim256_e4m3_fp11_sm90.cu`, `flash_delta_hdim128_e4m3_fp11v5_sm90.cu` | the matched-delta pass 0 (`fp11_delta*.h`) |
 | `fp11_twin_kernel.cu` | the transposed operand twins |

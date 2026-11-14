@@ -27,7 +27,8 @@ using namespace cute;
 // ## Delta-Matching-128 (M19): the launch body is templated on the head dim; the d256 entry point
 // (run_flash_fwd_fp8f_d256) keeps its name and configuration verbatim, the d128 entry point instantiates
 // the same collective at kHeadDim 128 with the same 128 x 128 tile (FA3's own bf16 hd128 tile).
-template <bool Is_causal, int kHeadDim_>
+// ## ATTNQAT: ResidualP_ = the O' residual pass (mainloop_fwd_sm90_fp8f.hpp ResidualP); false is the shipped forward.
+template <bool Is_causal, int kHeadDim_, bool ResidualP_ = false>
 void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) {
     using Element = cutlass::float_e4m3_t;
     using ElementOut = cutlass::bfloat16_t;
@@ -51,7 +52,7 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
         kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, ArchTag,
         Is_causal, false /*Is_local*/, false /*Has_softcap*/, false /*Varlen*/,
         false /*PagedKVNonTMA*/, false /*AppendKV*/, false /*HasQv*/,
-        MmaPV_is_RS, IntraWGOverlap, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/>;
+        MmaPV_is_RS, IntraWGOverlap, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/, ResidualP_>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<
         TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads,
         false /*Varlen*/, false /*PackGQA*/, false /*Split*/, true /*FP8_TransposeV*/>;
@@ -147,6 +148,12 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
 template <bool Is_causal>
 void run_flash_fwd_fp8f_d256(Flash_fwd_fp8_params &params, cudaStream_t stream) {
     run_flash_fwd_fp8f_impl<Is_causal, 256>(params, stream);
+}
+
+// ## ATTNQAT: the d256 O' residual pass (the shipped d256 configuration with the residual P codes).
+template <bool Is_causal>
+void run_flash_fwd_fp8f_d256_res(Flash_fwd_fp8_params &params, cudaStream_t stream) {
+    run_flash_fwd_fp8f_impl<Is_causal, 256, true>(params, stream);
 }
 
 // ## Delta-Matching-128

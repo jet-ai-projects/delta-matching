@@ -3,6 +3,8 @@
 producers.doq_m17 (dO codes, scales, twin and, in the stale mode, delta = rowsum(dO * O)); in the matched mode the delta
 from pass 0 of the kernel (delta_fp8); then the bwd_fp8_t op on the global-memory twins, split per head group at long
 context (split.py).  Saved for the backward: the fp8 codes, their scales, the twins, O and the LSE.
+attnqat (attn-qat, arXiv 2603.00040, adapted to these fp8 formats): the forward also runs the fwd_fp8_res O' pass and
+saves O' = O + E (= P_hp V / l, bf16) in place of O; the backward is the stale path with delta = rowsum(dO * O').
 """
 from __future__ import annotations
 
@@ -23,6 +25,17 @@ def _ops_gt():
             raise RuntimeError("the delta_matching library lacks the global-memory twins (build_gt() != 1): rebuild the package")
         _GT_CHECKED = True
     return ops
+
+
+def attnqat_oprime(ops, O, q8, k8, v8, q8s, k8s, v8s, sm, causal):
+    """attn-qat's O' (arXiv 2603.00040 Alg. 2 l.13): P_hp V / l from the fwd_fp8_res pass on fwd_fp8's own operands,
+    O' = bf16(float(O) + float(E)).  P_hp is the forward's unquantized P held to the two-term e4m3 split (the residual of
+    fwd_fp8's own P-hat codes on a 2^4 finer basis): ~2^-8 relative per element, the bf16 P of the reference code's O'
+    MMA is 2^-9.  Needs a build with the O' pass (build_attnqat() == 1)."""
+    if not hasattr(ops, "build_attnqat") or int(ops.build_attnqat()) != 1:
+        raise RuntimeError("mode='attnqat' needs a delta_matching build with the O' pass (build_attnqat() == 1)")
+    E, _ = ops.fwd_fp8_res(q8, k8, v8, q8s, k8s, v8s, sm, causal)
+    return (O.float() + E.float()).to(torch.bfloat16)
 
 
 def _refuse_bf16dp(ops):
@@ -65,7 +78,11 @@ class _DMAttn(torch.autograd.Function):
         O, Lse = ops.fwd_fp8(bshd(Q8), bshd(K8, Hk), bshd(V8, Hk),
                              Q8s.view(B, H, -1), K8s.view(B, Hk, -1),
                              V8s.view(B, Hk, -1), sm, causal)
-        ctx.save_for_backward(Q8, Q8s, K8, K8s, V8, V8s, kTt, Qt, O, Lse)
+        Osave = O
+        if delta_mode == "attnqat":   # the O' pass: E = (P_hp - P_q) V / l; O' = O + E (fp32 add, one bf16 rounding)
+            Osave = attnqat_oprime(ops, O, bshd(Q8), bshd(K8, Hk), bshd(V8, Hk), Q8s.view(B, H, -1),
+                                   K8s.view(B, Hk, -1), V8s.view(B, Hk, -1), sm, causal)
+        ctx.save_for_backward(Q8, Q8s, K8, K8s, V8, V8s, kTt, Qt, Osave, Lse)
         ctx.dims = (B, H, N, D)
         ctx.hk = Hk
         ctx.causal = causal
@@ -120,8 +137,9 @@ class _DMAttn(torch.autograd.Function):
 
 def dm_attn_func_bhnd(q, k, v, causal=True, softmax_scale=None, delta_mode="stale"):
     """Attention on (B, H, N, D) inputs: q (B, H, N, D), k / v (B, Hk, N, D) bf16 on CUDA (any strides; H % Hk == 0) ->
-    O (B, N, H, D) bf16 contiguous (the kernel's native output layout).  delta_mode: "stale" (delta = rowsum(dO * O)) or
-    "matched" (the Delta-Matching backward; needs causal=True).  Input errors raise ValueError / TypeError /
+    O (B, N, H, D) bf16 contiguous (the kernel's native output layout).  delta_mode: "stale" (delta = rowsum(dO * O)),
+    "matched" (the Delta-Matching backward; needs causal=True) or "attnqat" (attn-qat's delta = rowsum(dO * O') from the
+    forward's high-precision second output O'; head_dim 256).  Input errors raise ValueError / TypeError /
     NotImplementedError (core._check_inputs)."""
     _check_inputs(q, k, v, causal, softmax_scale, delta_mode)
     return _DMAttn.apply(q, k, v, causal, delta_mode)

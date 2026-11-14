@@ -122,8 +122,8 @@ def _check_inputs(q, k, v, causal, softmax_scale, mode):
         raise ValueError(f"delta_matching: q, k, v must be on one device (got {q.device}, {k.device}, {v.device})")
     if not (q.dtype == k.dtype == v.dtype == torch.bfloat16):
         raise TypeError(f"delta_matching: q, k, v must be torch.bfloat16 (got {q.dtype}, {k.dtype}, {v.dtype})")
-    if mode not in ("matched", "stale"):
-        raise ValueError(f"delta_matching: mode must be 'matched' or 'stale' (got {mode!r})")
+    if mode not in ("matched", "stale", "attnqat"):
+        raise ValueError(f"delta_matching: mode must be 'matched', 'stale' or 'attnqat' (got {mode!r})")
     if mode == "matched" and not causal:
         raise ValueError("delta_matching: mode='matched' needs causal=True (the matched delta is built for causal attention); "
                          "use mode='stale' for non-causal attention")
@@ -139,6 +139,8 @@ def _check_inputs(q, k, v, causal, softmax_scale, mode):
         raise ValueError(f"delta_matching: nheads ({H}) must be a positive multiple of nheads_k ({Hk})")
     if D not in (128, 256):
         raise ValueError(f"delta_matching: head_dim must be 128 or 256 (got {D})")
+    if mode == "attnqat" and D != 256:
+        raise NotImplementedError(f"delta_matching: mode='attnqat' (the O' residual pass) is built at head_dim 256 only (got {D})")
     mult = 256 if D == 128 else 128
     if N == 0 or N % mult:
         raise ValueError(f"delta_matching: seqlen must be a positive multiple of {mult} at head_dim {D} (got {N})")
@@ -268,4 +270,7 @@ def dm_attn_func_plain(q, k, v, causal=True, softmax_scale=None,
     on CUDA (any strides); returns O (B, N, H, D) bf16 contiguous.  delta_mode: "stale" (delta = rowsum(dO * O)) or
     "matched" (the in-kernel matched delta; needs causal=True)."""
     _check_inputs(q, k, v, causal, softmax_scale, delta_mode)
+    if delta_mode == "attnqat":
+        raise NotImplementedError("delta_matching: the plain route implements 'stale' and 'matched'; mode='attnqat' runs "
+                                  "through dm_attn_func / dm_attn_func_bhnd")
     return _DMAttnPlain.apply(q, k, v, causal, delta_mode)

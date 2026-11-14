@@ -46,7 +46,7 @@ using namespace cute;
 
 template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
-        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_>
+        bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_, bool ResidualP_ = false>
 struct CollectiveMainloopFwdSm90Fp8F {
     // ## FQ8F (delta_matching): the FAITHFUL forward.  Fork of fa3fp8's
     // CollectiveMainloopFwdSm90Fp8 that replaces FA3's constant-basis
@@ -146,6 +146,16 @@ struct CollectiveMainloopFwdSm90Fp8F {
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
+    // ## ATTNQAT: the O' residual pass (attn-qat's high-precision second forward output, arXiv 2603.00040 Alg. 2 l.13).
+    // false = the shipped forward, token for token (fq8_cvt_p below is convert_type_out verbatim).  true = the SAME
+    // collective (same S, same online max, same four per-row per-32-key bases ms_[g], same rho chain and promotes, same
+    // l and LSE) with the PV A-operand codes swapped for the forward's own rounding residual on a 2^4 finer basis:
+    //     C = e4m3(x)  (the shipped codes, bitwise),   C_lo = e4m3(16 * (x - float(C)))
+    // so tOrO accumulates 16 * sum_g w_g (x - C) V and finalize's 1/l carries an extra exact 2^-4.  The launch returns
+    // E = (P_hp - P_q) V / l in bf16; O' = O + E = P_hp V / l with P_hp held to the two-term e4m3 split (~2^-8 relative).
+    static constexpr bool ResidualP = ResidualP_;
+    static_assert(!ResidualP || (IntraWGOverlap && MmaPV_is_RS && !V_colmajor),
+                  "delta_matching: the O' residual pass is built on the shipped d256 schedule only");
     static constexpr bool Transpose_V = Is_FP8 && !V_colmajor;
     static constexpr bool Use_TMA_Q = !PackGQA;
     static constexpr bool Use_TMA_KV = !PagedKVNonTMA;
@@ -1145,6 +1155,22 @@ struct CollectiveMainloopFwdSm90Fp8F {
         }
     }
 
+    // ## ATTNQAT: the PV A-operand codes from the fp32 P-hat values (src, a view of the tSrS registers, dead after this).
+    // !ResidualP: convert_type_out, the shipped conversion.  ResidualP: the shipped codes C first (the same converter, so
+    // C is bitwise the O pass's), then the residual r = x - float(C) in place (exact in fp32: C is within half an e4m3
+    // ulp of x, or 0), coded as C_lo = e4m3(16 r).  |16 r| <= |x| <= 448, so the satfinite clamp never binds; x = 0
+    // (masked) gives C = C_lo = 0.
+    template <typename TensorSrc, typename TensorDst>
+    CUTLASS_DEVICE static void fq8_cvt_p(TensorSrc src, TensorDst& dst) {
+        convert_type_out(src, dst);
+        if constexpr (ResidualP) {
+            cutlass::NumericConverter<float, Element> to_f32;
+            #pragma unroll
+            for (int i = 0; i < size(src); ++i) { src(i) = (src(i) - to_f32(dst(i))) * 16.0f; }
+            convert_type_out(src, dst);
+        }
+    }
+
     // ## FQ8: flash::gemm with an explicit k-atom range [K0, K1): the PV splits
     // its contraction at the four 32-row V-scale groups (one fp8 k-atom each)
     // with accumulator basis rescales between (copy of the bwd fork's helper).
@@ -1490,7 +1516,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
             Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
             Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
-            convert_type_out(tOrP_acc, tOrP);
+            fq8_cvt_p(tOrP_acc, tOrP);   // ## ATTNQAT: convert_type_out unless ResidualP
             if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
             if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
             if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
@@ -1839,7 +1865,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
                     if constexpr (kFwdDfold && !Check_inf) { softmax.template online_softmax_grouped_raw</*Is_first=*/false, Check_inf>(tSrS, fq8_g_); }
                     else { softmax.template online_softmax_grouped</*Is_first=*/false, Check_inf>(tSrS); }
                     if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
-                    convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
+                    fq8_cvt_p(make_tensor(tSrS.data(), tOrP.layout()), tOrP);   // ## ATTNQAT
                     if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                     if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                     fq8_load_v(n_block);           // this tile's four v-scales
@@ -1876,7 +1902,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
                     softmax.rescale_o(tOrO, scores_scale);
                     softmax.template online_softmax_grouped</*Is_first=*/false, Check_inf>(tSrS);
                     if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
-                    convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
+                    fq8_cvt_p(make_tensor(tSrS.data(), tOrP.layout()), tOrP);   // ## ATTNQAT
                     if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                     if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                     fq8_load_v(n_block);
@@ -1928,6 +1954,10 @@ struct CollectiveMainloopFwdSm90Fp8F {
             // the unmodified natural-log formula in true units, which is the
             // frozen v10 backward's contract.
             cute::copy(softmax.finalize(), scores_scale);
+            if constexpr (ResidualP) {   // ## ATTNQAT: the residual codes carry 2^4; O' pass output E = tOrO / (16 l)
+                #pragma unroll
+                for (int mi = 0; mi < size(scores_scale); ++mi) { scores_scale(mi) *= 0.0625f; }
+            }
             if constexpr (LargeHeadDimV) {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
                 store_scales(scores_scale, smem_pipe_read.index());
@@ -1984,7 +2014,7 @@ struct CollectiveMainloopFwdSm90Fp8F {
                 if constexpr (Is_FP8 && !V_colmajor) { flash::permute_Cregs_fp8(tSrS); }
                 Tensor tOrP_acc = make_tensor(tSrS.data(), flash::convert_layout_acc_Aregs<TiledMmaPV>(tSrS.layout()));
                 Tensor tOrP = make_tensor_like<Element>(tOrP_acc);
-                convert_type_out(tOrP_acc, tOrP);
+                fq8_cvt_p(tOrP_acc, tOrP);   // ## ATTNQAT: convert_type_out unless ResidualP
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
                 if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }

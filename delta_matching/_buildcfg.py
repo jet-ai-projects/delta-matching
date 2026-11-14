@@ -73,7 +73,8 @@ def defines():
 
 
 def sources():
-    s = ["delta_matching_api.cpp", "flash_fwd_hdim256_e4m3_fp8f_sm90.cu", "flash_bwd_hdim256_e4m3_fp8v10_sm90.cu",
+    s = ["delta_matching_api.cpp", "flash_fwd_hdim256_e4m3_fp8f_sm90.cu", "flash_fwd_hdim256_e4m3_fp8f_res_sm90.cu",
+         "flash_bwd_hdim256_e4m3_fp8v10_sm90.cu",
          "flash_delta_hdim256_e4m3_fp11_sm90.cu", "fp11_twin_kernel.cu",
          "flash_fwd_hdim128_e4m3_fp8f_sm90.cu", "flash_bwd_hdim128_e4m3_fp8v10_sm90.cu",
          "flash_delta_hdim128_e4m3_fp11v5_sm90.cu"]

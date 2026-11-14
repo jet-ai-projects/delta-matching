@@ -4,7 +4,9 @@ The forward keeps the attention core in fp8 (e4m3 Q, K, V codes with per-block s
 P basis, PV promoted once per 128-key tile); the backward keeps all five backward matmuls in fp8 and, in the
 "matched" mode, forms the softmax-gradient centering term delta from the backward's OWN realized fp8 P / dP pair
 (pass 0 of the kernel), so that rowsum(dS) = 0 holds to fp32 round-off inside the kernel.  The "stale" mode is the
-conventional delta = rowsum(dO * O), which violates that identity under fp8 rounding.
+conventional delta = rowsum(dO * O), which violates that identity under fp8 rounding.  The "attnqat" mode (head_dim 256) is
+attn-qat's answer (arXiv 2603.00040): the forward also forms O' = P_hp V / l from the unquantized P (the fwd_fp8_res
+residual pass) and the backward takes delta = rowsum(dO * O'); the backward is otherwise the stale mode's.
 
 API (flash-attention layout, tensors (batch, seqlen, nheads, headdim), bf16, CUDA, Hopper):
     from delta_matching import dm_attn_func
@@ -37,7 +39,8 @@ __all__ = ["dm_attn_func", "dm_attn_func_bhnd", "dm_attn_func_plain", "flash_att
 
 def dm_attn_func(q, k, v, softmax_scale=None, causal=False, mode="matched"):
     """Attention in the flash-attention layout: q (B, N, H, D), k / v (B, N, Hk, D) bf16 on CUDA -> o (B, N, H, D) bf16.
-    mode: "matched" (the Delta-Matching backward; needs causal=True) or "stale" (delta = rowsum(dO * O))."""
+    mode: "matched" (the Delta-Matching backward; needs causal=True), "stale" (delta = rowsum(dO * O)) or "attnqat"
+    (delta = rowsum(dO * O') from the forward's high-precision second output; head_dim 256)."""
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not isinstance(t, torch.Tensor) or t.dim() != 4:
             raise ValueError(f"delta_matching: {name} must be a 4-D tensor (batch, seqlen, nheads, headdim)")
