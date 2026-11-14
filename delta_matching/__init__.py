@@ -20,12 +20,26 @@ refuses the arguments the kernel does not implement (dropout, sliding windows, s
 from __future__ import annotations
 
 import hashlib as _hashlib
+import importlib as _importlib
 import os as _os
 
 import torch
 
-from .attn import dm_attn_func_bhnd
-from .core import blocks, dm_attn_func_plain
+# The sm90 entry points and submodules load on first use (PEP 562), so importing a subpackage such as
+# delta_matching.sm100 does not import the sm90 producers (and with them Triton).
+_LAZY = {"dm_attn_func_bhnd": ".attn", "blocks": ".core", "dm_attn_func_plain": ".core"}
+_SUBMODULES = ("attn", "constants", "core", "doq", "producers", "quant", "split", "twins")
+
+
+def __getattr__(name):
+    if name in _LAZY:
+        value = getattr(_importlib.import_module(_LAZY[name], __name__), name)
+    elif name in _SUBMODULES:
+        value = _importlib.import_module("." + name, __name__)
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
 
 __version__ = "0.1.0"
 KERNEL_NUMERICS = {"128": "Delta-Matching-128 v3", "256": "Delta-Matching-256 v1"}
@@ -41,6 +55,7 @@ def dm_attn_func(q, k, v, softmax_scale=None, causal=False, mode="matched"):
     for name, t in (("q", q), ("k", k), ("v", v)):
         if not isinstance(t, torch.Tensor) or t.dim() != 4:
             raise ValueError(f"delta_matching: {name} must be a 4-D tensor (batch, seqlen, nheads, headdim)")
+    from .attn import dm_attn_func_bhnd
     return dm_attn_func_bhnd(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=causal,
                              softmax_scale=softmax_scale, delta_mode=mode)
 
