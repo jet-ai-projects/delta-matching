@@ -27,7 +27,11 @@ using namespace cute;
 // ## Delta-Matching-128 (M19): the launch body is templated on the head dim; the d256 entry point
 // (run_flash_fwd_fp8f_d256) keeps its name and configuration verbatim, the d128 entry point instantiates
 // the same collective at kHeadDim 128 with the same 128 x 128 tile (FA3's own bf16 hd128 tile).
-template <bool Is_causal, int kHeadDim_>
+// ## VT: d256 V-twin forward stages (the freed Vt buffers hold a 3rd K/V stage).
+#ifndef FA3FP11_D256_VTST
+#define FA3FP11_D256_VTST 3
+#endif
+template <bool Is_causal, int kHeadDim_, bool VTwin = false>
 void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) {
     using Element = cutlass::float_e4m3_t;
     using ElementOut = cutlass::bfloat16_t;
@@ -42,7 +46,7 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
     static constexpr int kBlockN = (kHeadDim_ < 256 && FA3FP11_HD128_BN256) ? 256 : 128;
     static constexpr bool MmaPV_is_RS = true;
     static constexpr bool IntraWGOverlap = true;
-    static constexpr int kStages = kHeadDim_ < 256 ? FA3FP11_HD128_FWDST : 2;   // hd128 forward K/V stages
+    static constexpr int kStages = kHeadDim_ < 256 ? FA3FP11_HD128_FWDST : (VTwin ? FA3FP11_D256_VTST : 2);   // hd128 forward K/V stages
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using TileShape_MNK_PV = cute::Shape<Int<kBlockM>, Int<kHeadDimV>, Int<kBlockN>>;
@@ -51,7 +55,7 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
         kStages, ClusterShape, TileShape_MNK, kHeadDimV, Element, float, ArchTag,
         Is_causal, false /*Is_local*/, false /*Has_softcap*/, false /*Varlen*/,
         false /*PagedKVNonTMA*/, false /*AppendKV*/, false /*HasQv*/,
-        MmaPV_is_RS, IntraWGOverlap, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/>;
+        MmaPV_is_RS, IntraWGOverlap, false /*PackGQA*/, false /*Split*/, false /*V_colmajor*/, VTwin>;
     using CollectiveEpilogue = flash::CollectiveEpilogueFwd<
         TileShape_MNK_PV, ClusterShape, ElementOut, ArchTag, CollectiveMainloop::NumMmaThreads,
         false /*Varlen*/, false /*PackGQA*/, false /*Split*/, true /*FP8_TransposeV*/>;
@@ -147,6 +151,12 @@ void run_flash_fwd_fp8f_impl(Flash_fwd_fp8_params &params, cudaStream_t stream) 
 template <bool Is_causal>
 void run_flash_fwd_fp8f_d256(Flash_fwd_fp8_params &params, cudaStream_t stream) {
     run_flash_fwd_fp8f_impl<Is_causal, 256>(params, stream);
+}
+
+// ## VT: v_ptr / v_*_stride describe the V twin (b, h_k, d, s_k) [s_k contiguous]: v_row_stride = its d stride.
+template <bool Is_causal>
+void run_flash_fwd_fp8f_d256_vt(Flash_fwd_fp8_params &params, cudaStream_t stream) {
+    run_flash_fwd_fp8f_impl<Is_causal, 256, true>(params, stream);
 }
 
 // ## Delta-Matching-128

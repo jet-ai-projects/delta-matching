@@ -46,6 +46,8 @@ PyObject* PyInit__C(void)
 template <bool Is_causal>
 void run_flash_fwd_fp8f_d256(Flash_fwd_fp8_params &params, cudaStream_t stream);
 template <bool Is_causal>
+void run_flash_fwd_fp8f_d256_vt(Flash_fwd_fp8_params &params, cudaStream_t stream);   // ## VT
+template <bool Is_causal>
 void run_flash_bwd_fp11_d256(Flash_bwd_fp8_params &params, cudaStream_t stream);
 template <bool Is_causal>
 void run_flash_delta_fp11_d256(Flash_bwd_fp8_params &params, cudaStream_t stream);
@@ -65,6 +67,9 @@ inline bool fp11_hd_supported(int d) { return d == 256 || (FA3FP11_HD128 && d ==
 // ## FP11-M17 GT: in-.so twin maker (fp11_twin_kernel.cu): x8 (b, s, h, d) e4m3 with strides
 // -> xt8 (b, h, d, s) contiguous e4m3 with the s positions in the pass-1 transposer's pi order.
 void fp11_make_twin_pi(void const* x8, void* xt8, int b, int s, int h, int d,
+                       int64_t sb, int64_t ss, int64_t sh, cudaStream_t stream);
+// ## VT: the forward's V twin (fp11_twin_kernel.cu): x8 (b, s, h, d) -> (b, h, d, s), sigma keys / tau head dims.
+void fp11_make_twin_vt(void const* x8, void* xt8, int b, int s, int h, int d,
                        int64_t sb, int64_t ss, int64_t sh, cudaStream_t stream);
 
 namespace {
@@ -110,7 +115,8 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_core(
     at::Tensor k8s,     // (b, h, s_k/32) fp32
     at::Tensor v8s,     // (b, h, s_k/32) fp32
     double softmax_scale,
-    bool is_causal
+    bool is_causal,
+    c10::optional<at::Tensor> const& vt8 = c10::nullopt   // ## VT: optional V twin (b, h_k, d, s_k) e4m3, see twins.py vtwin
 ) {
     c10::cuda::CUDAGuard device_guard(q8.device());
     dm_check_inputs("fwd", q8, {k8, v8, q8s, k8s, v8s});
@@ -186,10 +192,26 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_core(
     params.nblk_q = q8s.size(2);
     params.nblk_k = k8s.size(2);
 
+    bool const use_vt = vt8.has_value() && vt8->defined();
+    if (use_vt) {   // ## VT: the forward TMA-loads the pre-transposed V twin instead of transposing V in smem
+        at::Tensor const& vt = *vt8;
+        TORCH_CHECK(head_size == 256, "delta_matching fwd: the V twin is a head_dim-256 path");
+        dm_check_inputs("fwd", q8, {vt});
+        dm_check_codes("fwd", {vt});
+        TORCH_CHECK(vt.dim() == 4 && vt.size(0) == batch_size && vt.size(1) == num_heads_k && vt.size(2) == head_size
+                    && vt.size(3) == seqlen_k && vt.is_contiguous(),
+                    "delta_matching fwd: vt8 must be a contiguous (b, h_k, d, s_k) twin of v8");
+        params.v_ptr = vt.data_ptr();
+        params.v_row_stride = vt.stride(2); params.v_head_stride = vt.stride(1); params.v_batch_stride = vt.stride(0);
+        params.v_dim_stride = vt.stride(3);
+    }
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     if (head_size == 128) {
         if (is_causal) { run_flash_fwd_fp8f_d128<true>(params, stream); }   // ## Delta-Matching-128
         else { run_flash_fwd_fp8f_d128<false>(params, stream); }
+    } else if (use_vt) {
+        if (is_causal) { run_flash_fwd_fp8f_d256_vt<true>(params, stream); }
+        else { run_flash_fwd_fp8f_d256_vt<false>(params, stream); }
     } else {
         if (is_causal) { run_flash_fwd_fp8f_d256<true>(params, stream); }
         else { run_flash_fwd_fp8f_d256<false>(params, stream); }
@@ -199,9 +221,9 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8_core(
 
 std::tuple<at::Tensor, at::Tensor> fwd_fp8(
     at::Tensor q8, at::Tensor k8, at::Tensor v8, at::Tensor q8s, at::Tensor k8s, at::Tensor v8s,
-    double softmax_scale, bool is_causal
+    double softmax_scale, bool is_causal, c10::optional<at::Tensor> vt8
 ) {
-    return fwd_fp8_core(q8, k8, v8, q8s, k8s, v8s, softmax_scale, is_causal);
+    return fwd_fp8_core(q8, k8, v8, q8s, k8s, v8s, softmax_scale, is_causal, vt8);
 }
 
 // ## FQ8-V10 (SPLIT): the 7/7-fp8 d256 backward.  Pass 1 (column-parallel):
@@ -430,6 +452,24 @@ at::Tensor fp11_twin_pi(at::Tensor x8) {
     TORCH_CHECK(s % 64 == 0 && d % 64 == 0, "delta_matching twin_pi: s and d must be 64-multiples");
     at::Tensor out = torch::empty({b, h, d, s}, x8.options());
     fp11_make_twin_pi(x8.data_ptr(), out.data_ptr(), b, s, h, d,
+                      x8.stride(0), x8.stride(1), x8.stride(2),
+                      at::cuda::getCurrentCUDAStream().stream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return out;
+}
+
+// ## VT: the forward's V twin from the V codes: x8 (b, s, h_k, d) e4m3 (d contiguous) -> (b, h_k, d, s) contiguous.
+at::Tensor fp11_twin_vt(at::Tensor x8) {
+    TORCH_CHECK(x8.is_cuda(), "delta_matching twin_vt: x8 must be a CUDA tensor");
+    c10::cuda::CUDAGuard device_guard(x8.device());
+    TORCH_CHECK(x8.dim() == 4 && x8.stride(3) == 1 && x8.dtype() == at::kFloat8_e4m3fn, "delta_matching twin_vt: (b, s, h, d) e4m3, d contiguous");
+    TORCH_CHECK(int64_t(x8.size(0)) * x8.size(2) <= 65535, "delta_matching twin_vt: batch * heads must be at most 65535");
+    int const b = x8.size(0), s = x8.size(1), h = x8.size(2), d = x8.size(3);
+    TORCH_CHECK(s % 64 == 0 && d % 64 == 0, "delta_matching twin_vt: s and d must be 64-multiples");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x8.data_ptr()) % 16 == 0 && x8.stride(0) % 16 == 0 && x8.stride(1) % 16 == 0
+                && x8.stride(2) % 16 == 0, "delta_matching twin_vt: 16-byte aligned rows");
+    at::Tensor out = torch::empty({b, h, d, s}, x8.options());
+    fp11_make_twin_vt(x8.data_ptr(), out.data_ptr(), b, s, h, d,
                       x8.stride(0), x8.stride(1), x8.stride(2),
                       at::cuda::getCurrentCUDAStream().stream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -724,7 +764,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
 
 TORCH_LIBRARY(delta_matching, m) {
     m.def("fwd_fp8(Tensor q8, Tensor k8, Tensor v8, Tensor q8s, Tensor k8s, Tensor v8s,"
-          " float softmax_scale, bool is_causal) -> (Tensor, Tensor)");
+          " float softmax_scale, bool is_causal, Tensor? vt8=None) -> (Tensor, Tensor)");
     m.def("bwd_fp8(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
           " float softmax_scale, bool is_causal) -> (Tensor, Tensor, Tensor)");
@@ -744,6 +784,7 @@ TORCH_LIBRARY(delta_matching, m) {
           " -> (Tensor, Tensor, Tensor)");
     m.def("build_bf16dp() -> int");
     m.def("twin_pi(Tensor x8) -> Tensor");
+    m.def("twin_vt(Tensor x8) -> Tensor");   // ## VT
     m.def("build_gt() -> int");
     m.def("build_hd128() -> int");
 #ifdef FA3FP11_DBG
@@ -773,6 +814,7 @@ TORCH_LIBRARY_IMPL(delta_matching, CUDA, m) {
     m.impl("bwd_fp8_g", &bwd_fp8_g);
     m.impl("bwd_fp8_bf16dp", &bwd_fp8_bf16dp);
     m.impl("twin_pi", &fp11_twin_pi);
+    m.impl("twin_vt", &fp11_twin_vt);
 #ifdef FA3FP11_DBG
     m.impl("bwd_fp8_dbg", &bwd_fp8_dbg);
     m.impl("delta_fp8_dbg", &delta_fp8_dbg);

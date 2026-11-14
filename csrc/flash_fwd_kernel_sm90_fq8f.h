@@ -257,7 +257,7 @@ public:
         }();
         // MainloopPipelineV pipeline_v(shared_storage.pipelines.pipeline_v, pipeline_params_v, ClusterShape{});
         MainloopPipelineV pipeline_v = [&] {
-            if constexpr (!Transpose_V) {
+            if constexpr (!CollectiveMainloop::TransposeVSmem) {   // ## VT: the twin is TMA-loaded into the wgmma buffer
                 static_assert(is_same_v<PipelineParamsK, PipelineParamsV>);
                 if constexpr (Use_TMA_KV) {
                     return MainloopPipelineV(shared_storage.pipelines.pipeline_v, pipeline_params_vt, ClusterShape{});
