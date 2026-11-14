@@ -242,6 +242,14 @@ std::tuple<at::Tensor, at::Tensor> fwd_fp8(
 static at::Tensor* g_dbg_ds8 = nullptr;
 static at::Tensor* g_dbg_psi = nullptr;
 #endif
+// A (b, h, d, s) twin's batch (i = 0) / head (i = 1) stride for the TMA descriptor: a size-1 mode is never stepped, so it
+// gets the contiguous value of the mode inside it (what a contiguous tensor has), whatever stride the view carries.
+static int64_t dm_twin_stride(at::Tensor const& t, int i) {
+    int64_t const head = t.size(1) == 1 ? int64_t(t.size(2)) * t.stride(2) : t.stride(1);
+    if (i == 1) { return head; }
+    return t.size(0) == 1 ? int64_t(t.size(1)) * head : t.stride(0);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     at::Tensor dout8,   // (b, s_q, h, d) e4m3 codes
     at::Tensor q8,      // (b, s_q, h, d) e4m3
@@ -249,9 +257,9 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     at::Tensor v8,      // (b, s_k, h, d) e4m3
     at::Tensor lse,     // (b, h, s_q) fp32 (natural-log LSE)
     at::Tensor delta,   // (b, h, s_q) fp32 (the recipe delta: stale or matched)
-    at::Tensor kt8,     // (b, h, d, s_k) e4m3 transposed K twin, contiguous
-    at::Tensor qt8,     // ## FP11-M17 GT: (b, h, d, s_q) e4m3 Q twin (pi-ordered s), contiguous; ignored at GT=0
-    at::Tensor dot8,    // ## FP11-M17 GT: (b, h, d, s_q) e4m3 dO twin (pi-ordered s), contiguous; ignored at GT=0
+    at::Tensor kt8,     // (b, h, d, s_k) e4m3 transposed K twin (s unit-stride, 16-byte multiple strides)
+    at::Tensor qt8,     // ## FP11-M17 GT: (b, h, d, s_q) e4m3 Q twin (pi-ordered s), strides as kt8
+    at::Tensor dot8,    // ## FP11-M17 GT: (b, h, d, s_q) e4m3 dO twin (pi-ordered s), strides as kt8
     at::Tensor q8s,     // (b, h, s_q/64) fp32
     at::Tensor k8s,     // (b, h, s_k/32) fp32
     at::Tensor v8s,     // (b, h, s_k/32) fp32
@@ -268,7 +276,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     // ## CP ring (dm_cp): fp32 dQ (s_q, h, d) that pass 2 accumulates into (mode 1) or stores to (mode 2), the batch looped
     // inside each pass-2 CTA; the twins may then carry any (d-row, head, batch) strides with s unit-stride (batch 0 = shared).
     at::Tensor dq_acc = at::Tensor(),
-    int64_t dq_acc_mode = 0
+    int64_t dq_acc_mode = 0,
+    // ## WS (bwd_fp8_tw): caller-owned pass-1 -> pass-2 workspace (uint8, >= bwd_ws_bytes) and dq / dk / dv outputs, so a
+    // caller that runs this op on a side stream can keep every large buffer in its own stream's allocator pool.  Same
+    // kernels, same arguments otherwise (the workspace is never read before pass 1 writes it, as the fresh torch::empty).
+    at::Tensor ws = at::Tensor(),
+    at::Tensor dq_out = at::Tensor(),
+    at::Tensor dk_out = at::Tensor(),
+    at::Tensor dv_out = at::Tensor()
 ) {
     c10::cuda::CUDAGuard device_guard(q8.device());
     bool const ring = dq_acc.defined();
@@ -298,12 +313,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     TORCH_CHECK(k8s.size(1) == num_heads_k && v8s.size(1) == num_heads_k && q8s.size(1) == num_heads && do8s.size(1) == num_heads,
                 "delta_matching bwd: scale head counts (q/do: h, k/v: h_k)");
     if (ring) {
-        TORCH_CHECK(head_size == 128, "delta_matching bwd (ring): head_dim 128 only");
+        // head_dim 256: pass 2 has no batch loop; each launch adds its own block (batch 1) into dq_acc.
+        TORCH_CHECK(head_size == 128 || batch_size == 1, "delta_matching bwd (ring): head_dim 256 needs batch 1");
         TORCH_CHECK(!is_causal || batch_size == 1, "delta_matching bwd (ring): causal needs batch 1");
         TORCH_CHECK(dq_acc.scalar_type() == at::kFloat && dq_acc.dim() == 3 && dq_acc.size(0) == seqlen_q && dq_acc.size(1) == num_heads
                     && dq_acc.size(2) == head_size && dq_acc.stride(2) == 1 && dq_acc.stride(0) % 2 == 0 && dq_acc.stride(1) % 2 == 0,
                     "delta_matching bwd (ring): dq_acc must be fp32 (s_q, h, d) with d contiguous");
         TORCH_CHECK(dq_acc_mode == 1 || dq_acc_mode == 2, "delta_matching bwd (ring): dq_acc_mode 1 (accumulate) or 2 (store)");
+        // pass 2 reads / writes dq_acc as float2 and each (row, head) is owned by one CTA warpgroup: 8-byte aligned and
+        // non-overlapping ((s, h, d) or (h, s, d) order with no shared rows).
+        TORCH_CHECK(reinterpret_cast<uintptr_t>(dq_acc.data_ptr()) % 8 == 0, "delta_matching bwd (ring): dq_acc must be 8-byte aligned");
+        TORCH_CHECK((dq_acc.stride(1) >= head_size && dq_acc.stride(0) >= dq_acc.stride(1) * num_heads)
+                    || (dq_acc.stride(0) >= head_size && dq_acc.stride(1) >= dq_acc.stride(0) * seqlen_q),
+                    "delta_matching bwd (ring): dq_acc rows must not overlap");
         for (auto const& t : {kt8, qt8, dot8}) {
             TORCH_CHECK(t.stride(3) == 1 && t.stride(2) % 16 == 0 && t.stride(1) % 16 == 0 && t.stride(0) % 16 == 0,
                         "delta_matching bwd (ring): twins need s unit-stride and 16-byte multiple strides");
@@ -319,15 +341,27 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     }
     for (auto const& t : {dout8, q8, k8, v8}) { TORCH_CHECK(t.stride(-1) == 1); }
     for (auto const& t : {q8s, k8s, v8s, do8s, lse, delta}) { TORCH_CHECK(t.is_contiguous()); }
-    if (!ring) { TORCH_CHECK(kt8.is_contiguous()); }
+    // The twins: s unit-stride, every other stride a 16-byte multiple (the TMA descriptors take the strides).
+    for (auto const& t : {kt8, qt8, dot8}) {
+        TORCH_CHECK(t.stride(3) == 1 && t.stride(2) % 16 == 0 && dm_twin_stride(t, 1) % 16 == 0 && dm_twin_stride(t, 0) % 16 == 0,
+                    "delta_matching bwd: twins need s unit-stride and 16-byte multiple strides");
+    }
     auto opts = q8.options();
     int const seqlen_q_rounded = seqlen_q;    // 64-multiple asserted
     int const head_size_rounded = head_size;
 
-    at::Tensor dq = ring ? torch::empty({1, 1, 1, 1}, opts.dtype(at::kBFloat16))
+    auto out_ok = [&](at::Tensor const& t, int64_t s) {
+        return t.scalar_type() == at::kBFloat16 && t.is_contiguous() && t.device() == q8.device()
+               && t.sizes() == at::IntArrayRef({batch_size, s, num_heads, head_size});
+    };
+    TORCH_CHECK(!dq_out.defined() || (!ring && out_ok(dq_out, seqlen_q)), "delta_matching bwd_fp8_tw: dq must be bf16 (b, s_q, h, d) contiguous");
+    TORCH_CHECK(!dk_out.defined() || out_ok(dk_out, seqlen_k), "delta_matching bwd_fp8_tw: dk must be bf16 (b, s_k, h, d) contiguous");
+    TORCH_CHECK(!dv_out.defined() || out_ok(dv_out, seqlen_k), "delta_matching bwd_fp8_tw: dv must be bf16 (b, s_k, h, d) contiguous");
+    at::Tensor dq = dq_out.defined() ? dq_out
+                  : ring ? torch::empty({1, 1, 1, 1}, opts.dtype(at::kBFloat16))
                          : torch::empty({batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kBFloat16));
-    at::Tensor dk = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
-    at::Tensor dv = torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
+    at::Tensor dk = dk_out.defined() ? dk_out : torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
+    at::Tensor dv = dv_out.defined() ? dv_out : torch::empty({batch_size, seqlen_k, num_heads, head_size}, opts.dtype(at::kBFloat16));
     // Dummy dq_accum: the split backward has no cross-CTA dQ reduction; the
     // pointer is never dereferenced (plumbing only).
     at::Tensor dq_accum = torch::empty({4}, opts.dtype(at::kFloat));
@@ -338,12 +372,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     // Pass-1 -> pass-2 workspaces: tile-contiguous dS' codes + per-tile psi.
     // For causal only nb <= mb tiles are written or read: no zeroing needed.
     int const nbm = seqlen_q / 64, nbn = seqlen_k / kbn;
-    at::Tensor ds8 = torch::empty({int64_t(batch_size) * num_heads, nbm, nbn, 64, kbn}, opts);   // ## Delta-Matching-128: [64, kbn] tiles
 #ifndef FA3FP11_HALFPSI
 #define FA3FP11_HALFPSI 0
 #endif
     // ## M23 HALFPSI: at head_dim 128 pass 1 publishes one psi per (tile, warpgroup half): [BH, nbm, nbn, 2].
-    at::Tensor psi = torch::empty({int64_t(batch_size) * num_heads, nbm, nbn, (FA3FP11_HALFPSI && head_size == 128) ? 2 : 1}, opts.dtype(at::kFloat));
+    int const npsi_t = (FA3FP11_HALFPSI && head_size == 128) ? 2 : 1;
+    at::Tensor ds8, psi;
+    if (ws.defined()) {   // ## WS: [ds8 tiles | psi] carved from the caller's buffer (layout = the two torch::empty below)
+        int64_t const nds8 = int64_t(batch_size) * num_heads * nbm * nbn * 64 * kbn;
+        int64_t const npsi = int64_t(batch_size) * num_heads * nbm * nbn * npsi_t;
+        TORCH_CHECK(ws.scalar_type() == at::kByte && ws.is_contiguous() && ws.device() == q8.device()
+                    && ws.numel() >= nds8 + 4 * npsi && reinterpret_cast<uintptr_t>(ws.data_ptr()) % 256 == 0,
+                    "delta_matching bwd_fp8_tw: ws must be a contiguous 256-B aligned uint8 tensor of >= ", nds8 + 4 * npsi, " bytes");
+        ds8 = ws.narrow(0, 0, nds8).view({int64_t(batch_size) * num_heads, nbm, nbn, 64, kbn});
+        psi = ws.narrow(0, nds8, 4 * npsi).view(at::kFloat).view({int64_t(batch_size) * num_heads, nbm, nbn, npsi_t});
+    } else {
+        ds8 = torch::empty({int64_t(batch_size) * num_heads, nbm, nbn, 64, kbn}, opts);   // ## Delta-Matching-128: [64, kbn] tiles
+        psi = torch::empty({int64_t(batch_size) * num_heads, nbm, nbn, npsi_t}, opts.dtype(at::kFloat));
+    }
 #ifdef FA3FP11_DBG
     if (g_dbg_ds8 != nullptr) { *g_dbg_ds8 = ds8; *g_dbg_psi = psi; }   // ## DBG (bwd_fp8_dbg_ds only)
 #endif
@@ -371,7 +417,8 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     params.do_row_stride = dout8.stride(1); params.do_head_stride = dout8.stride(2); params.do_batch_stride = dout8.stride(0);
     params.dq_ptr = dq.data_ptr(); params.dk_ptr = dk.data_ptr(); params.dv_ptr = dv.data_ptr();
     // head_dim 256 pass 2 stores dQ rows as 16-B vectors (fq8_dq_pass2.h epilogue)
-    TORCH_CHECK(head_size != 256 || (reinterpret_cast<uintptr_t>(dq.data_ptr()) % 16 == 0 && dq.stride(1) % 8 == 0 && dq.stride(3) == 1),
+    // (ring: dq is a 1-element stand-in, pass 2 writes dq_acc instead)
+    TORCH_CHECK(ring || head_size != 256 || (reinterpret_cast<uintptr_t>(dq.data_ptr()) % 16 == 0 && dq.stride(1) % 8 == 0 && dq.stride(3) == 1),
                 "bwd: head_dim 256 dq needs 16-B aligned rows (row stride % 8 elements)");
     params.dq_row_stride = dq.stride(1); params.dq_head_stride = dq.stride(2); params.dq_batch_stride = dq.stride(0);
     params.dk_row_stride = dk.stride(1); params.dk_head_stride = dk.stride(2); params.dk_batch_stride = dk.stride(0);
@@ -385,15 +432,19 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_core(
     params.arch = 90;
     // ## FP11-M17 GT: the Q^T / dO^T gmem twins are REAL inputs (pi-ordered s positions).
     TORCH_CHECK(qt8.defined() && dot8.defined(), "delta_matching bwd: the qt8 / dot8 twins are required");
-    TORCH_CHECK(qt8.size(0) == batch_size && qt8.size(1) == num_heads && qt8.size(2) == head_size && qt8.size(3) == seqlen_q && (ring || qt8.is_contiguous()),
-                "delta_matching bwd: qt8 must be (b, h, d, s_q) contiguous");
-    TORCH_CHECK(dot8.size(0) == batch_size && dot8.size(1) == num_heads && dot8.size(2) == head_size && dot8.size(3) == seqlen_q && (ring || dot8.is_contiguous()),
-                "delta_matching bwd: dot8 must be (b, h, d, s_q) contiguous");
+    TORCH_CHECK(qt8.size(0) == batch_size && qt8.size(1) == num_heads && qt8.size(2) == head_size && qt8.size(3) == seqlen_q,
+                "delta_matching bwd: qt8 must be (b, h, d, s_q)");
+    TORCH_CHECK(dot8.size(0) == batch_size && dot8.size(1) == num_heads && dot8.size(2) == head_size && dot8.size(3) == seqlen_q,
+                "delta_matching bwd: dot8 must be (b, h, d, s_q)");
     params.qt_ptr = qt8.data_ptr(); params.kt_ptr = kt8.data_ptr(); params.dot_ptr = dot8.data_ptr();
-    // ## CP ring: the twin strides (contiguous tensors give exactly the former hard-coded values)
-    params.qt_d_stride = qt8.stride(2); params.qt_head_stride = qt8.stride(1); params.qt_batch_stride = qt8.stride(0);
-    params.kt_d_stride = kt8.stride(2); params.kt_head_stride = kt8.stride(1); params.kt_batch_stride = kt8.stride(0);
-    params.dot_d_stride = dot8.stride(2); params.dot_head_stride = dot8.stride(1); params.dot_batch_stride = dot8.stride(0);
+    // ## CP ring: the twin strides (contiguous tensors give exactly the former hard-coded values).  A size-1 batch / head
+    // mode is never stepped; its stride is set to the contiguous value of the mode inside it (as a contiguous tensor's).
+    params.qt_d_stride = qt8.stride(2); params.qt_head_stride = dm_twin_stride(qt8, 1); params.qt_batch_stride = dm_twin_stride(qt8, 0);
+    params.kt_d_stride = kt8.stride(2); params.kt_head_stride = dm_twin_stride(kt8, 1); params.kt_batch_stride = dm_twin_stride(kt8, 0);
+    params.dot_d_stride = dot8.stride(2); params.dot_head_stride = dm_twin_stride(dot8, 1); params.dot_batch_stride = dm_twin_stride(dot8, 0);
+    // head_dim 256 pass 2 reads Kt over one collapsed (b, h_k) mode.
+    TORCH_CHECK(head_size != 256 || batch_size == 1 || params.kt_batch_stride == int64_t(num_heads_k) * params.kt_head_stride,
+                "delta_matching bwd: at head_dim 256 a batched kt8 needs batch stride == h_k * head stride");
     if (ring) {
         params.dq_acc_ptr = dq_acc.data_ptr<float>();
         params.dqa_row_stride = dq_acc.stride(0); params.dqa_head_stride = dq_acc.stride(1);
@@ -507,6 +558,25 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> bwd_fp8_t(
                         nullptr, nullptr, nullptr);
 }
 
+// ## WS: bwd_fp8_t into caller-owned buffers: ws (uint8, >= bwd_ws_bytes(b, h, s_q, s_k, d) bytes, 256-B aligned) holds the
+// pass-1 -> pass-2 dS' tiles + psi; dq / dk / dv (bf16 (b, s, h, d) contiguous) receive the grads.  Bitwise bwd_fp8_t.
+void bwd_fp8_tw(
+    at::Tensor dout8, at::Tensor q8, at::Tensor k8, at::Tensor v8,
+    at::Tensor lse, at::Tensor delta, at::Tensor kt8, at::Tensor qt8, at::Tensor dot8,
+    at::Tensor q8s, at::Tensor k8s, at::Tensor v8s, at::Tensor do8s,
+    double softmax_scale, bool is_causal, at::Tensor ws, at::Tensor dq, at::Tensor dk, at::Tensor dv
+) {
+    TORCH_CHECK(ws.defined() && dq.defined() && dk.defined() && dv.defined(), "delta_matching bwd_fp8_tw: ws / dq / dk / dv required");
+    bwd_fp8_core(dout8, q8, k8, v8, lse, delta, kt8, qt8, dot8, q8s, k8s, v8s, do8s, softmax_scale, is_causal,
+                 nullptr, nullptr, nullptr, at::Tensor(), at::Tensor(), at::Tensor(), 0, ws, dq, dk, dv);
+}
+
+int64_t bwd_ws_bytes(int64_t b, int64_t h, int64_t s_q, int64_t s_k, int64_t d) {
+    int64_t const kbn = fp11_bwd_block_n(int(d));
+    int64_t const tiles = b * h * (s_q / 64) * (s_k / kbn);
+    return tiles * 64 * kbn + 4 * tiles * ((FA3FP11_HALFPSI && d == 128) ? 2 : 1);
+}
+
 // ## CP ring (dm_cp): bwd_fp8_t with a batch of ring blocks (Q / dO side may be batch-broadcast, stride 0) whose dQ pass
 // accumulates (mode 1) or stores (mode 2) fp32 into dq_acc (s_q, h, d).  Returns (dk, dv) bf16 (b, s_k, h, d).
 std::tuple<at::Tensor, at::Tensor> bwd_fp8_g(
@@ -600,7 +670,7 @@ at::Tensor delta_fp8_core(
     }
     for (auto const& t : {dout8, q8, k8, v8}) { TORCH_CHECK(t.stride(-1) == 1); }
     for (auto const& t : {q8s, k8s, v8s, do8s, lse}) { TORCH_CHECK(t.is_contiguous()); }
-    if (head_size != 128) { TORCH_CHECK(kt8.is_contiguous()); }   // ## CP ring: the hd128 pass 0 never reads kt8
+    TORCH_CHECK(kt8.stride(3) == 1, "delta_matching delta: kt8 needs s unit-stride");   // ## CP ring: no shipped pass 0 reads kt8
     auto opts = q8.options();
     int const seqlen_q_rounded = seqlen_q;    // 64-multiple asserted
     int const head_size_rounded = head_size;
@@ -778,6 +848,10 @@ TORCH_LIBRARY(delta_matching, m) {
     m.def("bwd_fp8_t(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
           " float softmax_scale, bool is_causal) -> (Tensor, Tensor, Tensor)");
+    m.def("bwd_fp8_tw(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
+          " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
+          " float softmax_scale, bool is_causal, Tensor(a!) ws, Tensor(b!) dq, Tensor(c!) dk, Tensor(d!) dv) -> ()");   // ## WS
+    m.def("bwd_ws_bytes(int b, int h, int s_q, int s_k, int d) -> int");   // ## WS
     m.def("bwd_fp8_g(Tensor dout8, Tensor q8, Tensor k8, Tensor v8, Tensor lse, Tensor delta,"
           " Tensor kt8, Tensor qt8, Tensor dot8, Tensor q8s, Tensor k8s, Tensor v8s, Tensor do8s,"
           " float softmax_scale, bool is_causal, Tensor dq_acc, int dq_acc_mode) -> (Tensor, Tensor)");
@@ -807,6 +881,7 @@ TORCH_LIBRARY_IMPL(delta_matching, CompositeExplicitAutograd, m) {
     m.impl("build_gt", &fp11_build_gt);
     m.impl("build_bf16dp", &fp11_build_bf16dp);
     m.impl("build_hd128", &fp11_build_hd128);
+    m.impl("bwd_ws_bytes", &bwd_ws_bytes);   // ## WS
 }
 
 TORCH_LIBRARY_IMPL(delta_matching, CUDA, m) {
@@ -814,6 +889,7 @@ TORCH_LIBRARY_IMPL(delta_matching, CUDA, m) {
     m.impl("bwd_fp8", &bwd_fp8);
     m.impl("delta_fp8", &delta_fp8);
     m.impl("bwd_fp8_t", &bwd_fp8_t);
+    m.impl("bwd_fp8_tw", &bwd_fp8_tw);   // ## WS
     m.impl("bwd_fp8_g", &bwd_fp8_g);
     m.impl("bwd_fp8_bf16dp", &bwd_fp8_bf16dp);
     m.impl("twin_pi", &fp11_twin_pi);

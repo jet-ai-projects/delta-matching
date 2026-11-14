@@ -197,7 +197,21 @@ struct P2Params {
     // ## FP11-M16 (native GQA, READ side): the Kt twin is per KV head
     // [b, h_k, d, s]; h_k == h reproduces the M10 index arithmetic exactly.
     int h_k;
+    // ## CP ring (batch 1): dq_acc != nullptr: instead of the bf16 dQ, the epilogue adds this block's dQ, rounded to bf16
+    // exactly as the bf16 store would, into the fp32 dQ (s_q, h, d) with an IEEE round-to-nearest add (no FTZ): mode 1
+    // dq_acc + value, mode 2 0 + value.  Bitwise a zeroed fp32 dQ plus the per-block bf16 dQ added in launch order.
+    float* dq_acc;
+    int64_t dqa_row_stride, dqa_head_stride;
+    int dq_acc_mode;
 };
+
+// fp32 a + b, round-to-nearest, denormals kept (the library builds with --use_fast_math, whose FTZ adds would differ
+// from torch's fp32 add on denormal results).
+__device__ __forceinline__ float add_rn_noftz(float a, float b) {
+    float r;
+    asm volatile("add.rn.f32 %0, %1, %2;" : "=f"(r) : "f"(a), "f"(b));
+    return r;
+}
 
 template <bool Is_causal>
 __global__ void __launch_bounds__(kThreads, 1)
@@ -321,6 +335,15 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
         }
     };
 
+    // ## CP ring, accumulate mode: pull this row block's fp32 dQ (64 rows x 1 KB) into L2 now, so the epilogue's
+    // read-modify-write hits L2 instead of exposing an HBM round trip at the CTA's tail (cache hint only).
+    if (params.dq_acc != nullptr && params.dq_acc_mode == 1 && wg_valid) {
+        float const* const dqa = params.dq_acc + int64_t(bh % params.h) * params.dqa_head_stride + int64_t(mb) * kBM * params.dqa_row_stride;
+        #pragma unroll
+        for (int l = tid; l < kBM * (kBD / 32); l += 128) {   // 32 floats = one 128-B line
+            asm volatile("prefetch.global.L2::evict_last [%0];" :: "l"(dqa + int64_t(l / (kBD / 32)) * params.dqa_row_stride + (l % (kBD / 32)) * 32));
+        }
+    }
     // P2B-OVL: issue one half's two k32 wgmmas and commit, WITHOUT flash::gemm's trailing fence_operand on the
     // in-flight accumulator (that register use made ptxas inject a full wgmma wait before the other half's work).
     auto issue_h = [&](auto& a, auto const& tB, int st, bool zero) {
@@ -406,6 +429,38 @@ fq8_dq_pass2_kernel(CUTE_GRID_CONSTANT P2Params const params) {
     float const fin = params.final_scale;
     int const b_idx = bh / params.h;
     int const h_idx = bh % params.h;
+    if (params.dq_acc != nullptr) {   // ## CP ring: fp32 dQ (s_q, h, d) += float(bf16(dQ block)), batch 1
+        float* const dqa = params.dq_acc + int64_t(h_idx) * params.dqa_head_stride + int64_t(mb) * kBM * params.dqa_row_stride;
+        bool const acc_mode = params.dq_acc_mode == 1;
+        // Batches of kSlots float2 slots: all loads of a batch issue before its stores (one round trip per batch
+        // instead of a load / store chain per slot); same values, same per-slot arithmetic.
+        constexpr int kSlots = 16;
+        static_assert(kAH % (2 * kSlots) == 0, "pass 2: dQ slot batches must tile the half fragment");
+        #pragma unroll
+        for (int h = 0; h < kNH; ++h) {   // P2B-OVL column halves (d offset h * kBDH), as the bf16 epilogue below
+            #pragma unroll
+            for (int i0 = 0; i0 < kAH; i0 += 2 * kSlots) {
+                float2 base[kSlots];
+                #pragma unroll
+                for (int j = 0; j < kSlots; ++j) {
+                    int const m = get<0>(tCcC(i0 + 2 * j));
+                    int const d = get<1>(tCcC(i0 + 2 * j)) + h * kBDH;
+                    base[j] = acc_mode ? *reinterpret_cast<float2 const*>(dqa + int64_t(m) * params.dqa_row_stride + d)
+                                       : make_float2(0.0f, 0.0f);
+                }
+                #pragma unroll
+                for (int j = 0; j < kSlots; ++j) {
+                    int const m = get<0>(tCcC(i0 + 2 * j));
+                    int const d = get<1>(tCcC(i0 + 2 * j)) + h * kBDH;
+                    float2 const v2 = *reinterpret_cast<float2 const*>(&smem_dq[m * kDqPitch + d]);
+                    cutlass::bfloat16_t lo(v2.x * fin), hi(v2.y * fin);
+                    *reinterpret_cast<float2*>(dqa + int64_t(m) * params.dqa_row_stride + d) =
+                        make_float2(add_rn_noftz(base[j].x, float(lo)), add_rn_noftz(base[j].y, float(hi)));
+                }
+            }
+        }
+        return;
+    }
     auto* dq_base = reinterpret_cast<cutlass::bfloat16_t*>(params.dq_ptr)
         + int64_t(b_idx) * params.dq_batch_stride + int64_t(h_idx) * params.dq_head_stride
         + int64_t(mb) * kBM * params.dq_row_stride;
@@ -469,15 +524,17 @@ void run_fq8_dq_pass2_fp11(Flash_bwd_fp8_params &params, cudaStream_t stream) {
                             shape_a, stride_a);
     TmaA tma_a = make_tma_copy(cute::SM90_TMA_LOAD{}, mA, SmemLayoutA{}(_, _, _0{}));
     ShapeB shape_b = make_shape(Int<kBD>{}, params.seqlen_k, params.b * params.h_k);   // ## FP11-M16: per KV head
-    StrideB stride_b = make_stride(int64_t(params.seqlen_k), _1{},
-                                   int64_t(kBD) * params.seqlen_k);
+    // Explicit Kt strides over the collapsed (b, h_k) mode (the host checks b == 1 or batch stride == h_k * head
+    // stride); a contiguous twin gives exactly the former {s_k, 1, 256 s_k}.
+    StrideB stride_b = make_stride(params.kt_d_stride, _1{}, params.kt_head_stride);
     Tensor mB = make_tensor(make_gmem_ptr(static_cast<Element const*>(params.kt_ptr)),
                             shape_b, stride_b);
     TmaB tma_b = make_tma_copy(cute::SM90_TMA_LOAD{}, mB, SmemLayoutB{}(_, _, _0{}));
     P2Params p2{tma_a, tma_b, shape_a, shape_b, params.psi_ptr,
                 params.dq_ptr, params.dq_row_stride, params.dq_head_stride,
                 params.dq_batch_stride,
-                params.scale_softmax / 256.0f, nbm, nbn, params.h, params.h_k};
+                params.scale_softmax / 256.0f, nbm, nbn, params.h, params.h_k,
+                params.dq_acc_ptr, params.dqa_row_stride, params.dqa_head_stride, params.dq_acc_mode};
     auto* kernel = &fq8p2::fq8_dq_pass2_kernel<Is_causal>;
     constexpr int kSmem = int(sizeof(SharedStorage));
     if (kSmem >= 48 * 1024) {
