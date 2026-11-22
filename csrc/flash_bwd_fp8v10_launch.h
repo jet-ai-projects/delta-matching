@@ -96,13 +96,13 @@ void run_flash_bwd_fp11r_hd128(Flash_bwd_fp8_params &params, cudaStream_t stream
 #endif
         static_cast<Element const*>(params.qt_ptr),
         {params.d, seqlen_q, params.h, params.b},
-        {int64_t(seqlen_q), _1{}, int64_t(params.d) * seqlen_q, int64_t(params.d) * seqlen_q * params.h},
+        {params.qt_d_stride, _1{}, params.qt_head_stride, params.qt_batch_stride},   // ## CP ring: explicit twin strides
         static_cast<Element const*>(params.kt_ptr),
         {params.d, seqlen_k, params.h_k, params.b},
-        {int64_t(seqlen_k), _1{}, int64_t(params.d) * seqlen_k, int64_t(params.d) * seqlen_k * params.h_k},
+        {params.kt_d_stride, _1{}, params.kt_head_stride, params.kt_batch_stride},
         static_cast<Element const*>(params.dot_ptr),
         {params.dv, seqlen_q, params.h, params.b},
-        {int64_t(seqlen_q), _1{}, int64_t(params.dv) * seqlen_q, int64_t(params.dv) * seqlen_q * params.h},
+        {params.dot_d_stride, _1{}, params.dot_head_stride, params.dot_batch_stride},
         params.q8s_ptr, params.k8s_ptr, params.v8s_ptr, params.do8s_ptr,
         params.nblk_q, params.nblk_k,
         static_cast<ElementAccum*>(params.dq_accum_ptr),
@@ -226,16 +226,17 @@ void run_flash_bwd_fp11_impl(Flash_bwd_fp8_params &params, cudaStream_t stream) 
         static_cast<Element const*>(params.do_ptr),
         {seqlen_q, params.dv, params.h, params.b},  // shape_dO
         {params.do_row_stride, _1{}, params.do_head_stride, params.do_batch_stride},
-        // ## FQ8 twins: [d, seq, head, batch], seq-contiguous ([BH, D, N] tensors).
+        // ## FQ8 twins: [d, seq, head, batch], seq-contiguous.  Explicit twin strides (CP ring: strided half / wire-buffer
+        // views); a contiguous [BH, D, N] tensor gives exactly the former {seq, 1, d seq, d seq h} values.
         static_cast<Element const*>(params.qt_ptr),
         {params.d, seqlen_q, params.h, params.b},   // shape_Qt
-        {int64_t(seqlen_q), _1{}, int64_t(params.d) * seqlen_q, int64_t(params.d) * seqlen_q * params.h},
+        {params.qt_d_stride, _1{}, params.qt_head_stride, params.qt_batch_stride},
         static_cast<Element const*>(params.kt_ptr),
         {params.d, seqlen_k, params.h_k, params.b},  // shape_Kt
-        {int64_t(seqlen_k), _1{}, int64_t(params.d) * seqlen_k, int64_t(params.d) * seqlen_k * params.h_k},
+        {params.kt_d_stride, _1{}, params.kt_head_stride, params.kt_batch_stride},
         static_cast<Element const*>(params.dot_ptr),
         {params.dv, seqlen_q, params.h, params.b},  // shape_dOt
-        {int64_t(seqlen_q), _1{}, int64_t(params.dv) * seqlen_q, int64_t(params.dv) * seqlen_q * params.h},
+        {params.dot_d_stride, _1{}, params.dot_head_stride, params.dot_batch_stride},
         params.q8s_ptr, params.k8s_ptr, params.v8s_ptr, params.do8s_ptr,
         params.nblk_q, params.nblk_k,
         static_cast<ElementAccum*>(params.dq_accum_ptr),
